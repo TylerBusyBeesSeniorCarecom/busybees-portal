@@ -39,3 +39,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Busy Bees portal secrets
+app/schedule/secrets/
+app/schedule/secrets/*.json
