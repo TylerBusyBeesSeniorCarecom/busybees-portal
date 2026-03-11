@@ -253,7 +253,7 @@ function clientLastNameKey(client: string): { last: string; first: string } {
   if (!raw) return { last: "", first: "" };
 
   if (raw.includes(",")) {
-    const [last, first] = raw.split(",").map((s) => s.trim());
+   const [last, first] = raw.split(",").map((s: string) => s.trim());
     return { last: (last || "").toLowerCase(), first: (first || "").toLowerCase() };
   }
 
