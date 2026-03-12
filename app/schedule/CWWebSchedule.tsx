@@ -9,6 +9,11 @@ import { useMessagesUI } from "@/app/api/messages/MessagesContext";
 import TopNav from "./components/TopNav";
 import CaregiverWebSchedulePanel from "./components/CaregiverWebSchedulePanel";
 import ServiceRequestsPanel from "./components/AppServiceRequests";
+import {
+  buildShiftSaveToast,
+  parseShiftTextForFeedback,
+  type ShiftSaveCaregiverInput,
+} from "./utils/shiftSaveFeedback";
 /**
  * NOTE (hydration + nested buttons):
  * The invalid DOM nesting error you showed ("<button> cannot be a descendant of <button>") is almost always
@@ -1725,7 +1730,7 @@ const [applicantSearch, setApplicantSearch] = useState("");
     }));
   }, [week]);
 
-  // edit modal
+    // edit modal
   const [editOpen, setEditOpen] = useState(false);
   const [editA1, setEditA1] = useState<string | null>(null);
   const [editClientName, setEditClientName] = useState<string>("");
@@ -1733,6 +1738,13 @@ const [applicantSearch, setApplicantSearch] = useState("");
   const [editDraft, setEditDraft] = useState<string>("");
   const [savingA1, setSavingA1] = useState<string | null>(null);
 
+  // shift save feedback toast
+  const [saveToast, setSaveToast] = useState<{
+    id: number;
+    kind: "success" | "warning" | "error";
+    title: string;
+    lines: string[];
+  } | null>(null);
   function openClientProfile(clientName: string) {
     const n = norm(clientName);
     if (!n) return;
@@ -1910,7 +1922,7 @@ const [applicantSearch, setApplicantSearch] = useState("");
   }, [week]);
 
   // availability fetch
-  useEffect(() => {
+    useEffect(() => {
     let alive = true;
 
     async function runAvail() {
@@ -1948,6 +1960,16 @@ const [applicantSearch, setApplicantSearch] = useState("");
       alive = false;
     };
   }, [panelOpen, week]);
+
+  useEffect(() => {
+    if (!saveToast) return;
+
+    const timer = window.setTimeout(() => {
+      setSaveToast((prev) => (prev?.id === saveToast.id ? null : prev));
+    }, 5000);
+
+    return () => window.clearTimeout(timer);
+  }, [saveToast]);
 
   /** ---------- Week window (for ghost shifts) ---------- */
 
@@ -2266,7 +2288,7 @@ const [applicantSearch, setApplicantSearch] = useState("");
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [scheduleRows]);
 
-  const caregiversWithCertsActive = useMemo(() => {
+    const caregiversWithCertsActive = useMemo(() => {
     return Object.values(caregiversById)
       .filter((c) => isActiveStatus(c.status))
       .filter((c) => {
@@ -2282,8 +2304,16 @@ const [applicantSearch, setApplicantSearch] = useState("");
       });
   }, [caregiversById]);
 
-  /** ---------- Schedule summaries for caregiver panel ---------- */
+  const shiftSaveCaregivers = useMemo<ShiftSaveCaregiverInput[]>(() => {
+    return Object.values(caregiversById).map((c) => ({
+      caregiverId: c.caregiverId,
+      nameOnSchedule: c.nameOnSchedule,
+      name: c.name,
+      status: c.status,
+    }));
+  }, [caregiversById]);
 
+  /** ---------- Schedule summaries for caregiver panel ---------- */
   type ScheduleItem = {
     shiftId: string;
     client: string;
@@ -2511,7 +2541,7 @@ const [applicantSearch, setApplicantSearch] = useState("");
     setEditOpen(true);
   }
 
-  async function saveEdit() {
+    async function saveEdit() {
     if (!editA1) return;
     const a1 = editA1;
     const newVal = editDraft;
@@ -2530,6 +2560,9 @@ const [applicantSearch, setApplicantSearch] = useState("");
       setEditA1(null);
       return;
     }
+
+    const parsed = parseShiftTextForFeedback(newVal, shiftSaveCaregivers);
+    const toastModel = buildShiftSaveToast(parsed);
 
     try {
       setSavingA1(a1);
@@ -2551,16 +2584,28 @@ const [applicantSearch, setApplicantSearch] = useState("");
       await loadGridForWeek(week);
       await Promise.all([refreshScheduleMapsForWeek(week), refreshCaregivers(), refreshClients()]);
 
+      setSaveToast({
+        id: Date.now(),
+        kind: toastModel.kind,
+        title: toastModel.title,
+        lines: toastModel.lines,
+      });
+
       setEditOpen(false);
       setEditA1(null);
     } catch (err: any) {
-      alert(err?.message ?? "Save failed");
+      setSaveToast({
+        id: Date.now(),
+        kind: "error",
+        title: "Save failed",
+        lines: [err?.message ?? "The cell could not be updated."],
+      });
     } finally {
       setSavingA1(null);
     }
   }
 
-  return (
+    return (
     <main
       style={{
         padding: 18,
@@ -2572,6 +2617,95 @@ const [applicantSearch, setApplicantSearch] = useState("");
         minHeight: "100vh",
       }}
     >
+      {saveToast ? (
+        <div
+          style={{
+            position: "fixed",
+            top: 18,
+            right: 18,
+            zIndex: 10050,
+            width: "min(390px, calc(100vw - 24px))",
+            background:
+              saveToast.kind === "success"
+                ? "#ecfdf5"
+                : saveToast.kind === "warning"
+                ? "#fffbeb"
+                : "#fef2f2",
+            border:
+              saveToast.kind === "success"
+                ? "1px solid #86efac"
+                : saveToast.kind === "warning"
+                ? "1px solid #fcd34d"
+                : "1px solid #fca5a5",
+            color: "#111827",
+            borderRadius: 14,
+            boxShadow: "0 12px 30px rgba(0,0,0,0.18)",
+            padding: 12,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "flex-start",
+              gap: 10,
+            }}
+          >
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 13, fontWeight: 1000 }}>
+                {saveToast.title}
+              </div>
+
+              <div
+                style={{
+                  marginTop: 6,
+                  display: "grid",
+                  gap: 4,
+                }}
+              >
+                {saveToast.lines.map((line, idx) => (
+                  <div
+                    key={`${saveToast.id}_${idx}`}
+                    style={{
+                      fontSize: 12,
+                      fontWeight: idx < 4 ? 850 : 700,
+                      lineHeight: 1.3,
+                      color:
+                        saveToast.kind === "error"
+                          ? "#991b1b"
+                          : idx < 4
+                          ? "#111827"
+                          : "#92400e",
+                      wordBreak: "break-word",
+                    }}
+                  >
+                    {line}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setSaveToast(null)}
+              style={{
+                border: `1px solid ${UI.border}`,
+                background: "#fff",
+                color: UI.text,
+                borderRadius: 10,
+                padding: "5px 8px",
+                cursor: "pointer",
+                fontWeight: 900,
+                fontSize: 12,
+                flex: "0 0 auto",
+              }}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       <div
   ref={topNavRef}
   style={{

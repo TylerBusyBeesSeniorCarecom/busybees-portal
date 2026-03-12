@@ -36,12 +36,16 @@ function rangeRowA1(tab: string, row: number, colCount: number) {
   return `${tab}!A${row}:${lastCol}${row}`;
 }
 
-/**
- * ✅ Uses GOOGLE_APPLICATION_CREDENTIALS (service account JSON file)
- * This matches your current project setup.
- */
 async function getSheetsClient() {
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  if (!raw) {
+    throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_KEY");
+  }
+
+  const credentials = JSON.parse(raw);
+
   const auth = new google.auth.GoogleAuth({
+    credentials,
     scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
 

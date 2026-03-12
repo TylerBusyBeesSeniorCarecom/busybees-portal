@@ -1,7 +1,6 @@
 // app/api/service-requests/route.ts
 import { NextResponse } from "next/server";
 import { google } from "googleapis";
-import path from "path";
 
 const SHEET_NAME = "Service Requests";
 const RANGE_A1 = `${SHEET_NAME}!A1:Z5000`;
@@ -104,11 +103,13 @@ function addDaysYmd(ymd: string, n: number) {
 // ---- end helpers ----
 
 async function getSheetsClient() {
-  const keyFile = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-  if (!keyFile) throw new Error("Missing GOOGLE_APPLICATION_CREDENTIALS");
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_KEY");
+
+  const credentials = JSON.parse(raw);
 
   const auth = new google.auth.GoogleAuth({
-    keyFile: path.resolve(process.cwd(), keyFile),
+    credentials,
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
   });
 
@@ -193,16 +194,6 @@ export async function GET(req: Request) {
     const idxPreferred = headerMap.get("preferred caregiver") ?? 3;
     const idxNotes = headerMap.get("additional notes") ?? 4;
 
-    /**
-     * You observed the sheet has a "Timestamp" header but some data exports include:
-     *   index 5 = Status (e.g., Pending)
-     *   index 6 = Timestamp ISO
-     *
-     * We handle BOTH:
-     * - if row is longer than header, treat headerTimestamp as status and headerTimestamp+1 as timestamp
-     * - otherwise, look for a "status" header, and use "timestamp" header if present
-     * - final fallback: scan row tail for an ISO timestamp
-     */
     const idxTimestampHeader = headerMap.get("timestamp");
 
     const parsed: ReqItem[] = values.slice(1).map((row) => {

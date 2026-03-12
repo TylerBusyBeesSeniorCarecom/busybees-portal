@@ -3,16 +3,25 @@ import { NextResponse } from "next/server";
 import { google } from "googleapis";
 
 export const dynamic = "force-dynamic";
-export const runtime = "nodejs"; // ✅ important when using googleapis
+export const runtime = "nodejs";
 
 type ClientsPayload =
   | { ok: true; meta: any; headers: string[]; rows: string[][] }
   | { ok: false; error: string };
 
 async function getSheetsClient() {
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  if (!raw) {
+    throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_KEY");
+  }
+
+  const credentials = JSON.parse(raw);
+
   const auth = new google.auth.GoogleAuth({
+    credentials,
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
   });
+
   return google.sheets({ version: "v4", auth });
 }
 

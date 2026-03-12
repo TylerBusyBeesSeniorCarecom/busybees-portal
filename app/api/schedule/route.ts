@@ -1,13 +1,14 @@
 import { NextResponse } from "next/server";
 import { google } from "googleapis";
-import path from "path";
 
 async function getSheetsClient() {
-  const keyFile = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-  if (!keyFile) throw new Error("Missing GOOGLE_APPLICATION_CREDENTIALS");
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_KEY");
+
+  const credentials = JSON.parse(raw);
 
   const auth = new google.auth.GoogleAuth({
-    keyFile: path.resolve(process.cwd(), keyFile),
+    credentials,
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
   });
 

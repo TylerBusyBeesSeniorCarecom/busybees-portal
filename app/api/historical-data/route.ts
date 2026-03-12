@@ -54,11 +54,13 @@ function startOfSundayWeekKey(dateStr: string): string {
 }
 
 async function getSheetsClient() {
-  const keyFile = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-  if (!keyFile) throw new Error("Missing GOOGLE_APPLICATION_CREDENTIALS");
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_KEY");
+
+  const credentials = JSON.parse(raw);
 
   const auth = new google.auth.GoogleAuth({
-    keyFile,
+    credentials,
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
   });
 
@@ -83,18 +85,14 @@ export async function GET(req: Request) {
 
     const url = new URL(req.url);
 
-    const weekStart = norm(url.searchParams.get("weekStart")); // YYYY-MM-DD
+    const weekStart = norm(url.searchParams.get("weekStart"));
     const limit = toInt(url.searchParams.get("limit"), 5000);
 
-    // tail logic
     const tailWeeks = toInt(url.searchParams.get("tailWeeks"), 0);
     const tailRowsParam = url.searchParams.get("tailRows");
     const rowsPerWeek = toInt(process.env.HIST_ROWS_PER_WEEK || "275", 275);
     const bufferRows = toInt(process.env.HIST_TAIL_BUFFER_ROWS || "500", 500);
 
-    // If tailRows is provided, it wins.
-    // If tailWeeks is provided (>0), compute tailRows from weeks.
-    // If neither is provided, we read "full" range (bounded by a max range).
     const tailRows =
       tailRowsParam != null
         ? toInt(tailRowsParam, 0)
@@ -105,10 +103,9 @@ export async function GET(req: Request) {
     const sheets = await getSheetsClient();
 
     const tabName = process.env.HISTORICAL_DATA_TAB_NAME || "Historical Data";
-    const maxCols = process.env.HISTORICAL_DATA_MAX_COLS || "K"; // safe upper bound
+    const maxCols = process.env.HISTORICAL_DATA_MAX_COLS || "K";
     const maxRowsHardCap = toInt(process.env.HISTORICAL_DATA_MAX_ROWS || "50000", 50000);
 
-    // Always fetch header row separately so tail slices still map columns correctly
     const headerResp = await sheets.spreadsheets.values.get({
       spreadsheetId,
       range: `${tabName}!A1:${maxCols}1`,
@@ -119,7 +116,6 @@ export async function GET(req: Request) {
     const headers = (headerVals[0] || []).map(norm);
     if (headers.length === 0) throw new Error(`No headers found in ${tabName}`);
 
-    // column indices (match your sheet headers)
     const iShiftId = idx(headers, "Shift ID");
     const iDate = idx(headers, "Date");
     const iClient = idx(headers, "Client");
@@ -129,7 +125,6 @@ export async function GET(req: Request) {
     const iEnd = idx(headers, "End Time");
     const iStatus = idx(headers, "Status");
 
-    // Determine the range we will read
     let startRow = 2;
     let endRow = maxRowsHardCap;
 
@@ -140,7 +135,6 @@ export async function GET(req: Request) {
         startRow = Math.max(2, endRow - tailRows + 1);
       }
     } else {
-      // fallback: still read a bounded range
       startRow = tailRows > 0 ? Math.max(2, maxRowsHardCap - tailRows + 1) : 2;
       endRow = maxRowsHardCap;
     }

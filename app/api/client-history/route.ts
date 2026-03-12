@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { google } from "googleapis";
 
 export const dynamic = "force-dynamic";
-export const runtime = "nodejs"; // ✅ important when using googleapis
+export const runtime = "nodejs";
 
 type ClientHistoryItem = {
   caregiverName: string;
@@ -23,10 +23,16 @@ function toInt(v: string | null, fallback: number) {
 }
 
 async function getSheetsClient() {
-  // mirrors your other routes
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_KEY");
+
+  const credentials = JSON.parse(raw);
+
   const auth = new google.auth.GoogleAuth({
+    credentials,
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
   });
+
   return google.sheets({ version: "v4", auth });
 }
 
@@ -37,10 +43,11 @@ export async function GET(req: Request) {
 
     const url = new URL(req.url);
     const client = norm(url.searchParams.get("client"));
-    if (!client) return NextResponse.json({ ok: false, error: "Missing client" }, { status: 400 });
+    if (!client) {
+      return NextResponse.json({ ok: false, error: "Missing client" }, { status: 400 });
+    }
 
-    // tune these if needed
-    const tailWeeks = toInt(url.searchParams.get("tailWeeks"), 26); // default: last ~26 weeks
+    const tailWeeks = toInt(url.searchParams.get("tailWeeks"), 26);
     const limit = toInt(url.searchParams.get("limit"), 20000);
 
     const tabName = process.env.HISTORICAL_DATA_TAB_NAME || "Historical Data";
@@ -52,7 +59,6 @@ export async function GET(req: Request) {
 
     const sheets = await getSheetsClient();
 
-    // header row
     const headerResp = await sheets.spreadsheets.values.get({
       spreadsheetId,
       range: `${tabName}!A1:${maxCols}1`,
@@ -63,7 +69,6 @@ export async function GET(req: Request) {
     const headers = (headerVals[0] || []).map(norm);
     if (headers.length === 0) throw new Error(`No headers found in ${tabName}`);
 
-    // columns
     const iDate = idx(headers, "Date");
     const iClient = idx(headers, "Client");
     const iCaregiver = idx(headers, "Caregiver");
@@ -74,7 +79,6 @@ export async function GET(req: Request) {
       );
     }
 
-    // determine how many rows exist (optional but helps)
     let endRow = toInt(process.env.HISTORICAL_DATA_MAX_ROWS || "50000", 50000);
     let startRow = 2;
 
@@ -83,8 +87,12 @@ export async function GET(req: Request) {
         spreadsheetId,
         fields: "sheets(properties(title,gridProperties(rowCount)))",
       });
-      const found = (meta.data.sheets || []).find((s: any) => s?.properties?.title === tabName);
+
+      const found = (meta.data.sheets || []).find(
+        (s: any) => s?.properties?.title === tabName
+      );
       const rowCount = found?.properties?.gridProperties?.rowCount;
+
       if (typeof rowCount === "number" && rowCount > 0) {
         endRow = Math.min(rowCount, endRow);
         if (tailRows > 0) startRow = Math.max(2, endRow - tailRows + 1);
@@ -92,7 +100,6 @@ export async function GET(req: Request) {
         if (tailRows > 0) startRow = Math.max(2, endRow - tailRows + 1);
       }
     } catch {
-      // if metadata read fails, just fall back to bounded range
       if (tailRows > 0) startRow = Math.max(2, endRow - tailRows + 1);
     }
 
@@ -104,15 +111,13 @@ export async function GET(req: Request) {
     });
 
     const rows = (dataResp.data.values || []) as string[][];
-
     const clientKey = client.toLowerCase();
 
-    // group by caregiver
     const map = new Map<string, { count: number; lastDate: string }>();
 
     for (const r of rows) {
       if (limit > 0 && map.size > 5000) {
-        // safety guard; doesn’t cap counts, just prevents runaway if something is weird
+        // safety guard placeholder
       }
 
       const rClient = norm(r[iClient]);
@@ -129,8 +134,9 @@ export async function GET(req: Request) {
         map.set(cg, { count: 1, lastDate: date });
       } else {
         existing.count += 1;
-        // string compare is usually OK for YYYY-MM-DD; if you have M/D/YYYY this is “best effort”
-        if (date && (!existing.lastDate || date > existing.lastDate)) existing.lastDate = date;
+        if (date && (!existing.lastDate || date > existing.lastDate)) {
+          existing.lastDate = date;
+        }
       }
     }
 
@@ -154,6 +160,9 @@ export async function GET(req: Request) {
       items,
     });
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: e?.message || "Unknown error" }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: e?.message || "Unknown error" },
+      { status: 500 }
+    );
   }
 }

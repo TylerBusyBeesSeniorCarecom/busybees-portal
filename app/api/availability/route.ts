@@ -1,16 +1,45 @@
 // app/api/availability/route.ts
 import { NextResponse } from "next/server";
 import { google } from "googleapis";
-import path from "path";
 
 async function getSheetsClient() {
-  const keyFile = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-  if (!keyFile) {
-    throw new Error("Missing GOOGLE_APPLICATION_CREDENTIALS");
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+
+  console.log("[availability] GOOGLE_SERVICE_ACCOUNT_KEY exists:", Boolean(raw));
+  console.log(
+    "[availability] GOOGLE_SERVICE_ACCOUNT_KEY length:",
+    raw ? raw.length : 0
+  );
+  console.log(
+    "[availability] GOOGLE_SERVICE_ACCOUNT_KEY preview:",
+    raw ? raw.slice(0, 80) : "(missing)"
+  );
+
+  if (!raw) {
+    throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_KEY");
   }
 
+  let credentials: any;
+  try {
+    credentials = JSON.parse(raw);
+  } catch (e: any) {
+    console.error("[availability] Failed to parse GOOGLE_SERVICE_ACCOUNT_KEY:", e);
+    throw new Error(
+      `Invalid GOOGLE_SERVICE_ACCOUNT_KEY JSON: ${e?.message ?? "parse failed"}`
+    );
+  }
+
+  console.log(
+    "[availability] Parsed credentials client_email:",
+    credentials?.client_email ?? "(missing)"
+  );
+  console.log(
+    "[availability] Parsed credentials project_id:",
+    credentials?.project_id ?? "(missing)"
+  );
+
   const auth = new google.auth.GoogleAuth({
-    keyFile: path.resolve(process.cwd(), keyFile),
+    credentials,
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
   });
 
@@ -25,6 +54,8 @@ export const dynamic = "force-dynamic";
 export async function GET(req: Request) {
   try {
     const spreadsheetId = process.env.TEST_SHEET_ID;
+    console.log("[availability] TEST_SHEET_ID exists:", Boolean(spreadsheetId));
+
     if (!spreadsheetId) {
       throw new Error("Missing TEST_SHEET_ID");
     }
@@ -36,14 +67,24 @@ export async function GET(req: Request) {
     const nwTab = process.env.NW_AVAIL_TAB_NAME || "NW Availability";
     const tabName = week === "nw" ? nwTab : cwTab;
 
+    console.log("[availability] week:", week);
+    console.log("[availability] tabName:", tabName);
+
     const sheets = await getSheetsClient();
     const range = `'${tabName}'!A1:L500`;
+
+    console.log("[availability] range:", range);
 
     const res = await sheets.spreadsheets.values.get({
       spreadsheetId,
       range,
       valueRenderOption: "FORMATTED_VALUE",
     });
+
+    console.log(
+      "[availability] rows returned:",
+      res.data.values ? res.data.values.length : 0
+    );
 
     return NextResponse.json({
       ok: true,
@@ -52,6 +93,8 @@ export async function GET(req: Request) {
       values: res.data.values ?? [],
     });
   } catch (err: any) {
+    console.error("[availability] Route error:", err);
+
     return NextResponse.json(
       { ok: false, error: err?.message ?? "Unknown error" },
       { status: 500 }

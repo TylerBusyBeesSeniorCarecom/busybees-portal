@@ -7,11 +7,13 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 async function getSheetsClient() {
-  const keyFile = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-  if (!keyFile) throw new Error("Missing GOOGLE_APPLICATION_CREDENTIALS in .env.local");
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_KEY in environment");
+
+  const credentials = JSON.parse(raw);
 
   const auth = new google.auth.GoogleAuth({
-    keyFile,
+    credentials,
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
   });
 
@@ -96,14 +98,12 @@ export async function GET() {
           nameOnSchedule,
           name,
 
-          // existing
           status: iStatus >= 0 ? norm(r[iStatus]) : "",
           certification: iCert >= 0 ? norm(r[iCert]) : "",
           role: iRole >= 0 ? norm(r[iRole]) : "",
           email: iEmail >= 0 ? norm(r[iEmail]) : "",
           phone: iPhone >= 0 ? norm(r[iPhone]) : "",
 
-          // ✅ new
           address: iAddress >= 0 ? norm(r[iAddress]) : "",
           dateInterviewed: iDateInterviewed >= 0 ? norm(r[iDateInterviewed]) : "",
           age: iAge >= 0 ? norm(r[iAge]) : "",

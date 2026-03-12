@@ -5,11 +5,13 @@ import { google } from "googleapis";
 export const dynamic = "force-dynamic";
 
 async function getSheetsClient() {
-  const keyFile = process.env.GOOGLE_APPLICATION_CREDENTIALS;
-  if (!keyFile) throw new Error("Missing GOOGLE_APPLICATION_CREDENTIALS");
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  if (!raw) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_KEY");
+
+  const credentials = JSON.parse(raw);
 
   const auth = new google.auth.GoogleAuth({
-    keyFile,
+    credentials,
     scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
   });
 
@@ -34,20 +36,24 @@ export async function GET(req: Request) {
     const weekStart = norm(url.searchParams.get("weekStart"));
     if (!weekStart) throw new Error("Missing weekStart");
 
-    // ✅ ABSOLUTE internal fetch
     const histRes = await fetch(
       `${origin}/api/historical-data?weekStart=${encodeURIComponent(weekStart)}&limit=5000`,
       { cache: "no-store" }
     );
     const hist = await histRes.json();
-    if (!histRes.ok || !hist?.ok) throw new Error(hist?.error || `Failed to load historical-data (${histRes.status})`);
+    if (!histRes.ok || !hist?.ok) {
+      throw new Error(hist?.error || `Failed to load historical-data (${histRes.status})`);
+    }
 
-    const shiftIds = new Set<string>((hist.rows || []).map((r: any) => norm(r.shiftId)).filter(Boolean));
-    if (shiftIds.size === 0) return NextResponse.json({ ok: true, clockMap: {}, locationMap: {} });
+    const shiftIds = new Set<string>(
+      (hist.rows || []).map((r: any) => norm(r.shiftId)).filter(Boolean)
+    );
+    if (shiftIds.size === 0) {
+      return NextResponse.json({ ok: true, clockMap: {}, locationMap: {} });
+    }
 
     const sheets = await getSheetsClient();
 
-    // --- CLOCKS (App Data) ---
     const appDataTab = process.env.APP_DATA_TAB_NAME || "App Data";
     const appDataRange = process.env.APP_DATA_RANGE || "A1:K50000";
 
@@ -72,12 +78,11 @@ export async function GET(req: Request) {
       if (!sid || !shiftIds.has(sid)) continue;
 
       clockMap[sid] = {
-        clockInTime: iCin >= 0 ? (norm(r[iCin]) || null) : null,
-        clockOutTime: iCout >= 0 ? (norm(r[iCout]) || null) : null,
+        clockInTime: iCin >= 0 ? norm(r[iCin]) || null : null,
+        clockOutTime: iCout >= 0 ? norm(r[iCout]) || null : null,
       };
     }
 
-    // --- LOCATION VERDICTS (Location Events) ---
     const locTab = process.env.LOCATION_EVENTS_TAB_NAME || "Location Events";
     const locRange = process.env.LOCATION_EVENTS_RANGE || "A1:K50000";
 
@@ -119,16 +124,23 @@ export async function GET(req: Request) {
       if (!sid || !shiftIds.has(sid)) continue;
 
       const action = iAction >= 0 ? norm(r[iAction]).toLowerCase() : "";
-      const verdict = iVerdict >= 0 ? (norm(r[iVerdict]) || null) : null;
-      const ts = iTS >= 0 ? (norm(r[iTS]) || null) : null;
+      const verdict = iVerdict >= 0 ? norm(r[iVerdict]) || null : null;
+      const ts = iTS >= 0 ? norm(r[iTS]) || null : null;
 
       const entry = ensure(sid);
-      if (action === "clock_in" || action === "clockin") entry.clockIn = { timestamp: ts, verdict };
-      if (action === "clock_out" || action === "clockout") entry.clockOut = { timestamp: ts, verdict };
+      if (action === "clock_in" || action === "clockin") {
+        entry.clockIn = { timestamp: ts, verdict };
+      }
+      if (action === "clock_out" || action === "clockout") {
+        entry.clockOut = { timestamp: ts, verdict };
+      }
     }
 
     return NextResponse.json({ ok: true, clockMap, locationMap });
   } catch (e: any) {
-    return NextResponse.json({ ok: false, error: e?.message || "Unknown error" }, { status: 500 });
+    return NextResponse.json(
+      { ok: false, error: e?.message || "Unknown error" },
+      { status: 500 }
+    );
   }
 }
