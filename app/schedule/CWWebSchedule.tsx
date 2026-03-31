@@ -457,7 +457,7 @@ type EditHistoryModalTarget = {
   caregiverName: string;
   startTime: string;
   endTime: string;
-  status: ShiftStatus;
+  status: ShiftCardStatus;
 };
 type EditHistoryOpenPayload = {
   a1Key: string;
@@ -468,7 +468,7 @@ type EditHistoryOpenPayload = {
   caregiverName: string;
   startTime: string;
   endTime: string;
-  status: ShiftStatus;
+  status: ShiftCardStatus;
 };
 type ShiftRateRecord = {
   shiftId: string;
