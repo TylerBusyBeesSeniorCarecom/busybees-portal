@@ -3,17 +3,26 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation"; // ✅ NEW
+import { useSession } from "next-auth/react";
 import ShiftCard from "./components/ShiftCard";
 import { useShiftInfo } from "./components/useShiftInfo";
 import { useMessagesUI } from "@/app/api/messages/MessagesContext";
 import TopNav from "./components/TopNav";
 import CaregiverWebSchedulePanel from "./components/CaregiverWebSchedulePanel";
 import ServiceRequestsPanel from "./components/AppServiceRequests";
+import OnboardingPanel from "./components/OnboardingPanel";
+import useDraftSchedule from "./hooks/useDraftSchedule";
 import {
   buildShiftSaveToast,
   parseShiftTextForFeedback,
   type ShiftSaveCaregiverInput,
+  type ShiftConflictMatch,
 } from "./utils/shiftSaveFeedback";
+import {
+  parseScheduleShiftCell,
+  convertScheduleShiftStatus,
+  type BaseShiftStatus,
+} from "./utils/scheduleShiftStatus";
 /**
  * NOTE (hydration + nested buttons):
  * The invalid DOM nesting error you showed ("<button> cannot be a descendant of <button>") is almost always
@@ -436,6 +445,93 @@ type GhostShift = {
   status?: string;
 };
 
+type CellEditHistoryPresenceMap = Record<string, boolean>;
+
+type EditHistoryModalTarget = {
+  a1: string;
+  clientName: string;
+  dateStr: string;
+  dayLabel: string;
+  week: WeekKind;
+  shiftId: string;
+  caregiverName: string;
+  startTime: string;
+  endTime: string;
+  status: ShiftStatus;
+};
+
+type ShiftRateRecord = {
+  shiftId: string;
+  rate: number | string | null;
+  updatedAt?: string;
+  updatedBy?: string;
+  reason?: string;
+
+  // raw sheet-backed fields from /api/shift-rates GET
+  raw?: Record<string, any>;
+};
+
+type ShiftRatesGetResponse = {
+  ok: boolean;
+  count?: number;
+  rows?: Record<string, any>[];
+  error?: string;
+};
+
+type ShiftRatesPostResponse = {
+  ok: boolean;
+  rate?: ShiftRateRecord | null;
+  error?: string;
+};
+
+type ScheduleEditLogRow = {
+  timestamp: string;
+  user: string;
+  userEmail: string;
+  actionType: string;
+  weekType: string;
+  weekOf: string;
+  date: string;
+  client: string;
+  oldValue: string;
+  newValue: string;
+  cell: string;
+  day: string;
+  oldStatus: string;
+  newStatus: string;
+  oldCaregiver: string;
+  newCaregiver: string;
+  oldStartTime: string;
+  newStartTime: string;
+  oldEndTime: string;
+  newEndTime: string;
+  notes: string;
+  accessPoint: string;
+};
+
+type ScheduleEditLogGetResponse = {
+  ok: boolean;
+  rows?: ScheduleEditLogRow[];
+  error?: string;
+};
+type BulkSelectedCell = {
+  a1: string;
+  week: WeekKind;
+  clientName: string;
+  dateStr: string;
+  dayLabel: string;
+  originalValue: string;
+};
+
+type BulkTargetStatus = Exclude<BaseShiftStatus, "Unknown">;
+
+type BulkSmartStatusFilter =
+  | "Any"
+  | "Open"
+  | "Filled"
+  | "Offered"
+  | "Considering"
+  | "PendingClientApproval";
 /** ---------- Status logic ---------- */
 
 export type ShiftStatus =
@@ -551,15 +647,12 @@ const DOW_LABELS = [
 ];
 
 // Sticky header sizing
-// Sticky header sizing
-// Sticky header sizing
-// Sticky header sizing
-// Sticky header sizing
 const STICKY_DAY_ROW_HEIGHT = 44;
+const STICKY_DATE_ROW_HEIGHT = 40;
 
 // ✅ TopNav is sticky and its height can change.
-// Measure it so the day/date rows stick directly under it.
-const TOPNAV_Z = 200; // keep nav above header rows
+// The schedule header rows must sit directly below it.
+const TOPNAV_Z = 200;
 const STICKY_DAY_Z = 150;
 const STICKY_DATE_Z = 140;
 
@@ -573,13 +666,68 @@ const EMPTY_CELL_HEIGHT = 20;
 function parseCaregiverFromCell(cellValue: string): string {
   const v = norm(cellValue);
   if (!v) return "";
+
   const s = normalizeCellText(v);
+
+  // New considering format: (Tara K, 9:00AM-2:00PM
+  const consideringOpenOnly = s.match(/^\(([^,]+),\s*\d{1,2}:\d{2}\s?[APMapm]{2}/);
+  if (consideringOpenOnly?.[1]) {
+    const cg = norm(consideringOpenOnly[1]);
+    return cg.toLowerCase() === "open" ? "" : cg;
+  }
+
+  // Older considering format fallback: (Tara K) 9:00AM-2:00PM
+  const consideringOld = s.match(/^\(([^)]+)\)\s*\d{1,2}:\d{2}\s?[APMapm]{2}/);
+  if (consideringOld?.[1]) {
+    const cg = norm(consideringOld[1]);
+    return cg.toLowerCase() === "open" ? "" : cg;
+  }
+
+  // Standard comma-based formats
   const idx = s.indexOf(",");
   if (idx === -1) return "";
-  const cg = s.slice(0, idx).replace(/[(")]/g, "").trim();
+
+  const cg = s.slice(0, idx).replace(/[(")\^$]/g, "").trim();
   if (!cg) return "";
   if (cg.toLowerCase() === "open") return "";
+
   return cg;
+}
+
+function parseCaregiverNameFromAnyShiftText(cellValue: string): string {
+  const v = norm(cellValue);
+  if (!v) return "";
+
+  const s = normalizeCellText(v);
+
+  // Filled: Tara K, 9:00AM-2:00PM
+  const filled = s.match(/^([^,*\$\(\)\^"]+)\s*,\s*\d{1,2}:\d{2}\s?[APMapm]{2}/);
+  if (filled?.[1]) return norm(filled[1]);
+
+  // Considering (new format): (Tara K, 9:00AM-2:00PM
+  const consideringOpenOnly = s.match(/^\(([^,]+),\s*\d{1,2}:\d{2}\s?[APMapm]{2}/);
+  if (consideringOpenOnly?.[1]) return norm(consideringOpenOnly[1]);
+
+  // Considering (older format fallback): (Tara K) 9:00AM-2:00PM
+  const consideringOld = s.match(/^\(([^)]+)\)\s*\d{1,2}:\d{2}\s?[APMapm]{2}/);
+  if (consideringOld?.[1]) return norm(consideringOld[1]);
+
+  // Offered (new format): "Tara K, 9:00AM-2:00PM
+const offeredOpenOnly = s.match(/^"([^,]+),\s*\d{1,2}:\d{2}\s?[APMapm]{2}/);
+if (offeredOpenOnly?.[1]) return norm(offeredOpenOnly[1]);
+
+// Offered (older format fallback): "Tara K" 9:00AM-2:00PM
+const offeredOld = s.match(/^"([^"]+)"\s*\d{1,2}:\d{2}\s?[APMapm]{2}/);
+if (offeredOld?.[1]) return norm(offeredOld[1]);
+  // Offering: ^Tara K, 9:00AM-2:00PM
+  const offering = s.match(/^\^([^,]+),\s*\d{1,2}:\d{2}\s?[APMapm]{2}/);
+  if (offering?.[1]) return norm(offering[1]);
+
+  // Pending: $Tara K, 9:00AM-2:00PM
+  const pending = s.match(/^\$([^,]+),\s*\d{1,2}:\d{2}\s?[APMapm]{2}/);
+  if (pending?.[1]) return norm(pending[1]);
+
+  return "";
 }
 
 function parseFirstTimeRange(
@@ -595,7 +743,18 @@ function parseFirstTimeRange(
     end: m[2].replace(/\s+/g, ""),
   };
 }
+function buildConsideringShiftValueFromExisting(args: {
+  existingValue: string;
+  caregiverName: string;
+}): string | null {
+  const caregiverName = norm(args.caregiverName);
+  if (!caregiverName) return null;
 
+  const timeRange = parseFirstTimeRange(args.existingValue);
+  if (!timeRange) return null;
+
+  return `(${caregiverName}, ${timeRange.start}-${timeRange.end}`;
+}
 /** ---------- Time helpers ---------- */
 
 function toDateSafe(dateStr: string): Date | null {
@@ -642,6 +801,19 @@ function dateKey(dateStr: string): string {
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
+}
+
+function a1ColumnLetters(a1: string): string {
+  const m = String(a1 || "").match(/^[A-Z]+/i);
+  return (m?.[0] || "").toUpperCase();
+}
+
+function columnLettersToNumber(col: string): number {
+  let n = 0;
+  for (let i = 0; i < col.length; i++) {
+    n = n * 26 + (col.charCodeAt(i) - 64);
+  }
+  return n;
 }
 
 function parseTimeToMinutes(t: string): number | null {
@@ -697,6 +869,56 @@ function fmtNiceTime(d: Date | null): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function formatIsoTimestampForDisplay(raw: string): string {
+  const s = norm(raw);
+  if (!s) return "—";
+
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return s;
+
+  return d.toLocaleString(undefined, {
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function formatSingleTimeForDisplay(raw: string): string {
+  const s = norm(raw);
+  if (!s) return "";
+
+  // ✅ If it already looks like a normal schedule time, keep it
+  if (/^\d{1,2}:\d{2}\s?[APMapm]{2}$/.test(s)) {
+    return s.replace(/\s+/g, "");
+  }
+
+  // ✅ If Google/Apps Script turned it into a full Date string, convert to time only
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) {
+    return d.toLocaleTimeString(undefined, {
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true,
+    }).replace(/\s/g, "");
+  }
+
+  // ✅ fallback
+  return s;
+}
+
+function formatTimeRangeForDisplay(start: string, end: string): string {
+  const s = formatSingleTimeForDisplay(start);
+  const e = formatSingleTimeForDisplay(end);
+
+  if (!s && !e) return "—";
+  if (!s) return e;
+  if (!e) return s;
+
+  return `${s}-${e}`;
 }
 
 function evalClockForShiftLikeScheduleClient(
@@ -1114,13 +1336,152 @@ async function updateCell(week: WeekKind, a1: string, value: string) {
   });
 
   const text = await r.text();
-  const data = text ? JSON.parse(text) : null;
+  const data = text ? JSON.parse(text.trim()) : null;
 
   if (!r.ok) throw new Error(data?.error || `Update failed (${r.status})`);
   if (!data?.ok) throw new Error(data?.error || "Update failed");
   return data;
 }
 
+async function fetchScheduleEditLog(week: WeekKind): Promise<ScheduleEditLogRow[]> {
+  const res = await fetch(`/api/schedule-edit-log?week=${encodeURIComponent(week)}`, {
+    cache: "no-store",
+  });
+
+  const text = await res.text();
+  let j: ScheduleEditLogGetResponse | any = null;
+
+  try {
+    j = text ? JSON.parse(text.trim()) : null;
+  } catch {
+    throw new Error(`Non-JSON schedule edit log response (${res.status}): ${text.slice(0, 200)}`);
+  }
+
+  if (!res.ok) throw new Error(j?.error || `Schedule edit log request failed (${res.status})`);
+  if (!j?.ok) throw new Error(j?.error || "Failed to load schedule edit log");
+
+  return Array.isArray(j.rows) ? j.rows : [];
+}
+
+async function fetchShiftRateByShiftId(shiftId: string): Promise<ShiftRateRecord | null> {
+  if (!norm(shiftId)) return null;
+
+  const res = await fetch(`/api/shift-rates?shiftId=${encodeURIComponent(shiftId)}`, {
+    cache: "no-store",
+  });
+
+  const text = await res.text();
+  let j: ShiftRatesGetResponse | any = null;
+
+  try {
+    j = text ? JSON.parse(text.trim()) : null;
+  } catch {
+    throw new Error(`Non-JSON shift-rates response (${res.status}): ${text.slice(0, 200)}`);
+  }
+
+  if (!res.ok) throw new Error(j?.error || `Shift rate request failed (${res.status})`);
+  if (!j?.ok) throw new Error(j?.error || "Failed to load shift rate");
+
+  const rows = Array.isArray(j?.rows) ? j.rows : [];
+  const match = rows.find((row: any) => norm(row?.["Shift ID"]) === norm(shiftId));
+
+  if (!match) return null;
+
+  return {
+    shiftId: norm(match?.["Shift ID"]),
+    rate: match?.["Final Pay Rate"] ?? match?.["Base Rate"] ?? "",
+    updatedAt:
+      norm(match?.["TimeStamp"]) ||
+      norm(match?.["Approved Timestamp"]) ||
+      norm(match?.["Last Synced At"]),
+    updatedBy: norm(match?.["Updated By"]) || norm(match?.["Approved By"]),
+    reason: norm(match?.["Rate Source Detail"]) || norm(match?.["Updated Source"]),
+    raw: match,
+  };
+}
+async function saveShiftRate(args: {
+  shiftId: string;
+  newRate: number;
+  updatedBy: string;
+  reason?: string;
+}): Promise<ShiftRateRecord | null> {
+  const res = await fetch("/api/shift-rates", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      action: "updateShiftRate",
+      shiftId: args.shiftId,
+      newRate: args.newRate,
+      updatedBy: args.updatedBy,
+      reason: args.reason || "",
+    }),
+  });
+
+  const text = await res.text();
+  let j: ShiftRatesPostResponse | any = null;
+
+  try {
+    j = text ? JSON.parse(text.trim()) : null;
+  } catch {
+    throw new Error(`Shift rate save failed (${res.status})`);
+  }
+
+  if (!res.ok || !j?.ok) {
+    throw new Error(j?.error || `Shift rate save failed (${res.status})`);
+  }
+
+  return j?.rate ?? null;
+}
+
+async function logAndSaveScheduleEdit(args: {
+  timestamp: string;
+  user: string;
+  userEmail: string;
+  actionType: string;
+  weekType: "cw" | "nw";
+  weekOf?: string;
+  date: string;
+  client: string;
+  oldValue: string;
+  newValue: string;
+  cell: string;
+  day: string;
+  oldStatus: string;
+  newStatus: string;
+  oldCaregiver: string;
+  newCaregiver: string;
+  oldStartTime: string;
+  newStartTime: string;
+  oldEndTime: string;
+  newEndTime: string;
+  notes: string;
+  accessPoint: string;
+}) {
+  const res = await fetch("/api/schedule-edit-log", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(args),
+  });
+
+  const text = await res.text();
+  let data: any = null;
+
+  try {
+    data = text ? JSON.parse(text.trim()) : null;
+  } catch {
+    throw new Error(`Schedule edit log save failed (${res.status})`);
+  }
+
+  if (!res.ok || !data?.ok) {
+    throw new Error(data?.error || `Schedule edit log save failed (${res.status})`);
+  }
+
+  return data;
+}
 async function fetchScheduleMaps(week: WeekKind): Promise<{
   values: RawValues;
   clockMap: ClockMap;
@@ -1375,6 +1736,19 @@ function makeShiftLookupKey(args: {
   return `${client}__${date}__${start}__${end}__${caregiver}`;
 }
 
+function makeCellEditHistoryKey(args: {
+  week: WeekKind;
+  a1: string;
+  clientName: string;
+  dateStr: string;
+}) {
+  return [
+    args.week,
+    normalizeKey(args.a1),
+    normalizeKey(args.clientName),
+    dateKey(args.dateStr),
+  ].join("__");
+}
 /** ---------- Modal ---------- */
 
 function Modal({
@@ -1409,15 +1783,15 @@ function Modal({
       }}
     >
       <div
-        style={{
-          width: "min(780px, 96vw)",
-          background: UI.panelBg,
-          border: `1px solid ${UI.border}`,
-          borderRadius: 14,
-          overflow: "hidden",
-          boxShadow: "0 12px 34px rgba(0,0,0,0.22)",
-        }}
-      >
+  style={{
+    width: "min(680px, 96vw)",
+    background: UI.panelBg,
+    border: `1px solid ${UI.border}`,
+    borderRadius: 14,
+    overflow: "hidden",
+    boxShadow: "0 12px 34px rgba(0,0,0,0.22)",
+  }}
+>
         <div
           style={{
             padding: 12,
@@ -1596,27 +1970,80 @@ export default function CWWebSchedule() {
   const router = useRouter(); // ✅ NEW
   const pathname = usePathname() || "/schedule"; // ✅ NEW
   const searchParams = useSearchParams(); // ✅ NEW
-const [applicantSearch, setApplicantSearch] = useState("");
-  const [week, setWeek] = useState<WeekKind>("cw");
 
-  // ✅ TopNav height tracking (MUST live inside component)
+  // ✅ signed-in portal user from NextAuth
+  const { data: session, status: sessionStatus } = useSession();
+
+  const currentUserName =
+    session?.user?.name?.trim() || "Unknown User";
+
+  const currentUserEmail =
+    session?.user?.email?.trim() || "";
+
+  // ✅ for now, "online users" = current signed-in user only
+  // later we can replace this with true shared presence tracking
+  const portalUsersOnline = useMemo(() => {
+    if (!currentUserEmail) return [];
+    return [
+      {
+        name: currentUserName,
+        email: currentUserEmail,
+        isCurrentUser: true,
+      },
+    ];
+  }, [currentUserName, currentUserEmail]);
+
+ const [applicantSearch, setApplicantSearch] = useState("");
+const [week, setWeek] = useState<WeekKind>("cw");
+
+const [panelOpen, setPanelOpen] = useState(false);
+const [panelWidth, setPanelWidth] = useState(470);
+
+function handlePanelResize(nextWidth: number) {
+  const clamped = Math.max(360, Math.min(760, Math.round(nextWidth)));
+  setPanelWidth(clamped);
+}
+
+const {
+  draftMode,
+  toggleDraftMode,
+  resetDraft,
+  undo,
+  redo,
+  canUndo,
+  canRedo,
+  hasDraftChanges,
+  changedCellCount,
+  setDraftCell,
+  getDraftValue,
+  isCellChanged,
+  buildSavePayload,
+} = useDraftSchedule();
+
+    // ✅ TopNav height tracking (MUST live inside component)
   const [topNavH, setTopNavH] = useState(0);
   const topNavRef = useRef<HTMLDivElement | null>(null);
 
   // ✅ Computed sticky tops (depend on topNavH)
-  const STICKY_DAY_ROW_TOP = topNavH;
-  const STICKY_DATE_ROW_TOP = topNavH + STICKY_DAY_ROW_HEIGHT;
-
-  // ✅ Measure TopNav height so sticky table headers sit right under it
+  // The day/date header rows should sit directly below the sticky TopNav.
+  // This is the correct setup for the final table/header layout fix.
+  // ✅ Computed sticky tops (depend on measured TopNav height)
+// Day row should sit directly under TopNav
+// Date row should sit directly under the day row
+const STICKY_DAY_ROW_TOP = 0;
+const STICKY_DATE_ROW_TOP = STICKY_DAY_ROW_HEIGHT;
+    // ✅ Measure TopNav height so sticky schedule headers sit right under it
   useEffect(() => {
     const el = topNavRef.current;
     if (!el) return;
 
-    const update = () => setTopNavH(el.offsetHeight || 0);
+    const update = () => {
+      setTopNavH(el.offsetHeight || 0);
+    };
 
     update();
 
-    const ro = new ResizeObserver(update);
+    const ro = new ResizeObserver(() => update());
     ro.observe(el);
 
     window.addEventListener("resize", update);
@@ -1626,7 +2053,6 @@ const [applicantSearch, setApplicantSearch] = useState("");
       window.removeEventListener("resize", update);
     };
   }, []);
-
   // ✅ NEW: write week to URL (preserve any existing query params)
   function setWeekAndUrl(next: WeekKind) {
     setWeek(next);
@@ -1652,10 +2078,13 @@ const [applicantSearch, setApplicantSearch] = useState("");
   const messagesUI = useMessagesUI();
   const { openPanel } = messagesUI;
 
-  // grid
+    // grid
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [data, setData] = useState<GridResponse | null>(null);
+
+  // publish
+  const [publishingSchedule, setPublishingSchedule] = useState(false);
 
   // maps
   const [clockMap, setClockMap] = useState<ClockMap>({});
@@ -1697,18 +2126,54 @@ const [applicantSearch, setApplicantSearch] = useState("");
   const [clientsError, setClientsError] = useState<string | null>(null);
   const [clientsByName, setClientsByName] = useState<Record<string, ClientProfile>>({});
 
-  // client profile modal
+    // client profile modal
   const [clientProfileOpen, setClientProfileOpen] = useState(false);
-  const [clientProfileName, setClientProfileName] = useState<string>("");
+const [clientProfileName, setClientProfileName] = useState<string>("");
 
-  // ✅ Service Requests panel (per-client, per-week)
+// edit history modal
+const [editHistoryModalTarget, setEditHistoryModalTarget] =
+  useState<EditHistoryModalTarget | null>(null);
+const [editHistoryLoading, setEditHistoryLoading] = useState(false);
+const [editHistoryError, setEditHistoryError] = useState<string | null>(null);
+const [scheduleEditLogRows, setScheduleEditLogRows] = useState<ScheduleEditLogRow[]>([]);
+
+// shift rate state
+const [shiftRateLoading, setShiftRateLoading] = useState(false);
+const [shiftRateError, setShiftRateError] = useState<string | null>(null);
+const [shiftRateValue, setShiftRateValue] = useState<string>("");
+const [shiftRateOriginalValue, setShiftRateOriginalValue] = useState<string>("");
+const [shiftRateReason, setShiftRateReason] = useState<string>("");
+const [shiftRateUpdatedAt, setShiftRateUpdatedAt] = useState<string>("");
+const [shiftRateUpdatedBy, setShiftRateUpdatedBy] = useState<string>("");
+const [shiftRateSaving, setShiftRateSaving] = useState(false);
+
+// ✅ Onboarding panel
+const [onboardingOpen, setOnboardingOpen] = useState(false);
+   // ✅ Service Requests panel (per-client, per-week)
   const [svcPanelOpen, setSvcPanelOpen] = useState(false);
   const [svcClientName, setSvcClientName] = useState<string>("");
 
+  // ✅ Insert row modal
+  const [insertRowModal, setInsertRowModal] = useState<{
+  open: boolean;
+  anchorRow: number | null;
+  insertAtRow: number | null;
+  position: "above" | "below";
+  clientName: string;
+  anchorClientName: string;
+}>({
+  open: false,
+  anchorRow: null,
+  insertAtRow: null,
+  position: "below",
+  clientName: "",
+  anchorClientName: "",
+});
+
+const [insertRowSaving, setInsertRowSaving] = useState(false);
   // filters
   const [selectedDow, setSelectedDow] = useState<number | null>(null);
   const [searchText, setSearchText] = useState("");
-
   // expanded shift cards
   const [expandedA1ByWeek, setExpandedA1ByWeek] = useState<Record<WeekKind, Set<string>>>({
     cw: new Set(),
@@ -1723,29 +2188,64 @@ const [applicantSearch, setApplicantSearch] = useState("");
     });
   };
 
-  useEffect(() => {
+   useEffect(() => {
     setExpandedA1ByWeek((prev) => ({
       ...prev,
       [week]: new Set(),
     }));
+
+    setInsertRowModal({
+      open: false,
+      insertAtRow: null,
+      clientName: "",
+      anchorClientName: "",
+    });
   }, [week]);
 
-    // edit modal
-  const [editOpen, setEditOpen] = useState(false);
-  const [editA1, setEditA1] = useState<string | null>(null);
-  const [editClientName, setEditClientName] = useState<string>("");
-  const [editDayLabel, setEditDayLabel] = useState<string>("");
-  const [editDraft, setEditDraft] = useState<string>("");
-  const [savingA1, setSavingA1] = useState<string | null>(null);
+      // inline cell editing
+   const [editingA1, setEditingA1] = useState<string | null>(null);
+  const [draftByA1, setDraftByA1] = useState<Record<string, string>>({});
+  const [dragOverA1, setDragOverA1] = useState<string | null>(null);
 
-  // shift save feedback toast
+  // allow independent cell save states
+  const [savingA1Set, setSavingA1Set] = useState<Set<string>>(new Set());
+    // shift save feedback toast
   const [saveToast, setSaveToast] = useState<{
     id: number;
     kind: "success" | "warning" | "error";
     title: string;
     lines: string[];
   } | null>(null);
-  function openClientProfile(clientName: string) {
+
+  // ✅ remembers which just-saved cell has a conflict
+    const [conflictHighlight, setConflictHighlight] = useState<{
+    a1: string;
+    conflicts: ShiftConflictMatch[];
+  } | null>(null);
+
+ const [cellEditHistoryPresence, setCellEditHistoryPresence] =
+  useState<CellEditHistoryPresenceMap>({});
+// bulk editing
+const [bulkMode, setBulkMode] = useState(false);
+const [selectedBulkCells, setSelectedBulkCells] = useState<Record<string, BulkSelectedCell>>({});
+const [bulkApplying, setBulkApplying] = useState(false);
+
+const [bulkSmartCaregiver, setBulkSmartCaregiver] = useState("");
+const [bulkSmartClient, setBulkSmartClient] = useState("");
+const [bulkSmartStatus, setBulkSmartStatus] = useState<BulkSmartStatusFilter>("Any");
+const [bulkCancelledTarget, setBulkCancelledTarget] = useState<
+  "keep" | "cancelled" | "not_cancelled"
+>("keep");
+
+const [bulkSelectionMode, setBulkSelectionMode] = useState<
+  "caregiver" | "client" | "status" | "manual"
+>("caregiver");
+
+const [showCaregiverSuggestions, setShowCaregiverSuggestions] = useState(false);
+const [showClientSuggestions, setShowClientSuggestions] = useState(false);
+
+const selectedBulkCount = Object.keys(selectedBulkCells).length;
+    function openClientProfile(clientName: string) {
     const n = norm(clientName);
     if (!n) return;
     const p = clientsByName[normalizeKey(n)];
@@ -1753,13 +2253,123 @@ const [applicantSearch, setApplicantSearch] = useState("");
     setClientProfileOpen(true);
   }
 
-  // caregiver panel
-  const [panelOpen, setPanelOpen] = useState(true);
-  const [availLoading, setAvailLoading] = useState(false);
-  const [availError, setAvailError] = useState<string | null>(null);
-  const [availValues, setAvailValues] = useState<RawValues>([]);
-  const [availTabName, setAvailTabName] = useState<string>("");
+  function openInsertRowModal(args: {
+  anchorRow: number;
+  anchorClientName: string;
+}) {
+  const anchorClientName = args.anchorClientName || "";
 
+  setInsertRowModal({
+    open: true,
+    anchorRow: args.anchorRow,
+    insertAtRow: args.anchorRow + 1,
+    position: "below",
+    clientName: anchorClientName,
+    anchorClientName,
+  });
+}
+
+function closeInsertRowModal() {
+  if (insertRowSaving) return;
+
+  setInsertRowModal({
+    open: false,
+    anchorRow: null,
+    insertAtRow: null,
+    position: "below",
+    clientName: "",
+    anchorClientName: "",
+  });
+}
+function setInsertRowPosition(position: "above" | "below") {
+  setInsertRowModal((prev) => {
+    const anchorRow = prev.anchorRow;
+    if (!anchorRow) return prev;
+
+    return {
+      ...prev,
+      position,
+      insertAtRow: position === "above" ? anchorRow : anchorRow + 1,
+    };
+  });
+}
+  function isCellSaving(a1: string) {
+    return savingA1Set.has(a1);
+  }
+
+  function markCellSaving(a1: string) {
+    setSavingA1Set((prev) => {
+      const next = new Set(prev);
+      next.add(a1);
+      return next;
+    });
+  }
+
+    function unmarkCellSaving(a1: string) {
+    setSavingA1Set((prev) => {
+      const next = new Set(prev);
+      next.delete(a1);
+      return next;
+    });
+  }
+
+  function markCellHasEditHistory(args: {
+  week: WeekKind;
+  a1: string;
+  clientName: string;
+  dateStr: string;
+}) {
+  const key = makeCellEditHistoryKey(args);
+
+  setCellEditHistoryPresence((prev) => ({
+    ...prev,
+    [key]: true,
+  }));
+}
+
+async function refreshScheduleEditLogForWeek(targetWeek: WeekKind) {
+  try {
+    setEditHistoryLoading(true);
+    setEditHistoryError(null);
+    const rows = await fetchScheduleEditLog(targetWeek);
+    setScheduleEditLogRows(rows);
+  } catch (err: any) {
+    setEditHistoryError(err?.message || "Failed to load edit history.");
+    setScheduleEditLogRows([]);
+  } finally {
+    setEditHistoryLoading(false);
+  }
+}
+
+async function loadShiftRateForTarget(target: EditHistoryModalTarget) {
+  try {
+    setShiftRateLoading(true);
+    setShiftRateError(null);
+    setShiftRateValue("");
+    setShiftRateOriginalValue("");
+    setShiftRateReason("");
+    setShiftRateUpdatedAt("");
+    setShiftRateUpdatedBy("");
+
+    const rateRow = await fetchShiftRateByShiftId(target.shiftId);
+    const nextRate = rateRow?.rate == null ? "" : String(rateRow.rate);
+
+    setShiftRateValue(nextRate);
+    setShiftRateOriginalValue(nextRate);
+    setShiftRateUpdatedAt(norm(rateRow?.updatedAt));
+    setShiftRateUpdatedBy(norm(rateRow?.updatedBy));
+    setShiftRateReason(norm(rateRow?.reason));
+  } catch (err: any) {
+    setShiftRateError(err?.message || "Failed to load shift rate.");
+  } finally {
+    setShiftRateLoading(false);
+  }
+}
+  // caregiver panel
+const [availLoading, setAvailLoading] = useState(false);
+const [availError, setAvailError] = useState<string | null>(null);
+const [availValues, setAvailValues] = useState<RawValues>([]);
+const [availTabName, setAvailTabName] = useState<string>("");
   const [panelSearch, setPanelSearch] = useState("");
   const [panelSelectedDow, setPanelSelectedDow] = useState<number | null>(null);
   const [panelFilter, setPanelFilter] = useState<"all" | "certifiedActive" | "missingProfile">("all");
@@ -1769,7 +2379,7 @@ const [applicantSearch, setApplicantSearch] = useState("");
     setData(j);
   }
 
-  async function refreshScheduleMapsForWeek(w: WeekKind) {
+    async function refreshScheduleMapsForWeek(w: WeekKind) {
     const sched = await fetchScheduleMaps(w);
     setClockMap(sched.clockMap ?? {});
     setLocationMap(sched.locationMap ?? {});
@@ -1788,6 +2398,150 @@ const [applicantSearch, setApplicantSearch] = useState("");
       if (s.shiftId) lookup[key] = s.shiftId;
     }
     setShiftIdLookup(lookup);
+  }
+
+    async function handlePublishSchedule() {
+    try {
+      setPublishingSchedule(true);
+
+      const weekType = week === "cw" ? "current" : "next";
+
+      const res = await fetch("/api/publish-schedule", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ weekType }),
+      });
+
+      const text = await res.text();
+      let data: any = null;
+
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        throw new Error(`Non-JSON publish response (${res.status}): ${text.slice(0, 200)}`);
+      }
+
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || "Failed to publish schedule.");
+      }
+
+      await Promise.all([
+        loadGridForWeek(week),
+        refreshScheduleMapsForWeek(week),
+        refreshGhostShiftsForWeek(week),
+        refreshScheduleEditLogForWeek(week),
+      ]);
+
+      const result = data?.result || {};
+      const rowsWritten = result?.rowsWritten;
+      const destinationSheet =
+        result?.destinationSheet || (week === "cw" ? "All Shifts" : "NW All Shifts");
+
+      setSaveToast({
+        id: Date.now(),
+        kind: "success",
+        title: week === "cw" ? "Current Week published" : "Next Week published",
+        lines: [
+          `Published to ${destinationSheet}.`,
+          rowsWritten != null
+            ? `${rowsWritten} row${rowsWritten === 1 ? "" : "s"} written.`
+            : "Publish completed successfully.",
+        ],
+      });
+    } catch (err: any) {
+      setSaveToast({
+        id: Date.now(),
+        kind: "error",
+        title: "Publish failed",
+        lines: [err?.message || "Unable to publish the schedule."],
+      });
+    } finally {
+      setPublishingSchedule(false);
+    }
+  }
+
+  async function handleInsertRowSubmit() {
+    const insertAtRow = insertRowModal.insertAtRow;
+    const clientName = norm(insertRowModal.clientName);
+
+    if (!insertAtRow) {
+      setSaveToast({
+        id: Date.now(),
+        kind: "error",
+        title: "Add row failed",
+        lines: ["Missing target row."],
+      });
+      return;
+    }
+
+    if (!clientName) {
+      setSaveToast({
+        id: Date.now(),
+        kind: "warning",
+        title: "Client name required",
+        lines: ["Please enter a client name before adding the row."],
+      });
+      return;
+    }
+
+    try {
+      setInsertRowSaving(true);
+
+      const res = await fetch("/api/insert-row", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          sheetName: sheetLabelForWeek(week),
+          insertAtRow,
+          clientName,
+        }),
+      });
+
+      const text = await res.text();
+      let data: any = null;
+
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        throw new Error(`Non-JSON insert-row response (${res.status}): ${text.slice(0, 200)}`);
+      }
+
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || "Failed to insert row.");
+      }
+
+      await Promise.all([
+        loadGridForWeek(week),
+        refreshScheduleMapsForWeek(week),
+        refreshGhostShiftsForWeek(week),
+        refreshScheduleEditLogForWeek(week),
+      ]);
+
+      setSaveToast({
+        id: Date.now(),
+        kind: "success",
+        title: "Row added",
+        lines: [
+          `Inserted row ${insertAtRow}.`,
+          `Client: ${clientName}`,
+        ],
+      });
+
+      closeInsertRowModal();
+    } catch (err: any) {
+      setSaveToast({
+        id: Date.now(),
+        kind: "error",
+        title: "Add row failed",
+        lines: [err?.message || "Unable to insert the row."],
+      });
+    } finally {
+      setInsertRowSaving(false);
+    }
   }
 
   async function refreshGhostShiftsForWeek(w: WeekKind) {
@@ -1888,12 +2642,13 @@ const [applicantSearch, setApplicantSearch] = useState("");
         if (!alive) return;
         setData(j);
 
-        await Promise.all([
+      await Promise.all([
   refreshScheduleMapsForWeek(week),
   refreshCaregivers(),
-  refreshApplicants(), // ✅ add
+  refreshApplicants(),
   refreshClients(),
   refreshGhostShiftsForWeek(week),
+  refreshScheduleEditLogForWeek(week),
   (async () => {
     try {
       setHistLoading(true);
@@ -1961,16 +2716,33 @@ const [applicantSearch, setApplicantSearch] = useState("");
     };
   }, [panelOpen, week]);
 
-  useEffect(() => {
-    if (!saveToast) return;
+    useEffect(() => {
+  if (!saveToast) return;
 
-    const timer = window.setTimeout(() => {
-      setSaveToast((prev) => (prev?.id === saveToast.id ? null : prev));
-    }, 5000);
+  const timer = window.setTimeout(() => {
+    setSaveToast((prev) => (prev?.id === saveToast.id ? null : prev));
+  }, 60000);
 
-    return () => window.clearTimeout(timer);
-  }, [saveToast]);
+  return () => window.clearTimeout(timer);
+}, [saveToast]);
 
+useEffect(() => {
+  if (!draftMode) {
+    setDragOverA1(null);
+  }
+}, [draftMode]);
+
+useEffect(() => {
+  if (!bulkMode) {
+    setSelectedBulkCells({});
+    setBulkSelectionMode("caregiver");
+    setBulkSmartCaregiver("");
+    setBulkSmartClient("");
+    setBulkSmartStatus("Any");
+    setShowCaregiverSuggestions(false);
+    setShowClientSuggestions(false);
+  }
+}, [bulkMode]);
   /** ---------- Week window (for ghost shifts) ---------- */
 
   const weekStartYmd = useMemo(() => {
@@ -2082,19 +2854,37 @@ const [applicantSearch, setApplicantSearch] = useState("");
   }, [requestCountByClientKey, requestDowsByClientKey, scheduledDowsByClientKey]);
   /** ---------- Client history (modal) ---------- */
 
-  const clientCaregiverHistory = useMemo(() => {
-    if (!clientProfileOpen || !clientProfileName) return [];
-    return buildClientHistoryList({
-      clientName: clientProfileName,
-      historicalRows: histRows,
-      caregiversById,
-      idByNameOnSchedule,
-    });
-  }, [clientProfileOpen, clientProfileName, histRows, caregiversById, idByNameOnSchedule]);
+ const clientCaregiverHistory = useMemo(() => {
+  if (!clientProfileOpen || !clientProfileName) return [];
+  return buildClientHistoryList({
+    clientName: clientProfileName,
+    historicalRows: histRows,
+    caregiversById,
+    idByNameOnSchedule,
+  });
+}, [clientProfileOpen, clientProfileName, histRows, caregiversById, idByNameOnSchedule]);
 
+const selectedCellHistoryRows = useMemo(() => {
+  if (!editHistoryModalTarget) return [];
+
+  return scheduleEditLogRows
+    .filter((row) => {
+      return (
+        normalizeKey(row.cell) === normalizeKey(editHistoryModalTarget.a1) &&
+        normalizeKey(row.client) === normalizeKey(editHistoryModalTarget.clientName) &&
+        dateKey(row.date) === dateKey(editHistoryModalTarget.dateStr) &&
+        normalizeKey(row.weekType) === normalizeKey(editHistoryModalTarget.week)
+      );
+    })
+    .sort((a, b) => {
+      const ta = new Date(a.timestamp).getTime();
+      const tb = new Date(b.timestamp).getTime();
+      return tb - ta;
+    });
+}, [editHistoryModalTarget, scheduleEditLogRows]);
  
 
-  const rows = useMemo(() => {
+    const rows = useMemo(() => {
     const q = searchText.trim();
     if (!q) return rowsAll;
 
@@ -2112,10 +2902,25 @@ const [applicantSearch, setApplicantSearch] = useState("");
       if (containsCI(clientDescription, q)) return true;
       if (containsCI(clientRate, q)) return true;
 
-      const anyCell = r.cells.some((c) => containsCI(norm(c.value), q));
+      const anyCell = r.cells.some((c) => {
+        const originalValue = norm(c.value);
+        const effectiveValue =
+          draftMode && c.a1
+            ? norm(
+                getDraftValue({
+                  a1: c.a1,
+                  week,
+                  originalValue,
+                })
+              )
+            : originalValue;
+
+        return containsCI(effectiveValue, q);
+      });
+
       return anyCell;
     });
-  }, [rowsAll, searchText, clientsByName]);
+  }, [rowsAll, searchText, clientsByName, draftMode, getDraftValue, week]);
 
   const dayHeaders = data?.headers?.dayHeaders ?? ["Client Name", ...DOW_LABELS];
   const dateHeaders = data?.headers?.dateHeaders ?? ["Date", "", "", "", "", "", "", ""];
@@ -2142,30 +2947,186 @@ const [applicantSearch, setApplicantSearch] = useState("");
     return map;
   }, [ghostShiftsThisWeek]);
 
-  const visibleDows = useMemo(() => {
+    const visibleDows = useMemo(() => {
     if (selectedDow == null) return [0, 1, 2, 3, 4, 5, 6];
     return [selectedDow];
   }, [selectedDow]);
 
-  const clientWorstStatus = useMemo(() => {
+  const visibleBulkCandidates = useMemo(() => {
+    const out: BulkSelectedCell[] = [];
+
+    for (const r of rows) {
+      const clientName = norm(r.clientName);
+
+      for (const dow of visibleDows) {
+        const c = r.cells[dow];
+        const a1 = c?.a1 || "";
+        if (!a1) continue;
+
+        const originalValue = norm(c?.value);
+        const effectiveValue =
+          draftMode
+            ? norm(
+                getDraftValue({
+                  a1,
+                  week,
+                  originalValue,
+                })
+              )
+            : originalValue;
+
+        if (!effectiveValue) continue;
+
+        const dateStr = norm(dateHeaders?.[dow + 1]);
+        const dayLabel = dayHeaders?.[dow + 1] || DOW_LABELS[dow];
+
+        out.push({
+          a1,
+          week,
+          clientName,
+          dateStr,
+          dayLabel,
+          originalValue: effectiveValue,
+        });
+      }
+    }
+
+    return out;
+  }, [rows, visibleDows, draftMode, getDraftValue, week, dateHeaders, dayHeaders]);
+  function smartSelectByCaregiver(caregiverName: string) {
+  const target = normalizeKey(caregiverName);
+  if (!target) return;
+
+  const matches = visibleBulkCandidates.filter((cell) => {
+    const parsed = parseScheduleShiftCell(cell.originalValue);
+    return normalizeKey(parsed.caregiverName || "") === target;
+  });
+
+  const next: Record<string, BulkSelectedCell> = {};
+  for (const m of matches) next[m.a1] = m;
+  setSelectedBulkCells(next);
+}
+
+function smartSelectByClient(clientName: string) {
+  const target = normalizeKey(clientName);
+  if (!target) return;
+
+  const matches = visibleBulkCandidates.filter(
+    (cell) => normalizeKey(cell.clientName) === target
+  );
+
+  const next: Record<string, BulkSelectedCell> = {};
+  for (const m of matches) next[m.a1] = m;
+  setSelectedBulkCells(next);
+}
+
+function smartSelectByStatus(status: Exclude<BulkSmartStatusFilter, "Any">) {
+  const matches = visibleBulkCandidates.filter((cell) => {
+    const parsed = parseScheduleShiftCell(cell.originalValue);
+    return parsed.baseStatus === status;
+  });
+
+  const next: Record<string, BulkSelectedCell> = {};
+  for (const m of matches) next[m.a1] = m;
+  setSelectedBulkCells(next);
+}
+
+function smartSelectByCaregiverAndStatus(
+  caregiverName: string,
+  status: BulkSmartStatusFilter
+) {
+  const target = normalizeKey(caregiverName);
+  if (!target) return;
+
+  const matches = visibleBulkCandidates.filter((cell) => {
+    const parsed = parseScheduleShiftCell(cell.originalValue);
+    const caregiverMatch = normalizeKey(parsed.caregiverName || "") === target;
+    const statusMatch = status === "Any" ? true : parsed.baseStatus === status;
+    return caregiverMatch && statusMatch;
+  });
+
+  const next: Record<string, BulkSelectedCell> = {};
+  for (const m of matches) next[m.a1] = m;
+  setSelectedBulkCells(next);
+}
+
+function selectAllVisibleShifts() {
+  const next: Record<string, BulkSelectedCell> = {};
+  for (const c of visibleBulkCandidates) next[c.a1] = c;
+  setSelectedBulkCells(next);
+}
+
+const bulkCaregiverSuggestions = useMemo(() => {
+  const names = Array.from(
+    new Set(
+      visibleBulkCandidates
+        .map((cell) => parseScheduleShiftCell(cell.originalValue).caregiverName || "")
+        .map((name) => norm(name))
+        .filter(Boolean)
+    )
+  ).sort((a, b) => a.localeCompare(b));
+
+  const q = normalizeKey(bulkSmartCaregiver);
+  if (!q) return names.slice(0, 8);
+
+  return names.filter((name) => normalizeKey(name).includes(q)).slice(0, 8);
+}, [visibleBulkCandidates, bulkSmartCaregiver]);
+
+const bulkClientSuggestions = useMemo(() => {
+  const names = Array.from(
+    new Set(visibleBulkCandidates.map((cell) => norm(cell.clientName)).filter(Boolean))
+  ).sort((a, b) => a.localeCompare(b));
+
+  const q = normalizeKey(bulkSmartClient);
+  if (!q) return names.slice(0, 8);
+
+  return names.filter((name) => normalizeKey(name).includes(q)).slice(0, 8);
+}, [visibleBulkCandidates, bulkSmartClient]);
+
+function resetBulkSearchUi(mode: "caregiver" | "client" | "status" | "manual") {
+  setBulkSelectionMode(mode);
+  setBulkSmartCaregiver("");
+  setBulkSmartClient("");
+  setBulkSmartStatus("Any");
+  setShowCaregiverSuggestions(false);
+  setShowClientSuggestions(false);
+}
+    const clientWorstStatus = useMemo(() => {
     const map = new Map<string, ShiftStatus>();
+
     for (const r of rows) {
       const name = norm(r.clientName);
       if (!name) continue;
 
       const statusesForRow = r.cells
-        .map((c) => statusFromCellValue(c.value))
+        .map((c) => {
+          const originalValue = norm(c.value);
+          const effectiveValue =
+            draftMode && c.a1
+              ? norm(
+                  getDraftValue({
+                    a1: c.a1,
+                    week,
+                    originalValue,
+                  })
+                )
+              : originalValue;
+
+          return statusFromCellValue(effectiveValue);
+        })
         .filter((s) => s !== "none");
+
       const rowWorst = statusesForRow.length ? worstStatus(statusesForRow) : "none";
 
       const prev = map.get(name);
       if (!prev) map.set(name, rowWorst);
       else map.set(name, worstStatus([prev, rowWorst]));
     }
-    return map;
-  }, [rows]);
 
-  const totals = useMemo(() => {
+    return map;
+  }, [rows, draftMode, getDraftValue, week]);
+
+    const totals = useMemo(() => {
     let totalHours = 0;
     const clientSet = new Set<string>();
 
@@ -2175,8 +3136,20 @@ const [applicantSearch, setApplicantSearch] = useState("");
 
       for (let dow = 0; dow < 7; dow++) {
         if (selectedDow != null && dow !== selectedDow) continue;
+
         const c = r.cells[dow];
-        const v = norm(c?.value);
+        const originalValue = norm(c?.value);
+        const v =
+          draftMode && c?.a1
+            ? norm(
+                getDraftValue({
+                  a1: c.a1,
+                  week,
+                  originalValue,
+                })
+              )
+            : originalValue;
+
         if (!v) continue;
 
         const tr = parseFirstTimeRange(v);
@@ -2187,9 +3160,9 @@ const [applicantSearch, setApplicantSearch] = useState("");
     }
 
     return { clientCount: clientSet.size, totalHours };
-  }, [rows, selectedDow]);
+  }, [rows, selectedDow, draftMode, getDraftValue, week]);
 
-  const hoursByClient = useMemo(() => {
+    const hoursByClient = useMemo(() => {
     const map = new Map<string, number>();
 
     for (const r of rows) {
@@ -2201,7 +3174,19 @@ const [applicantSearch, setApplicantSearch] = useState("");
       for (let dow = 0; dow < 7; dow++) {
         if (selectedDow != null && dow !== selectedDow) continue;
 
-        const v = norm(r.cells?.[dow]?.value);
+        const cell = r.cells?.[dow];
+        const originalValue = norm(cell?.value);
+        const v =
+          draftMode && cell?.a1
+            ? norm(
+                getDraftValue({
+                  a1: cell.a1,
+                  week,
+                  originalValue,
+                })
+              )
+            : originalValue;
+
         if (!v) continue;
 
         const tr = parseFirstTimeRange(v);
@@ -2212,8 +3197,9 @@ const [applicantSearch, setApplicantSearch] = useState("");
 
       map.set(cn, sum);
     }
+
     return map;
-  }, [rows, selectedDow]);
+  }, [rows, selectedDow, draftMode, getDraftValue, week]);
 
   /** ---------- Availability parsing -> maps ---------- */
 
@@ -2275,19 +3261,108 @@ const [applicantSearch, setApplicantSearch] = useState("");
 
     return { byId, byName };
   }, [availRowsAll, caregiverNameIdx, caregiverIdIdx, desiredHoursIdx, notesIdx, dayCols]);
+  const effectiveScheduleItemsForPanel = useMemo(() => {
+    const items: ScheduleItem[] = [];
 
+    const liveScheduleByLookupKey = new Map<string, ShiftRow>();
+    for (const s of scheduleRows) {
+      const key = makeShiftLookupKey({
+        client: s.client,
+        date: s.date,
+        start: s.startTime,
+        end: s.endTime,
+        caregiver: s.caregiver || "",
+      });
+      liveScheduleByLookupKey.set(key, s);
+    }
+
+    for (const r of rowsAll) {
+      const clientName = norm(r.clientName);
+      if (!clientName) continue;
+
+      for (let dow = 0; dow < 7; dow++) {
+        const c = r.cells[dow];
+        const a1 = c?.a1 || "";
+        if (!a1) continue;
+
+        const originalValue = norm(c?.value);
+        const effectiveValue =
+          draftMode
+            ? norm(
+                getDraftValue({
+                  a1,
+                  week,
+                  originalValue,
+                })
+              )
+            : originalValue;
+
+        const caregiverName = parseCaregiverNameFromAnyShiftText(effectiveValue);
+        const timeRange = parseFirstTimeRange(effectiveValue);
+        const dateStr = norm(dateHeaders?.[dow + 1]);
+
+        if (!caregiverName || !timeRange || !dateStr) continue;
+
+        const lookupKey = makeShiftLookupKey({
+          client: clientName,
+          date: dateStr,
+          start: timeRange.start,
+          end: timeRange.end,
+          caregiver: caregiverName,
+        });
+
+        const liveMatch = liveScheduleByLookupKey.get(lookupKey);
+
+        items.push({
+          shiftId: liveMatch?.shiftId || `${a1}::${timeRange.start}-${timeRange.end}`,
+          client: clientName,
+          date: dateStr,
+          dow,
+          startTime: timeRange.start,
+          endTime: timeRange.end,
+          status: statusFromCellValue(effectiveValue),
+          flagged: liveMatch
+            ? isFlaggedShiftFromScheduleRow(liveMatch, clockMap, locationMap)
+            : false,
+          hours: durationHoursFromStartEnd(timeRange.start, timeRange.end),
+          caregiverId: liveMatch?.caregiverId || "",
+          caregiverName,
+          isDraft:
+            draftMode && a1
+              ? isCellChanged({
+                  a1,
+                  week,
+                })
+              : false,
+        });
+      }
+    }
+
+    return items;
+  }, [
+    rowsAll,
+    scheduleRows,
+    dateHeaders,
+    draftMode,
+    week,
+    getDraftValue,
+    isCellChanged,
+    clockMap,
+    locationMap,
+  ]);
   /** ---------- Caregivers on schedule + missing profiles ---------- */
 
-  const scheduleCaregiverNames = useMemo(() => {
+    const scheduleCaregiverNames = useMemo(() => {
     const set = new Set<string>();
-    for (const s of scheduleRows) {
-      const name = norm(s.caregiver);
+
+    for (const s of effectiveScheduleItemsForPanel) {
+      const name = norm(s.caregiverName);
       if (!name) continue;
       set.add(name);
     }
-    return Array.from(set).sort((a, b) => a.localeCompare(b));
-  }, [scheduleRows]);
 
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [effectiveScheduleItemsForPanel]);
     const caregiversWithCertsActive = useMemo(() => {
     return Object.values(caregiversById)
       .filter((c) => isActiveStatus(c.status))
@@ -2313,7 +3388,7 @@ const [applicantSearch, setApplicantSearch] = useState("");
     }));
   }, [caregiversById]);
 
-  /** ---------- Schedule summaries for caregiver panel ---------- */
+    /** ---------- Schedule summaries for caregiver panel ---------- */
   type ScheduleItem = {
     shiftId: string;
     client: string;
@@ -2324,17 +3399,17 @@ const [applicantSearch, setApplicantSearch] = useState("");
     status: string;
     flagged: boolean;
     hours: number;
+    caregiverId?: string;
+    caregiverName?: string;
+    isDraft?: boolean;
   };
 
-  const scheduleByCaregiverKey = useMemo(() => {
+    const scheduleByCaregiverKey = useMemo(() => {
     const map: Record<string, ScheduleItem[]> = {};
 
-    for (const s of scheduleRows) {
-      const cgName = norm(s.caregiver);
+    for (const s of effectiveScheduleItemsForPanel) {
+      const cgName = norm(s.caregiverName);
       if (!cgName) continue;
-
-      const hours = durationHoursFromStartEnd(s.startTime, s.endTime);
-      const flagged = isFlaggedShiftFromScheduleRow(s, clockMap, locationMap);
 
       const item: ScheduleItem = {
         shiftId: s.shiftId,
@@ -2344,8 +3419,11 @@ const [applicantSearch, setApplicantSearch] = useState("");
         startTime: s.startTime,
         endTime: s.endTime,
         status: s.status,
-        flagged,
-        hours,
+        flagged: s.flagged,
+        hours: s.hours,
+        caregiverId: s.caregiverId,
+        caregiverName: s.caregiverName,
+        isDraft: s.isDraft,
       };
 
       const keys: string[] = [];
@@ -2368,7 +3446,7 @@ const [applicantSearch, setApplicantSearch] = useState("");
     }
 
     return map;
-  }, [scheduleRows, clockMap, locationMap]);
+  }, [effectiveScheduleItemsForPanel]);
 
   function caregiverProfileByScheduleName(nameOnSchedule: string): CaregiverProfile | undefined {
     const id = idByNameOnSchedule[normalizeKey(nameOnSchedule)];
@@ -2533,1162 +3611,3312 @@ const [applicantSearch, setApplicantSearch] = useState("");
     return caregiverPanelRowsAll.reduce((sum, r) => sum + r.flaggedCount, 0);
   }, [caregiverPanelRowsAll]);
 
-  function openEditModal(a1: string, currentValue: string, clientName: string, dowLabel: string) {
-    setEditA1(a1);
-    setEditDraft(currentValue);
-    setEditClientName(clientName);
-    setEditDayLabel(dowLabel);
-    setEditOpen(true);
+    function startInlineEdit(a1: string, currentValue: string) {
+    setEditingA1(a1);
+    setDraftByA1((prev) => ({
+      ...prev,
+      [a1]: currentValue,
+    }));
   }
 
-    async function saveEdit() {
-    if (!editA1) return;
-    const a1 = editA1;
-    const newVal = editDraft;
+  function cancelInlineEdit(a1: string) {
+    setEditingA1((prev) => (prev === a1 ? null : prev));
+    setDraftByA1((prev) => {
+      const next = { ...prev };
+      delete next[a1];
+      return next;
+    });
+  }
+  function openEditHistoryForCell(args: {
+    a1: string;
+    clientName: string;
+    dateStr: string;
+    dayLabel: string;
+  }) {
+    setEditHistoryModalTarget({
+      a1: args.a1,
+      clientName: args.clientName,
+      dateStr: args.dateStr,
+      dayLabel: args.dayLabel,
+      week,
+    });
+  }
 
-    let oldVal = "";
-    const snapshot = data;
-    if (snapshot?.ok) {
-      for (const r of snapshot.body.rows) {
-        const cell = r.cells.find((x) => x.a1 === a1);
-        if (cell) oldVal = norm(cell.value);
+      function cellHasEditHistory(args: {
+    a1: string;
+    clientName: string;
+    dateStr: string;
+  }) {
+    const key = makeCellEditHistoryKey({
+      week,
+      a1: args.a1,
+      clientName: args.clientName,
+      dateStr: args.dateStr,
+    });
+
+    return Boolean(cellEditHistoryPresence[key]);
+  }
+
+  function toggleBulkCellSelection(cell: BulkSelectedCell) {
+    setSelectedBulkCells((prev) => {
+      const next = { ...prev };
+      if (next[cell.a1]) delete next[cell.a1];
+      else next[cell.a1] = cell;
+      return next;
+    });
+  }
+
+  function clearBulkSelection() {
+    setSelectedBulkCells({});
+  }
+
+  function isBulkCellSelected(a1: string) {
+    return Boolean(selectedBulkCells[a1]);
+  }
+
+  function showDraftShiftFeedback(args: {
+    a1: string;
+    oldValue: string;
+    newValue: string;
+    clientName: string;
+    shiftDateForSave: string;
+    dayLabel: string;
+  }) {
+    const { oldValue, newValue, clientName, shiftDateForSave, dayLabel } = args;
+
+    const oldTimeRange = parseFirstTimeRange(oldValue);
+
+    const currentShiftId =
+      scheduleRows.find((s) => {
+        const rowDateKey = dateKey(s.date);
+        const targetDateKey = dateKey(shiftDateForSave);
+
+        return (
+          rowDateKey === targetDateKey &&
+          normalizeKey(s.client) === normalizeKey(clientName) &&
+          normalizeKey(s.caregiver) === normalizeKey(parseCaregiverNameFromAnyShiftText(oldValue)) &&
+          norm(s.startTime).replace(/\s+/g, "").toUpperCase() ===
+            norm(oldTimeRange?.start).replace(/\s+/g, "").toUpperCase() &&
+          norm(s.endTime).replace(/\s+/g, "").toUpperCase() ===
+            norm(oldTimeRange?.end).replace(/\s+/g, "").toUpperCase()
+        );
+      })?.shiftId || "";
+
+    const parsed = parseShiftTextForFeedback(newValue, shiftSaveCaregivers, {
+      currentShiftId,
+      shiftDate: shiftDateForSave,
+      existingShifts: scheduleRows.map((s) => ({
+        shiftId: s.shiftId,
+        date: s.date,
+        caregiverId: s.caregiverId,
+        caregiverName: s.caregiver,
+        startTime: s.startTime,
+        endTime: s.endTime,
+        status: s.status,
+        client: s.client,
+      })),
+      previousRawText: oldValue,
+    });
+
+    const toastModel = buildShiftSaveToast(parsed);
+
+    setSaveToast({
+      id: Date.now(),
+      kind: toastModel.kind,
+      title:
+        toastModel.title === "Shift saved"
+          ? "Draft updated"
+          : toastModel.title === "Shift saved with warnings"
+          ? "Draft updated with warnings"
+          : toastModel.title,
+      lines: [
+        `${clientName} • ${dayLabel}`,
+        ...toastModel.lines,
+        "Saved to draft mode only.",
+      ],
+    });
+  }
+
+  async function saveInlineEdit(args: {
+    a1: string;
+    newVal: string;
+    clientName: string;
+    shiftDateForSave: string;
+    dayLabel: string;
+    weekOf?: string;
+  }) {
+  const { a1, newVal, clientName, shiftDateForSave, dayLabel, weekOf } = args;
+
+  let oldVal = "";
+  const snapshot = data;
+
+  if (snapshot?.ok) {
+    for (const r of snapshot.body.rows) {
+      const cell = r.cells.find((x) => x.a1 === a1);
+      if (cell) {
+        oldVal = norm(cell.value);
+        break;
+      }
+    }
+  }
+
+    if (norm(oldVal) === norm(newVal)) {
+    cancelInlineEdit(a1);
+    return;
+  }
+
+     if (draftMode) {
+    setDraftCell({
+      a1,
+      week,
+      originalValue: oldVal,
+      draftValue: newVal,
+      clientName,
+      dateStr: shiftDateForSave,
+      dayLabel,
+    });
+
+    cancelInlineEdit(a1);
+
+    showDraftShiftFeedback({
+      a1,
+      oldValue: oldVal,
+      newValue: newVal,
+      clientName,
+      shiftDateForSave,
+      dayLabel,
+    });
+
+    return;
+  }
+
+  const oldTimeRange = parseFirstTimeRange(oldVal);
+  const newTimeRange = parseFirstTimeRange(newVal);
+
+  const oldCaregiverName = parseCaregiverFromCell(oldVal);
+  const newCaregiverName = parseCaregiverFromCell(newVal);
+
+  const oldStatus = statusFromCellValue(oldVal);
+  const newStatus = statusFromCellValue(newVal);
+
+  const oldStatusLabel = oldStatus === "none" ? "" : oldStatus;
+  const newStatusLabel = newStatus === "none" ? "" : newStatus;
+
+  const actionType =
+    !norm(oldVal) && norm(newVal)
+      ? "Created Shift"
+      : norm(oldVal) && !norm(newVal)
+      ? "Deleted Shift"
+      : "Edited Shift";
+
+  const logTimestamp = new Date().toISOString();
+
+  const currentShiftId =
+    scheduleRows.find((s) => {
+      const rowDateKey = dateKey(s.date);
+      const targetDateKey = dateKey(shiftDateForSave);
+
+      return (
+        rowDateKey === targetDateKey &&
+        normalizeKey(s.client) === normalizeKey(clientName) &&
+        normalizeKey(s.caregiver) === normalizeKey(oldCaregiverName) &&
+        norm(s.startTime).replace(/\s+/g, "").toUpperCase() ===
+          norm(oldTimeRange?.start).replace(/\s+/g, "").toUpperCase() &&
+        norm(s.endTime).replace(/\s+/g, "").toUpperCase() ===
+          norm(oldTimeRange?.end).replace(/\s+/g, "").toUpperCase()
+      );
+    })?.shiftId || "";
+
+  const parsed = parseShiftTextForFeedback(newVal, shiftSaveCaregivers, {
+    currentShiftId,
+    shiftDate: shiftDateForSave,
+    existingShifts: scheduleRows.map((s) => ({
+      shiftId: s.shiftId,
+      date: s.date,
+      caregiverId: s.caregiverId,
+      caregiverName: s.caregiver,
+      startTime: s.startTime,
+      endTime: s.endTime,
+      status: s.status,
+      client: s.client,
+    })),
+  });
+
+  const notesParts: string[] = [];
+
+  if (parsed.warnings?.length) {
+    notesParts.push(`Warnings: ${parsed.warnings.join(" | ")}`);
+  }
+
+  if (parsed.errors?.length) {
+    notesParts.push(`Errors: ${parsed.errors.join(" | ")}`);
+  }
+
+  if (parsed.conflictMatches?.length) {
+    const conflictSummary = parsed.conflictMatches
+      .map(
+        (m) =>
+          `${m.client} ${m.startTime}-${m.endTime}${m.shiftId ? ` (${m.shiftId})` : ""}`
+      )
+      .join(" | ");
+
+    notesParts.push(`Conflicts: ${conflictSummary}`);
+  }
+
+  const logNotes = notesParts.join(" || ");
+
+  const toastModel = buildShiftSaveToast(parsed);
+
+  try {
+    markCellSaving(a1);
+    setConflictHighlight(null);
+
+    // optimistic local update first
+    setData((prev) => {
+      if (!prev?.ok) return prev;
+      const next = structuredClone(prev);
+
+      for (const row of next.body.rows) {
+        const cell = row.cells.find((x) => x.a1 === a1);
+        if (cell) {
+          cell.value = newVal;
+          cell.fontColor = (
+            SHEET_COLORS[statusFromCellValue(newVal)] || "#111827"
+          ).toLowerCase();
+          break;
+        }
+      }
+
+      return next;
+    });
+
+    // close editor immediately so scheduler can keep moving
+    cancelInlineEdit(a1);
+
+    // 1) save actual schedule cell
+    await updateCell(week, a1, newVal);
+
+    // 2) append edit-log row
+        await logAndSaveScheduleEdit({
+      timestamp: logTimestamp,
+      user: currentUserName,
+      userEmail: currentUserEmail,
+      actionType,
+      weekType: week,
+      weekOf,
+      date: shiftDateForSave,
+      client: clientName,
+      oldValue: oldVal,
+      newValue: newVal,
+      cell: a1,
+      day: dayLabel,
+      oldStatus: oldStatusLabel,
+      newStatus: newStatusLabel,
+      oldCaregiver: oldCaregiverName,
+      newCaregiver: newCaregiverName,
+      oldStartTime: oldTimeRange?.start ?? "",
+      newStartTime: newTimeRange?.start ?? "",
+      oldEndTime: oldTimeRange?.end ?? "",
+      newEndTime: newTimeRange?.end ?? "",
+      notes: logNotes,
+      accessPoint: "CWWebSchedule inline edit",
+    });
+
+    markCellHasEditHistory({
+  week,
+  a1,
+  clientName,
+  dateStr: shiftDateForSave,
+});
+
+// re-sync from source-of-truth sheet
+await Promise.all([
+  loadGridForWeek(week),
+  refreshScheduleMapsForWeek(week),
+  refreshScheduleEditLogForWeek(week),
+]);
+    if (parsed.conflictMatches.length > 0) {
+      setConflictHighlight({
+        a1,
+        conflicts: parsed.conflictMatches,
+      });
+    } else {
+      setConflictHighlight(null);
+    }
+
+    setSaveToast({
+      id: Date.now(),
+      kind: toastModel.kind,
+      title: toastModel.title,
+      lines: toastModel.lines,
+    });
+  } catch (err: any) {
+    // rollback if actual save or log failed
+    setData((prev) => {
+      if (!prev?.ok) return prev;
+      const next = structuredClone(prev);
+
+      for (const row of next.body.rows) {
+        const cell = row.cells.find((x) => x.a1 === a1);
+        if (cell) {
+          cell.value = oldVal;
+          cell.fontColor = (
+            SHEET_COLORS[statusFromCellValue(oldVal)] || "#111827"
+          ).toLowerCase();
+          break;
+        }
+      }
+
+      return next;
+    });
+
+    setEditingA1(a1);
+    setDraftByA1((prev) => ({
+      ...prev,
+      [a1]: newVal,
+    }));
+
+    setSaveToast({
+      id: Date.now(),
+      kind: "error",
+      title: "Save failed",
+      lines: [
+        err?.message ?? "The cell could not be updated.",
+        "The cell was restored to its previous value.",
+      ],
+    });
+  } finally {
+    unmarkCellSaving(a1);
+  }
+}
+
+async function saveDraftScheduleToSheet() {
+  const payload = buildSavePayload();
+  if (!payload.length) {
+    setSaveToast({
+      id: Date.now(),
+      kind: "warning",
+      title: "No draft changes",
+      lines: ["There are no draft changes to save."],
+    });
+    return;
+  }
+
+  try {
+    setLoading(true);
+    setError(null);
+
+    for (const item of payload) {
+      await updateCell(item.week, item.a1, item.draftValue);
+
+      await logAndSaveScheduleEdit({
+        timestamp: new Date().toISOString(),
+        user: currentUserName,
+        userEmail: currentUserEmail,
+        actionType:
+          !norm(item.originalValue) && norm(item.draftValue)
+            ? "Created Shift"
+            : norm(item.originalValue) && !norm(item.draftValue)
+            ? "Deleted Shift"
+            : "Edited Shift",
+        weekType: item.week,
+        weekOf: weekStartYmd || "",
+        date: item.dateStr || "",
+        client: item.clientName || "",
+        oldValue: item.originalValue,
+        newValue: item.draftValue,
+        cell: item.a1,
+        day: item.dayLabel || "",
+        oldStatus: statusFromCellValue(item.originalValue) === "none" ? "" : statusFromCellValue(item.originalValue),
+        newStatus: statusFromCellValue(item.draftValue) === "none" ? "" : statusFromCellValue(item.draftValue),
+        oldCaregiver: parseCaregiverFromCell(item.originalValue),
+        newCaregiver: parseCaregiverFromCell(item.draftValue),
+        oldStartTime: parseFirstTimeRange(item.originalValue)?.start ?? "",
+        newStartTime: parseFirstTimeRange(item.draftValue)?.start ?? "",
+        oldEndTime: parseFirstTimeRange(item.originalValue)?.end ?? "",
+        newEndTime: parseFirstTimeRange(item.draftValue)?.end ?? "",
+        notes: "Saved from Draft Mode",
+        accessPoint: "CWWebSchedule draft save",
+      });
+
+      if (item.clientName && item.dateStr) {
+        markCellHasEditHistory({
+          week: item.week,
+          a1: item.a1,
+          clientName: item.clientName,
+          dateStr: item.dateStr,
+        });
       }
     }
 
-    if (norm(oldVal) === norm(newVal)) {
-      setEditOpen(false);
-      setEditA1(null);
-      return;
-    }
+    await Promise.all([
+      loadGridForWeek(week),
+      refreshScheduleMapsForWeek(week),
+      refreshScheduleEditLogForWeek(week),
+    ]);
 
-    const parsed = parseShiftTextForFeedback(newVal, shiftSaveCaregivers);
-    const toastModel = buildShiftSaveToast(parsed);
+    resetDraft();
 
-    try {
-      setSavingA1(a1);
-      await updateCell(week, a1, newVal);
+    setSaveToast({
+      id: Date.now(),
+      kind: "success",
+      title: "Draft schedule saved",
+      lines: [`${payload.length} change${payload.length === 1 ? "" : "s"} saved to the sheet.`],
+    });
+  } catch (err: any) {
+    setSaveToast({
+      id: Date.now(),
+      kind: "error",
+      title: "Draft save failed",
+      lines: [err?.message ?? "Unable to save draft changes to the sheet."],
+    });
+  } finally {
+    setLoading(false);
+  }
+}
+async function applyBulkStatusChange(args: {
+  targetBaseStatus: BulkTargetStatus;
+  targetCancelled?: "keep" | boolean;
+  caregiverNameOverride?: string | null;
+}) {
+  const cells = Object.values(selectedBulkCells);
 
-      setData((prev) => {
-        if (!prev?.ok) return prev;
-        const next = structuredClone(prev);
-        for (const row of next.body.rows) {
-          const cell = row.cells.find((x) => x.a1 === a1);
-          if (cell) {
-            cell.value = newVal;
-            cell.fontColor = (SHEET_COLORS[statusFromCellValue(newVal)] || "#111827").toLowerCase();
-          }
-        }
-        return next;
-      });
-
-      await loadGridForWeek(week);
-      await Promise.all([refreshScheduleMapsForWeek(week), refreshCaregivers(), refreshClients()]);
-
-      setSaveToast({
-        id: Date.now(),
-        kind: toastModel.kind,
-        title: toastModel.title,
-        lines: toastModel.lines,
-      });
-
-      setEditOpen(false);
-      setEditA1(null);
-    } catch (err: any) {
-      setSaveToast({
-        id: Date.now(),
-        kind: "error",
-        title: "Save failed",
-        lines: [err?.message ?? "The cell could not be updated."],
-      });
-    } finally {
-      setSavingA1(null);
-    }
+  if (!cells.length) {
+    setSaveToast({
+      id: Date.now(),
+      kind: "warning",
+      title: "No shifts selected",
+      lines: ["Select one or more shifts first."],
+    });
+    return;
   }
 
+  try {
+    setBulkApplying(true);
+
+    const successes: string[] = [];
+    const failures: string[] = [];
+
+    for (const cell of cells) {
+      const parsed = parseScheduleShiftCell(cell.originalValue);
+
+      const targetCancelled =
+        args.targetCancelled === "keep"
+          ? parsed.isCancelled
+          : typeof args.targetCancelled === "boolean"
+          ? args.targetCancelled
+          : parsed.isCancelled;
+
+      const result = convertScheduleShiftStatus({
+        rawText: cell.originalValue,
+        targetBaseStatus: args.targetBaseStatus,
+        caregiverNameOverride: args.caregiverNameOverride ?? undefined,
+        targetCancelled,
+      });
+
+      if (!result.ok || !result.newText) {
+        failures.push(
+          `${cell.clientName} • ${cell.dayLabel} • ${result.error || "Conversion failed"}`
+        );
+        continue;
+      }
+
+      if (draftMode) {
+        setDraftCell({
+          a1: cell.a1,
+          week: cell.week,
+          originalValue: cell.originalValue,
+          draftValue: result.newText,
+          clientName: cell.clientName,
+          dateStr: cell.dateStr,
+          dayLabel: cell.dayLabel,
+        });
+        successes.push(`${cell.clientName} • ${cell.dayLabel}`);
+      } else {
+        await saveInlineEdit({
+          a1: cell.a1,
+          newVal: result.newText,
+          clientName: cell.clientName,
+          shiftDateForSave: cell.dateStr,
+          dayLabel: cell.dayLabel,
+          weekOf: weekStartYmd,
+        });
+        successes.push(`${cell.clientName} • ${cell.dayLabel}`);
+      }
+    }
+
+    setSaveToast({
+      id: Date.now(),
+      kind: failures.length ? "warning" : "success",
+      title: failures.length
+        ? "Bulk update finished with warnings"
+        : draftMode
+        ? "Bulk draft update complete"
+        : "Bulk update complete",
+      lines: [
+        `${successes.length} shift${successes.length === 1 ? "" : "s"} updated.`,
+        ...failures.slice(0, 8),
+        ...(failures.length > 8 ? [`+${failures.length - 8} more issue(s)`] : []),
+      ],
+    });
+
+    clearBulkSelection();
+  } catch (err: any) {
+    setSaveToast({
+      id: Date.now(),
+      kind: "error",
+      title: "Bulk update failed",
+      lines: [err?.message ?? "Unable to apply bulk changes."],
+    });
+  } finally {
+    setBulkApplying(false);
+  }
+}
+async function handleOpenEditHistory(payload: EditHistoryOpenPayload) {
+  const nextTarget: EditHistoryModalTarget = {
+    a1: payload.a1Key,
+    clientName: payload.clientName,
+    dateStr: payload.dateStr,
+    dayLabel: DOW_LABELS[toDateSafe(payload.dateStr)?.getDay() ?? 0] || "",
+    week: payload.week,
+    shiftId: payload.shiftId,
+    caregiverName: payload.caregiverName,
+    startTime: payload.startTime,
+    endTime: payload.endTime,
+    status: payload.status,
+  };
+
+  setEditHistoryModalTarget(nextTarget);
+  setEditHistoryError(null);
+  setShiftRateError(null);
+
+  await Promise.all([
+    refreshScheduleEditLogForWeek(payload.week),
+    loadShiftRateForTarget(nextTarget),
+  ]);
+}
+
+async function handleSaveShiftRate() {
+  if (!editHistoryModalTarget?.shiftId) return;
+
+  const trimmed = norm(shiftRateValue);
+  if (!trimmed) {
+    setShiftRateError("Please enter a shift rate.");
+    return;
+  }
+
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    setShiftRateError("Shift rate must be a valid number.");
+    return;
+  }
+
+  try {
+    setShiftRateSaving(true);
+    setShiftRateError(null);
+
+    await saveShiftRate({
+      shiftId: editHistoryModalTarget.shiftId,
+      newRate: parsed,
+      updatedBy: currentUserName,
+      reason: shiftRateReason,
+    });
+
+    await loadShiftRateForTarget(editHistoryModalTarget);
+    await refreshScheduleEditLogForWeek(editHistoryModalTarget.week);
+
+    setSaveToast({
+      id: Date.now(),
+      kind: "success",
+      title: "Shift rate saved",
+      lines: [
+        `${editHistoryModalTarget.clientName} • ${formatTimeRangeForDisplay(
+          editHistoryModalTarget.startTime,
+          editHistoryModalTarget.endTime
+        )}`,
+        `New rate: $${parsed.toFixed(2)}`,
+      ],
+    });
+  } catch (err: any) {
+    setShiftRateError(err?.message || "Failed to save shift rate.");
+  } finally {
+    setShiftRateSaving(false);
+  }
+}
+
+async function handleCaregiverDropToShift(args: {
+  dropEvent: React.DragEvent<HTMLElement>;
+  a1: string;
+  clientName: string;
+  dateStrForDow: string;
+  dayLabel: string;
+  originalCellValue: string;
+}) {
+  const { dropEvent, a1, clientName, dateStrForDow, dayLabel, originalCellValue } = args;
+
+  dropEvent.preventDefault();
+  setDragOverA1(null);
+
+  let payload: any = null;
+
+  try {
+    const json = dropEvent.dataTransfer.getData("application/json");
+    payload = json ? JSON.parse(json) : null;
+  } catch {
+    payload = null;
+  }
+
+  const caregiverName =
+    norm(payload?.nameOnSchedule) ||
+    norm(payload?.caregiverName) ||
+    norm(dropEvent.dataTransfer.getData("text/plain"));
+
+  if (!caregiverName) {
+    setSaveToast({
+      id: Date.now(),
+      kind: "error",
+      title: "Drop failed",
+      lines: ["No caregiver name was found in the drag payload."],
+    });
+    return;
+  }
+
+  const newValue = buildConsideringShiftValueFromExisting({
+    existingValue: originalCellValue,
+    caregiverName,
+  });
+
+  if (!newValue) {
+    setSaveToast({
+      id: Date.now(),
+      kind: "error",
+      title: "Drop failed",
+      lines: ["This shift could not be converted into a considering shift."],
+    });
+    return;
+  }
+
+  if (draftMode) {
+    setDraftCell({
+      a1,
+      week,
+      originalValue: originalCellValue,
+      draftValue: newValue,
+      clientName,
+      dateStr: dateStrForDow,
+      dayLabel,
+    });
+
+    showDraftShiftFeedback({
+      a1,
+      oldValue: originalCellValue,
+      newValue,
+      clientName,
+      shiftDateForSave: dateStrForDow,
+      dayLabel,
+    });
+
+    return;
+  }
+
+  await saveInlineEdit({
+    a1,
+    newVal: newValue,
+    clientName,
+    shiftDateForSave: dateStrForDow,
+    dayLabel,
+    weekOf: weekStartYmd,
+  });
+}
     return (
-    <main
-      style={{
-        padding: 18,
-        // ✅ When the caregiver panel is OFF, let schedule use full width
-        maxWidth: panelOpen ? 2200 : "none",
-        margin: "0 auto",
-        color: UI.text,
-        background: UI.pageBg,
-        minHeight: "100vh",
-      }}
-    >
-      {saveToast ? (
+  <main
+  style={{
+    padding: 18,
+    width: "100%",
+    maxWidth: "none",
+    margin: 0,
+    color: UI.text,
+    background: UI.pageBg,
+    minHeight: "100vh",
+  }}
+>
+    {saveToast ? (
+      <div
+        style={{
+          position: "fixed",
+          top: 18,
+          right: 18,
+          zIndex: 10050,
+          width: "min(390px, calc(100vw - 24px))",
+          background:
+            saveToast.kind === "success"
+              ? "#ecfdf5"
+              : saveToast.kind === "warning"
+              ? "#fffbeb"
+              : "#fef2f2",
+          border:
+            saveToast.kind === "success"
+              ? "1px solid #86efac"
+              : saveToast.kind === "warning"
+              ? "1px solid #fcd34d"
+              : "1px solid #fca5a5",
+          color: "#111827",
+          borderRadius: 14,
+          boxShadow: "0 12px 30px rgba(0,0,0,0.18)",
+          padding: 12,
+        }}
+      >
         <div
           style={{
-            position: "fixed",
-            top: 18,
-            right: 18,
-            zIndex: 10050,
-            width: "min(390px, calc(100vw - 24px))",
-            background:
-              saveToast.kind === "success"
-                ? "#ecfdf5"
-                : saveToast.kind === "warning"
-                ? "#fffbeb"
-                : "#fef2f2",
-            border:
-              saveToast.kind === "success"
-                ? "1px solid #86efac"
-                : saveToast.kind === "warning"
-                ? "1px solid #fcd34d"
-                : "1px solid #fca5a5",
-            color: "#111827",
-            borderRadius: 14,
-            boxShadow: "0 12px 30px rgba(0,0,0,0.18)",
-            padding: 12,
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-start",
+            gap: 10,
           }}
         >
-          <div
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 1000 }}>{saveToast.title}</div>
+
+            <div
+              style={{
+                marginTop: 6,
+                display: "grid",
+                gap: 4,
+              }}
+            >
+              {saveToast.lines.map((line, idx) => (
+                <div
+                  key={`${saveToast.id}_${idx}`}
+                  style={{
+                    fontSize: 12,
+                    fontWeight: idx < 4 ? 850 : 700,
+                    lineHeight: 1.3,
+                    color:
+                      saveToast.kind === "error"
+                        ? "#991b1b"
+                        : idx < 4
+                        ? "#111827"
+                        : "#92400e",
+                    wordBreak: "break-word",
+                  }}
+                >
+                  {line}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setSaveToast(null)}
             style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "flex-start",
-              gap: 10,
+              border: `1px solid ${UI.border}`,
+              background: "#fff",
+              color: UI.text,
+              borderRadius: 10,
+              padding: "5px 8px",
+              cursor: "pointer",
+              fontWeight: 900,
+              fontSize: 12,
+              flex: "0 0 auto",
             }}
           >
-            <div style={{ minWidth: 0 }}>
-              <div style={{ fontSize: 13, fontWeight: 1000 }}>
-                {saveToast.title}
-              </div>
+            Close
+          </button>
+        </div>
+      </div>
+    ) : null}
 
-              <div
+    <div
+      ref={topNavRef}
+      style={{
+        position: "relative",
+        zIndex: TOPNAV_Z,
+      }}
+    >
+           <TopNav
+        week={week}
+        currentUserName={currentUserName}
+        currentUserEmail={currentUserEmail}
+        portalUsersOnline={portalUsersOnline}
+        right={
+          <>
+            <div
+              style={{
+                display: "inline-flex",
+                border: `1px solid ${UI.border}`,
+                borderRadius: 12,
+                overflow: "hidden",
+                background: UI.panelBg,
+              }}
+              role="group"
+              aria-label="Week toggle"
+            >
+              <button
+                type="button"
+                onClick={() => setWeekAndUrl("cw")}
                 style={{
-                  marginTop: 6,
-                  display: "grid",
-                  gap: 4,
+                  padding: "7px 10px",
+                  fontSize: 13,
+                  fontWeight: 900,
+                  border: "none",
+                  cursor: "pointer",
+                  background: week === "cw" ? "#111827" : UI.headerBg,
+                  color: week === "cw" ? "#fff" : UI.text,
                 }}
+                aria-pressed={week === "cw"}
               >
-                {saveToast.lines.map((line, idx) => (
-                  <div
-                    key={`${saveToast.id}_${idx}`}
-                    style={{
-                      fontSize: 12,
-                      fontWeight: idx < 4 ? 850 : 700,
-                      lineHeight: 1.3,
-                      color:
-                        saveToast.kind === "error"
-                          ? "#991b1b"
-                          : idx < 4
-                          ? "#111827"
-                          : "#92400e",
-                      wordBreak: "break-word",
-                    }}
-                  >
-                    {line}
-                  </div>
-                ))}
-              </div>
+                Current
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setWeekAndUrl("nw")}
+                style={{
+                  padding: "7px 10px",
+                  fontSize: 13,
+                  fontWeight: 900,
+                  border: "none",
+                  cursor: "pointer",
+                  background: week === "nw" ? "#111827" : UI.headerBg,
+                  color: week === "nw" ? "#fff" : UI.text,
+                }}
+                aria-pressed={week === "nw"}
+              >
+                Next
+              </button>
             </div>
 
             <button
               type="button"
-              onClick={() => setSaveToast(null)}
+              onClick={handlePublishSchedule}
+              disabled={publishingSchedule || loading || hasDraftChanges}
               style={{
                 border: `1px solid ${UI.border}`,
-                background: "#fff",
+                background:
+                  publishingSchedule || loading || hasDraftChanges
+                    ? "#f3f4f6"
+                    : "#f4b400",
+                color:
+                  publishingSchedule || loading || hasDraftChanges
+                    ? "#9ca3af"
+                    : "#111827",
+                borderRadius: 10,
+                padding: "7px 10px",
+                fontSize: 13,
+                cursor:
+                  publishingSchedule || loading || hasDraftChanges
+                    ? "default"
+                    : "pointer",
+                fontWeight: 1000,
+                opacity: publishingSchedule || loading || hasDraftChanges ? 0.7 : 1,
+              }}
+              title={
+                hasDraftChanges
+                  ? "Save or reset draft changes before publishing."
+                  : week === "cw"
+                  ? "Publish Current Week to All Shifts"
+                  : "Publish Next Week to NW All Shifts"
+              }
+            >
+              {publishingSchedule
+                ? "Publishing..."
+                : week === "cw"
+                ? "Publish Current Week"
+                : "Publish Next Week"}
+            </button>
+
+            <button
+              type="button"
+              onClick={openPanel}
+              style={{
+                border: `1px solid ${UI.border}`,
+                background: UI.headerBg,
                 color: UI.text,
                 borderRadius: 10,
-                padding: "5px 8px",
+                padding: "7px 10px",
+                fontSize: 13,
                 cursor: "pointer",
                 fontWeight: 900,
-                fontSize: 12,
-                flex: "0 0 auto",
+              }}
+              title="Open Messages"
+            >
+              💬 Messages
+            </button>
+
+           <button
+  type="button"
+  onClick={() => setPanelOpen((v) => !v)}
+  style={{
+    border: `1px solid ${UI.border}`,
+    background: panelOpen ? "#111827" : "#f4b400",
+    color: panelOpen ? "#fff" : "#111827",
+    borderRadius: 10,
+    padding: "7px 10px",
+    fontSize: 13,
+    cursor: "pointer",
+    fontWeight: 900,
+  }}
+  title={panelOpen ? "Close caregiver panel" : "Open caregiver panel"}
+>
+  {panelOpen ? "Close Caregiver Panel" : "Open Caregiver Panel"}
+</button>
+            <button
+              type="button"
+              onClick={toggleDraftMode}
+              style={{
+                border: `1px solid ${draftMode ? "#111827" : UI.border}`,
+                background: draftMode ? "#111827" : UI.headerBg,
+                color: draftMode ? "#fff" : UI.text,
+                borderRadius: 10,
+                padding: "7px 10px",
+                fontSize: 13,
+                cursor: "pointer",
+                fontWeight: 900,
+              }}
+              title="Toggle Draft Mode"
+            >
+              Draft Mode: {draftMode ? "ON" : "OFF"}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setBulkMode((v) => !v);
+                setSelectedBulkCells({});
+                setBulkSelectionMode("caregiver");
+                setBulkSmartCaregiver("");
+                setBulkSmartClient("");
+                setBulkSmartStatus("Any");
+                setShowCaregiverSuggestions(false);
+                setShowClientSuggestions(false);
+              }}
+              style={{
+                border: `1px solid ${bulkMode ? "#111827" : UI.border}`,
+                background: bulkMode ? "#111827" : UI.headerBg,
+                color: bulkMode ? "#fff" : UI.text,
+                borderRadius: 10,
+                padding: "7px 10px",
+                fontSize: 13,
+                cursor: "pointer",
+                fontWeight: 900,
+              }}
+              title="Toggle Bulk Edit Mode"
+            >
+              Bulk Edit: {bulkMode ? "ON" : "OFF"}
+            </button>
+
+            {draftMode ? (
+              <>
+                <button
+                  type="button"
+                  onClick={undo}
+                  disabled={!canUndo}
+                  style={{
+                    border: `1px solid ${UI.border}`,
+                    background: canUndo ? UI.headerBg : "#f3f4f6",
+                    color: canUndo ? UI.text : "#9ca3af",
+                    borderRadius: 10,
+                    padding: "7px 10px",
+                    fontSize: 13,
+                    cursor: canUndo ? "pointer" : "default",
+                    fontWeight: 900,
+                  }}
+                >
+                  Undo
+                </button>
+
+                <button
+                  type="button"
+                  onClick={redo}
+                  disabled={!canRedo}
+                  style={{
+                    border: `1px solid ${UI.border}`,
+                    background: canRedo ? UI.headerBg : "#f3f4f6",
+                    color: canRedo ? UI.text : "#9ca3af",
+                    borderRadius: 10,
+                    padding: "7px 10px",
+                    fontSize: 13,
+                    cursor: canRedo ? "pointer" : "default",
+                    fontWeight: 900,
+                  }}
+                >
+                  Redo
+                </button>
+
+                <button
+                  type="button"
+                  onClick={resetDraft}
+                  disabled={!hasDraftChanges}
+                  style={{
+                    border: `1px solid ${UI.border}`,
+                    background: hasDraftChanges ? UI.headerBg : "#f3f4f6",
+                    color: hasDraftChanges ? UI.text : "#9ca3af",
+                    borderRadius: 10,
+                    padding: "7px 10px",
+                    fontSize: 13,
+                    cursor: hasDraftChanges ? "pointer" : "default",
+                    fontWeight: 900,
+                  }}
+                >
+                  Reset Draft
+                </button>
+
+                <button
+                  type="button"
+                  onClick={saveDraftScheduleToSheet}
+                  disabled={!hasDraftChanges}
+                  style={{
+                    border: "1px solid #111827",
+                    background: hasDraftChanges ? "#111827" : "#9ca3af",
+                    color: "#fff",
+                    borderRadius: 10,
+                    padding: "7px 10px",
+                    fontSize: 13,
+                    cursor: hasDraftChanges ? "pointer" : "default",
+                    fontWeight: 900,
+                  }}
+                >
+                  Save Schedule{hasDraftChanges ? ` (${changedCellCount})` : ""}
+                </button>
+              </>
+            ) : null}
+
+            <button
+              type="button"
+              onClick={async () => {
+                try {
+                  setLoading(true);
+                  setError(null);
+                  setExpandedA1ByWeek((prev) => ({ ...prev, [week]: new Set() }));
+                  setEditingA1(null);
+                  setDraftByA1({});
+                  setSelectedBulkCells({});
+                  resetDraft();
+                  await loadGridForWeek(week);
+                  await Promise.all([
+                    refreshScheduleMapsForWeek(week),
+                    refreshCaregivers(),
+                    refreshApplicants(),
+                    refreshClients(),
+                    refreshGhostShiftsForWeek(week),
+                    refreshScheduleEditLogForWeek(week),
+                  ]);
+                } catch (e: any) {
+                  setError(e?.message ?? "Refresh failed");
+                } finally {
+                  setLoading(false);
+                }
+              }}
+              style={{
+                border: `1px solid ${UI.border}`,
+                background: UI.headerBg,
+                color: UI.text,
+                borderRadius: 10,
+                padding: "7px 10px",
+                fontSize: 13,
+                cursor: "pointer",
+                fontWeight: 900,
               }}
             >
-              Close
+              Refresh
             </button>
-          </div>
-        </div>
-      ) : null}
+          </>
+        }
+      />
+    </div>
 
-      <div
-  ref={topNavRef}
-  style={{
-    position: "sticky",
-    top: 0,
-    zIndex: TOPNAV_Z,
-    background: UI.pageBg, // prevents transparent overlap while scrolling
-    paddingTop: 0,
-  }}
->
-  <TopNav
-    week={week}
-    right={
-      <>
-        {/* Week toggle */}
-        <div
-          style={{
-            display: "inline-flex",
-            border: `1px solid ${UI.border}`,
-            borderRadius: 12,
-            overflow: "hidden",
-            background: UI.panelBg,
-          }}
-          role="group"
-          aria-label="Week toggle"
-        >
-          <button
-            type="button"
-            onClick={() => setWeekAndUrl("cw")}
-            style={{
-              padding: "7px 10px",
-              fontSize: 13,
-              fontWeight: 900,
-              border: "none",
-              cursor: "pointer",
-              background: week === "cw" ? "#111827" : UI.headerBg,
-              color: week === "cw" ? "#fff" : UI.text,
-            }}
-            aria-pressed={week === "cw"}
-          >
-            Current
-          </button>
+    <header
+      style={{
+        display: "flex",
+        alignItems: "baseline",
+        justifyContent: "space-between",
+        gap: 12,
+      }}
+    >
+      <div>
+        <h1 style={{ margin: 0, fontSize: 22 }}>{weekLabel(week)}</h1>
+        <p style={{ opacity: 0.8, marginTop: 6, fontSize: 13 }}>
+          Source: <code>{sheetLabelForWeek(week)}</code>
 
-          <button
-            type="button"
-            onClick={() => setWeekAndUrl("nw")}
-            style={{
-              padding: "7px 10px",
-              fontSize: 13,
-              fontWeight: 900,
-              border: "none",
-              cursor: "pointer",
-              background: week === "nw" ? "#111827" : UI.headerBg,
-              color: week === "nw" ? "#fff" : UI.text,
-            }}
-            aria-pressed={week === "nw"}
-          >
-            Next
-          </button>
-        </div>
+          <span style={{ marginLeft: 10, fontSize: 12, color: UI.textDim }}>
+            (Portal user:{" "}
+            {sessionStatus === "loading"
+              ? "loading…"
+              : currentUserEmail
+              ? `${currentUserName}${currentUserEmail ? ` • ${currentUserEmail}` : ""}`
+              : "not signed in"})
+          </span>
 
-        {/* Messages */}
-        <button
-          type="button"
-          onClick={openPanel}
-          style={{
-            border: `1px solid ${UI.border}`,
-            background: UI.headerBg,
-            color: UI.text,
-            borderRadius: 10,
-            padding: "7px 10px",
-            fontSize: 13,
-            cursor: "pointer",
-            fontWeight: 900,
-          }}
-          title="Open Messages"
-        >
-          💬 Messages
-        </button>
+          {panelOpen && (
+            <span style={{ marginLeft: 10, fontSize: 12, color: UI.textDim }}>
+              (Caregiver Panel: {availLoading ? "loading…" : availError ? "error" : "ready"})
+            </span>
+          )}
 
-        {/* Caregiver panel toggle */}
-        <button
-          type="button"
-          onClick={() => setPanelOpen((v) => !v)}
-          style={{
-            border: `1px solid ${UI.border}`,
-            background: panelOpen ? "#111827" : UI.headerBg,
-            color: panelOpen ? "#fff" : UI.text,
-            borderRadius: 10,
-            padding: "7px 10px",
-            fontSize: 13,
-            cursor: "pointer",
-            fontWeight: 900,
-          }}
-        >
-          Caregiver Panel: {panelOpen ? "ON" : "OFF"}
-        </button>
+          <span style={{ marginLeft: 10, fontSize: 12, color: UI.textDim }}>
+            (Caregivers: {caregiversLoading ? "loading…" : caregiversError ? "error" : "ready"})
+          </span>
 
-        {/* Refresh */}
-        <button
-          type="button"
-          onClick={async () => {
-            try {
-              setLoading(true);
-              setError(null);
-              setExpandedA1ByWeek((prev) => ({ ...prev, [week]: new Set() }));
-              await loadGridForWeek(week);
-              await Promise.all([
-                refreshScheduleMapsForWeek(week),
-                refreshCaregivers(),
-                refreshApplicants(),
-                refreshGhostShiftsForWeek(week),
-              ]);
-            } catch (e: any) {
-              setError(e?.message ?? "Refresh failed");
-            } finally {
-              setLoading(false);
-            }
-          }}
-          style={{
-            border: `1px solid ${UI.border}`,
-            background: UI.headerBg,
-            color: UI.text,
-            borderRadius: 10,
-            padding: "7px 10px",
-            fontSize: 13,
-            cursor: "pointer",
-            fontWeight: 900,
-          }}
-        >
-          Refresh
-        </button>
-      </>
-    }
-  />
-</div>
+          <span style={{ marginLeft: 10, fontSize: 12, color: UI.textDim }}>
+            (Applicants: {applicantsLoading ? "loading…" : applicantsError ? "error" : "ready"})
+          </span>
 
-      <header
+          <span style={{ marginLeft: 10, fontSize: 12, color: UI.textDim }}>
+            (Service requests: {ghostLoading ? "loading…" : ghostError ? "error" : "ready"})
+          </span>
+        </p>
+      </div>
+    </header>
+
+    <div
+      style={{
+        marginTop: 10,
+        display: "flex",
+        gap: 10,
+        alignItems: "center",
+        flexWrap: "wrap",
+      }}
+    >
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <DayChip label="All Days" active={selectedDow == null} onClick={() => setSelectedDow(null)} />
+        {DOW_LABELS.map((d, idx) => (
+          <DayChip
+            key={d}
+            label={d}
+            active={selectedDow === idx}
+            onClick={() => setSelectedDow(idx)}
+          />
+        ))}
+      </div>
+
+      <button
+        type="button"
+        onClick={() => setOnboardingOpen(true)}
         style={{
-          display: "flex",
-          alignItems: "baseline",
-          justifyContent: "space-between",
-          gap: 12,
+          border: `1px solid ${UI.border}`,
+          background: onboardingOpen ? "#111827" : UI.panelBg,
+          color: onboardingOpen ? "#fff" : UI.text,
+          borderRadius: 999,
+          padding: "6px 12px",
+          fontSize: 12,
+          cursor: "pointer",
+          fontWeight: 900,
+          whiteSpace: "nowrap",
+        }}
+        title="Open onboarding panel"
+      >
+        Onboarding
+      </button>
+
+      <input
+        value={searchText ?? ""}
+        onChange={(e) => setSearchText(e.target.value)}
+        placeholder="Search client or cell text…"
+        style={{
+          marginLeft: "auto",
+          width: 320,
+          border: `1px solid ${UI.border}`,
+          borderRadius: 12,
+          padding: "8px 10px",
+          fontSize: 13,
+          outline: "none",
+          background: UI.panelBg,
+        }}
+      />
+    </div>
+
+    <div
+      style={{
+        marginTop: 10,
+        display: "flex",
+        gap: 10,
+        flexWrap: "wrap",
+        alignItems: "center",
+      }}
+    >
+      <div
+        style={{
+          background: UI.panelBg,
+          border: `1px solid ${UI.border}`,
+          borderRadius: 12,
+          padding: "8px 10px",
         }}
       >
-        <div>
-          <h1 style={{ margin: 0, fontSize: 22 }}>{weekLabel(week)}</h1>
-          <p style={{ opacity: 0.8, marginTop: 6, fontSize: 13 }}>
-            Source: <code>{sheetLabelForWeek(week)}</code>
-            {panelOpen && (
-              <span style={{ marginLeft: 10, fontSize: 12, color: UI.textDim }}>
-                (Caregiver Panel: {availLoading ? "loading…" : availError ? "error" : "ready"})
-              </span>
-            )}
-            <span style={{ marginLeft: 10, fontSize: 12, color: UI.textDim }}>
-  (Caregivers: {caregiversLoading ? "loading…" : caregiversError ? "error" : "ready"})
-</span>
-<span style={{ marginLeft: 10, fontSize: 12, color: UI.textDim }}>
-  (Applicants: {applicantsLoading ? "loading…" : applicantsError ? "error" : "ready"})
-</span>
-<span style={{ marginLeft: 10, fontSize: 12, color: UI.textDim }}>
-  (Service requests: {ghostLoading ? "loading…" : ghostError ? "error" : "ready"})
-</span>
-          </p>
-        </div>
-      </header>
+        <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Total Hours (approx)</div>
+        <div style={{ fontSize: 16, fontWeight: 900 }}>{totals.totalHours.toFixed(1)}</div>
+      </div>
 
-      <div style={{ marginTop: 10, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <DayChip label="All Days" active={selectedDow == null} onClick={() => setSelectedDow(null)} />
-          {DOW_LABELS.map((d, idx) => (
-            <DayChip key={d} label={d} active={selectedDow === idx} onClick={() => setSelectedDow(idx)} />
-          ))}
-        </div>
+      <div
+        style={{
+          background: UI.panelBg,
+          border: `1px solid ${UI.border}`,
+          borderRadius: 12,
+          padding: "8px 10px",
+        }}
+      >
+        <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Clients</div>
+        <div style={{ fontSize: 16, fontWeight: 900 }}>{totals.clientCount}</div>
+      </div>
 
-       <input
-  value={searchText ?? ""}
-  onChange={(e) => setSearchText(e.target.value)}
-  placeholder="Search client or cell text…"
+      <div
+        style={{
+          background: UI.panelBg,
+          border: `1px solid ${UI.border}`,
+          borderRadius: 12,
+          padding: "8px 10px",
+        }}
+      >
+        <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Flagged Shifts</div>
+        <div style={{ fontSize: 16, fontWeight: 900 }}>{flaggedShiftsTotal}</div>
+      </div>
+
+      <div
+        style={{
+          marginLeft: "auto",
+          display: "flex",
+          gap: 10,
+          alignItems: "center",
+          flexWrap: "wrap",
+        }}
+      >
+        <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>Panel filter</div>
+        <select
+          value={panelFilter}
+          onChange={(e) => setPanelFilter(e.target.value as any)}
           style={{
-            marginLeft: "auto",
-            width: 320,
             border: `1px solid ${UI.border}`,
             borderRadius: 12,
             padding: "8px 10px",
             fontSize: 13,
             outline: "none",
             background: UI.panelBg,
+            minWidth: 280,
+            fontWeight: 800,
           }}
-        />
+          title="Filter the caregiver panel"
+        >
+          <option value="all">Caregivers on schedule (active)</option>
+          <option value="certifiedActive">Caregivers with certification (active)</option>
+          <option value="missingProfile">On schedule, missing caregiver profile</option>
+        </select>
       </div>
+    </div>
 
-      <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-        <div style={{ background: UI.panelBg, border: `1px solid ${UI.border}`, borderRadius: 12, padding: "8px 10px" }}>
-          <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Total Hours (approx)</div>
-          <div style={{ fontSize: 16, fontWeight: 900 }}>{totals.totalHours.toFixed(1)}</div>
+    {draftMode ? (
+      <div
+        style={{
+          marginTop: 12,
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: 12,
+          flexWrap: "wrap",
+          padding: "10px 12px",
+          borderRadius: 12,
+          border: "1px solid #cbd5e1",
+          background: "#eff6ff",
+        }}
+      >
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 1000, color: "#111827" }}>Draft Mode is ON</div>
+          <div style={{ fontSize: 12, color: "#475569", marginTop: 2 }}>
+            Changes stay in the portal until you click Save Schedule.
+          </div>
         </div>
 
-        <div style={{ background: UI.panelBg, border: `1px solid ${UI.border}`, borderRadius: 12, padding: "8px 10px" }}>
-          <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Clients</div>
-          <div style={{ fontSize: 16, fontWeight: 900 }}>{totals.clientCount}</div>
-        </div>
-
-        <div style={{ background: UI.panelBg, border: `1px solid ${UI.border}`, borderRadius: 12, padding: "8px 10px" }}>
-          <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Flagged Shifts</div>
-          <div style={{ fontSize: 16, fontWeight: 900 }}>{flaggedShiftsTotal}</div>
-        </div>
-
-        <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-          <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>Panel filter</div>
-          <select
-            value={panelFilter}
-            onChange={(e) => setPanelFilter(e.target.value as any)}
-            style={{
-              border: `1px solid ${UI.border}`,
-              borderRadius: 12,
-              padding: "8px 10px",
-              fontSize: 13,
-              outline: "none",
-              background: UI.panelBg,
-              minWidth: 280,
-              fontWeight: 800,
-            }}
-            title="Filter the caregiver panel"
-          >
-            <option value="all">Caregivers on schedule (active)</option>
-            <option value="certifiedActive">Caregivers with certification (active)</option>
-            <option value="missingProfile">On schedule, missing caregiver profile</option>
-          </select>
+        <div style={{ fontSize: 12, fontWeight: 900, color: "#1e3a8a" }}>
+          {hasDraftChanges
+            ? `${changedCellCount} unsaved draft change${changedCellCount === 1 ? "" : "s"}`
+            : "No draft changes yet"}
         </div>
       </div>
+    ) : null}
 
-      {loading && <p style={{ opacity: 0.85, marginTop: 12 }}>Loading…</p>}
-
-      {!loading && error && (
-        <pre
+    {bulkMode ? (
+      <div
+        style={{
+          marginTop: 12,
+          display: "grid",
+          gap: 12,
+          padding: "12px",
+          borderRadius: 12,
+          border: `1px solid ${UI.border}`,
+          background: UI.panelBg,
+        }}
+      >
+        <div
           style={{
-            whiteSpace: "pre-wrap",
-            background: UI.panelBg,
-            padding: 12,
-            borderRadius: 10,
-            color: "salmon",
-            marginTop: 12,
+            display: "flex",
+            gap: 10,
+            alignItems: "center",
+            flexWrap: "wrap",
           }}
         >
-          {error}
-        </pre>
-      )}
+          <div style={{ fontSize: 13, fontWeight: 1000, color: UI.text }}>Bulk Edit Mode</div>
 
-      {/* Edit modal */}
-      <Modal
-        open={editOpen}
-        title={`${editClientName || "Client"} • ${editDayLabel || ""}${editA1 ? ` • ${editA1}` : ""}`}
-        onClose={() => {
-          if (savingA1) return;
-          setEditOpen(false);
-          setEditA1(null);
-        }}
-      >
-        <div style={{ display: "grid", gap: 10 }}>
-          <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 900 }}>
-            Full cell text (edit anything exactly as you want it saved):
+          <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>
+            {selectedBulkCount} selected
           </div>
 
-          <textarea
-            value={editDraft}
-            onChange={(e) => setEditDraft(e.target.value)}
-            rows={6}
+          <button
+            type="button"
+            onClick={selectAllVisibleShifts}
             style={{
-              width: "100%",
-              boxSizing: "border-box",
               border: `1px solid ${UI.border}`,
-              borderRadius: 12,
-              padding: "10px 10px",
-              fontSize: 13,
-              outline: "none",
-              background: UI.panelBg,
+              background: UI.headerBg,
               color: UI.text,
-              resize: "vertical",
-              fontFamily: "inherit",
-              whiteSpace: "pre-wrap",
+              borderRadius: 10,
+              padding: "6px 10px",
+              fontSize: 12,
+              cursor: "pointer",
+              fontWeight: 900,
             }}
-            disabled={Boolean(savingA1)}
-            autoFocus
-          />
+          >
+            Select All Visible
+          </button>
 
-          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
-            <button
-              type="button"
-              onClick={() => {
-                if (savingA1) return;
-                setEditOpen(false);
-                setEditA1(null);
-              }}
-              style={{
-                border: `1px solid ${UI.border}`,
-                background: UI.panelBg,
-                color: UI.text,
-                borderRadius: 10,
-                padding: "8px 12px",
-                cursor: savingA1 ? "default" : "pointer",
-                fontWeight: 900,
-                fontSize: 13,
-              }}
-              disabled={Boolean(savingA1)}
-            >
-              Cancel
-            </button>
+          <button
+            type="button"
+            onClick={clearBulkSelection}
+            disabled={!selectedBulkCount}
+            style={{
+              border: `1px solid ${UI.border}`,
+              background: selectedBulkCount ? UI.headerBg : "#f3f4f6",
+              color: selectedBulkCount ? UI.text : "#9ca3af",
+              borderRadius: 10,
+              padding: "6px 10px",
+              fontSize: 12,
+              cursor: selectedBulkCount ? "pointer" : "default",
+              fontWeight: 900,
+            }}
+          >
+            Clear Selection
+          </button>
+        </div>
 
-            <button
-              type="button"
-              onClick={saveEdit}
-              style={{
-                border: "1px solid #111827",
-                background: "#111827",
-                color: "#fff",
-                borderRadius: 10,
-                padding: "8px 12px",
-                cursor: savingA1 ? "default" : "pointer",
-                fontWeight: 900,
-                fontSize: 13,
-              }}
-              disabled={Boolean(savingA1)}
-            >
-              {savingA1 ? "Saving…" : "Save"}
-            </button>
+        <div style={{ display: "grid", gap: 8 }}>
+          <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>
+            Step 1: Choose how to find shifts
           </div>
 
-          <div style={{ fontSize: 11.5, color: UI.textDim, lineHeight: 1.35 }}>
-            Tip: tap a cell to edit • cancelled shifts are shown in light gray.
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button
+              type="button"
+              onClick={() => resetBulkSearchUi("caregiver")}
+              style={{
+                border: `1px solid ${bulkSelectionMode === "caregiver" ? "#111827" : UI.border}`,
+                background: bulkSelectionMode === "caregiver" ? "#111827" : UI.headerBg,
+                color: bulkSelectionMode === "caregiver" ? "#fff" : UI.text,
+                borderRadius: 10,
+                padding: "6px 10px",
+                fontSize: 12,
+                cursor: "pointer",
+                fontWeight: 900,
+              }}
+            >
+              By Caregiver
+            </button>
+
+            <button
+              type="button"
+              onClick={() => resetBulkSearchUi("client")}
+              style={{
+                border: `1px solid ${bulkSelectionMode === "client" ? "#111827" : UI.border}`,
+                background: bulkSelectionMode === "client" ? "#111827" : UI.headerBg,
+                color: bulkSelectionMode === "client" ? "#fff" : UI.text,
+                borderRadius: 10,
+                padding: "6px 10px",
+                fontSize: 12,
+                cursor: "pointer",
+                fontWeight: 900,
+              }}
+            >
+              By Client
+            </button>
+
+            <button
+              type="button"
+              onClick={() => resetBulkSearchUi("status")}
+              style={{
+                border: `1px solid ${bulkSelectionMode === "status" ? "#111827" : UI.border}`,
+                background: bulkSelectionMode === "status" ? "#111827" : UI.headerBg,
+                color: bulkSelectionMode === "status" ? "#fff" : UI.text,
+                borderRadius: 10,
+                padding: "6px 10px",
+                fontSize: 12,
+                cursor: "pointer",
+                fontWeight: 900,
+              }}
+            >
+              By Status
+            </button>
+
+            <button
+              type="button"
+              onClick={() => resetBulkSearchUi("manual")}
+              style={{
+                border: `1px solid ${bulkSelectionMode === "manual" ? "#111827" : UI.border}`,
+                background: bulkSelectionMode === "manual" ? "#111827" : UI.headerBg,
+                color: bulkSelectionMode === "manual" ? "#fff" : UI.text,
+                borderRadius: 10,
+                padding: "6px 10px",
+                fontSize: 12,
+                cursor: "pointer",
+                fontWeight: 900,
+              }}
+            >
+              Manual Select
+            </button>
           </div>
         </div>
-      </Modal>
 
-      {/* Client Profile modal (details + history) */}
-      <Modal
-        open={clientProfileOpen}
-        title={`Client Profile • ${clientProfileName || "Client"}`}
-        onClose={() => {
-          setClientProfileOpen(false);
-          setClientProfileName("");
-        }}
-      >
-        {(() => {
-          const key = normalizeKey(clientProfileName);
-          const p = key ? clientsByName[key] : undefined;
+        {bulkSelectionMode === "caregiver" ? (
+          <div style={{ display: "grid", gap: 8 }}>
+            <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>
+              Step 2: Choose caregiver
+            </div>
 
-          const name = p?.name || clientProfileName || "Client";
-          const location = norm(p?.location);
-          const description = norm(p?.description);
-          const rate = norm(p?.rate);
+            <div style={{ position: "relative", maxWidth: 320 }}>
+              <input
+                value={bulkSmartCaregiver}
+                onChange={(e) => {
+                  setBulkSmartCaregiver(e.target.value);
+                  setShowCaregiverSuggestions(true);
+                }}
+                onFocus={() => setShowCaregiverSuggestions(true)}
+                placeholder="Search caregiver…"
+                style={{
+                  width: "100%",
+                  border: `1px solid ${UI.border}`,
+                  borderRadius: 10,
+                  padding: "8px 10px",
+                  fontSize: 12,
+                  outline: "none",
+                  background: UI.panelBg,
+                  boxSizing: "border-box",
+                }}
+              />
 
-          return (
-            <div style={{ maxHeight: "70vh", overflowY: "auto", paddingRight: 6 }}>
-              <div style={{ display: "grid", gap: 14 }}>
+              {showCaregiverSuggestions && bulkCaregiverSuggestions.length > 0 ? (
                 <div
                   style={{
-                    border: `1px solid ${UI.borderSoft}`,
-                    borderRadius: 14,
-                    padding: 12,
-                    background: "rgba(255,255,255,0.9)",
+                    position: "absolute",
+                    top: "calc(100% + 4px)",
+                    left: 0,
+                    right: 0,
+                    background: "#fff",
+                    border: `1px solid ${UI.border}`,
+                    borderRadius: 10,
+                    boxShadow: "0 8px 20px rgba(0,0,0,0.12)",
+                    zIndex: 40,
+                    overflow: "hidden",
                   }}
                 >
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      gap: 10,
-                      alignItems: "baseline",
-                    }}
-                  >
-                    <div style={{ minWidth: 0 }}>
-                      <div style={{ fontSize: 12, fontWeight: 950, color: UI.textDim }}>Client</div>
-                      <div
-                        style={{
-                          marginTop: 2,
-                          fontSize: 18,
-                          fontWeight: 1000,
-                          letterSpacing: 0.2,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                        }}
-                        title={name}
-                      >
-                        {name}
-                      </div>
-                    </div>
+                  {bulkCaregiverSuggestions.map((name) => (
+                    <button
+                      key={name}
+                      type="button"
+                      onClick={() => {
+                        setBulkSmartCaregiver(name);
+                        setShowCaregiverSuggestions(false);
+                        smartSelectByCaregiverAndStatus(name, bulkSmartStatus);
+                      }}
+                      style={{
+                        width: "100%",
+                        textAlign: "left",
+                        border: "none",
+                        background: "#fff",
+                        padding: "9px 10px",
+                        fontSize: 12,
+                        cursor: "pointer",
+                        fontWeight: 800,
+                      }}
+                    >
+                      {name}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
 
-                    {rate ? (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <select
+                value={bulkSmartStatus}
+                onChange={(e) => setBulkSmartStatus(e.target.value as BulkSmartStatusFilter)}
+                style={{
+                  border: `1px solid ${UI.border}`,
+                  borderRadius: 10,
+                  padding: "8px 10px",
+                  fontSize: 12,
+                  outline: "none",
+                  background: UI.panelBg,
+                  fontWeight: 800,
+                }}
+              >
+                <option value="Any">Any status</option>
+                <option value="Open">Open</option>
+                <option value="Filled">Filled</option>
+                <option value="Offered">Offered</option>
+                <option value="Considering">Considering</option>
+                <option value="PendingClientApproval">Pending Approval</option>
+              </select>
+
+              <button
+                type="button"
+                onClick={() =>
+                  smartSelectByCaregiverAndStatus(bulkSmartCaregiver, bulkSmartStatus)
+                }
+                style={{
+                  border: `1px solid ${UI.border}`,
+                  background: UI.headerBg,
+                  color: UI.text,
+                  borderRadius: 10,
+                  padding: "8px 10px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                  fontWeight: 900,
+                }}
+              >
+                Select Matching Shifts
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        {bulkSelectionMode === "client" ? (
+          <div style={{ display: "grid", gap: 8 }}>
+            <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>
+              Step 2: Choose client
+            </div>
+
+            <div style={{ position: "relative", maxWidth: 320 }}>
+              <input
+                value={bulkSmartClient}
+                onChange={(e) => {
+                  setBulkSmartClient(e.target.value);
+                  setShowClientSuggestions(true);
+                }}
+                onFocus={() => setShowClientSuggestions(true)}
+                placeholder="Search client…"
+                style={{
+                  width: "100%",
+                  border: `1px solid ${UI.border}`,
+                  borderRadius: 10,
+                  padding: "8px 10px",
+                  fontSize: 12,
+                  outline: "none",
+                  background: UI.panelBg,
+                  boxSizing: "border-box",
+                }}
+              />
+
+              {showClientSuggestions && bulkClientSuggestions.length > 0 ? (
+                <div
+                  style={{
+                    position: "absolute",
+                    top: "calc(100% + 4px)",
+                    left: 0,
+                    right: 0,
+                    background: "#fff",
+                    border: `1px solid ${UI.border}`,
+                    borderRadius: 10,
+                    boxShadow: "0 8px 20px rgba(0,0,0,0.12)",
+                    zIndex: 40,
+                    overflow: "hidden",
+                  }}
+                >
+                  {bulkClientSuggestions.map((name) => (
+                    <button
+                      key={name}
+                      type="button"
+                      onClick={() => {
+                        setBulkSmartClient(name);
+                        setShowClientSuggestions(false);
+                        smartSelectByClient(name);
+                      }}
+                      style={{
+                        width: "100%",
+                        textAlign: "left",
+                        border: "none",
+                        background: "#fff",
+                        padding: "9px 10px",
+                        fontSize: 12,
+                        cursor: "pointer",
+                        fontWeight: 800,
+                      }}
+                    >
+                      {name}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+
+            <div>
+              <button
+                type="button"
+                onClick={() => smartSelectByClient(bulkSmartClient)}
+                style={{
+                  border: `1px solid ${UI.border}`,
+                  background: UI.headerBg,
+                  color: UI.text,
+                  borderRadius: 10,
+                  padding: "8px 10px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                  fontWeight: 900,
+                }}
+              >
+                Select Matching Shifts
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        {bulkSelectionMode === "status" ? (
+          <div style={{ display: "grid", gap: 8 }}>
+            <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>
+              Step 2: Choose status
+            </div>
+
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <select
+                value={bulkSmartStatus}
+                onChange={(e) => setBulkSmartStatus(e.target.value as BulkSmartStatusFilter)}
+                style={{
+                  border: `1px solid ${UI.border}`,
+                  borderRadius: 10,
+                  padding: "8px 10px",
+                  fontSize: 12,
+                  outline: "none",
+                  background: UI.panelBg,
+                  fontWeight: 800,
+                }}
+              >
+                <option value="Any">Any status</option>
+                <option value="Open">Open</option>
+                <option value="Filled">Filled</option>
+                <option value="Offered">Offered</option>
+                <option value="Considering">Considering</option>
+                <option value="PendingClientApproval">Pending Approval</option>
+              </select>
+
+              <button
+                type="button"
+                disabled={bulkSmartStatus === "Any"}
+                onClick={() => {
+                  if (bulkSmartStatus !== "Any") {
+                    smartSelectByStatus(bulkSmartStatus);
+                  }
+                }}
+                style={{
+                  border: `1px solid ${UI.border}`,
+                  background: UI.headerBg,
+                  color: bulkSmartStatus === "Any" ? "#9ca3af" : UI.text,
+                  borderRadius: 10,
+                  padding: "8px 10px",
+                  fontSize: 12,
+                  cursor: bulkSmartStatus === "Any" ? "default" : "pointer",
+                  fontWeight: 900,
+                }}
+              >
+                Select Matching Shifts
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        {bulkSelectionMode === "manual" ? (
+          <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 800 }}>
+            Step 2: Click schedule cells directly to select them.
+          </div>
+        ) : null}
+
+        {selectedBulkCount > 0 ? (
+          <div
+            style={{
+              display: "grid",
+              gap: 10,
+              paddingTop: 8,
+              borderTop: `1px solid ${UI.borderSoft}`,
+            }}
+          >
+            <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>
+              Step 3: Choose what to change
+            </div>
+
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <select
+                value={bulkCancelledTarget}
+                onChange={(e) => setBulkCancelledTarget(e.target.value as any)}
+                style={{
+                  border: `1px solid ${UI.border}`,
+                  borderRadius: 10,
+                  padding: "8px 10px",
+                  fontSize: 12,
+                  outline: "none",
+                  background: UI.panelBg,
+                  fontWeight: 800,
+                }}
+                title="Cancelled state behavior"
+              >
+                <option value="keep">Keep cancelled state</option>
+                <option value="cancelled">Make cancelled</option>
+                <option value="not_cancelled">Remove cancelled</option>
+              </select>
+            </div>
+
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <button
+                type="button"
+                onClick={() =>
+                  applyBulkStatusChange({
+                    targetBaseStatus: "Considering",
+                    targetCancelled:
+                      bulkCancelledTarget === "keep"
+                        ? "keep"
+                        : bulkCancelledTarget === "cancelled",
+                  })
+                }
+                disabled={bulkApplying}
+                style={{
+                  border: `1px solid ${UI.border}`,
+                  background: "#fff7ed",
+                  color: "#9a3412",
+                  borderRadius: 10,
+                  padding: "6px 10px",
+                  fontSize: 12,
+                  cursor: bulkApplying ? "default" : "pointer",
+                  fontWeight: 900,
+                }}
+              >
+                Change to Considering
+              </button>
+
+              <button
+                type="button"
+                onClick={() =>
+                  applyBulkStatusChange({
+                    targetBaseStatus: "Offered",
+                    targetCancelled:
+                      bulkCancelledTarget === "keep"
+                        ? "keep"
+                        : bulkCancelledTarget === "cancelled",
+                  })
+                }
+                disabled={bulkApplying}
+                style={{
+                  border: `1px solid ${UI.border}`,
+                  background: "#eff6ff",
+                  color: "#1d4ed8",
+                  borderRadius: 10,
+                  padding: "6px 10px",
+                  fontSize: 12,
+                  cursor: bulkApplying ? "default" : "pointer",
+                  fontWeight: 900,
+                }}
+              >
+                Change to Offered
+              </button>
+
+              <button
+                type="button"
+                onClick={() =>
+                  applyBulkStatusChange({
+                    targetBaseStatus: "Filled",
+                    targetCancelled:
+                      bulkCancelledTarget === "keep"
+                        ? "keep"
+                        : bulkCancelledTarget === "cancelled",
+                  })
+                }
+                disabled={bulkApplying}
+                style={{
+                  border: `1px solid ${UI.border}`,
+                  background: "#ecfdf5",
+                  color: "#166534",
+                  borderRadius: 10,
+                  padding: "6px 10px",
+                  fontSize: 12,
+                  cursor: bulkApplying ? "default" : "pointer",
+                  fontWeight: 900,
+                }}
+              >
+                Change to Filled
+              </button>
+
+              <button
+                type="button"
+                onClick={() =>
+                  applyBulkStatusChange({
+                    targetBaseStatus: "PendingClientApproval",
+                    targetCancelled:
+                      bulkCancelledTarget === "keep"
+                        ? "keep"
+                        : bulkCancelledTarget === "cancelled",
+                  })
+                }
+                disabled={bulkApplying}
+                style={{
+                  border: `1px solid ${UI.border}`,
+                  background: "#faf5ff",
+                  color: "#7e22ce",
+                  borderRadius: 10,
+                  padding: "6px 10px",
+                  fontSize: 12,
+                  cursor: bulkApplying ? "default" : "pointer",
+                  fontWeight: 900,
+                }}
+              >
+                Change to Pending Approval
+              </button>
+
+              <button
+                type="button"
+                onClick={() =>
+                  applyBulkStatusChange({
+                    targetBaseStatus: "Open",
+                    targetCancelled:
+                      bulkCancelledTarget === "keep"
+                        ? "keep"
+                        : bulkCancelledTarget === "cancelled",
+                  })
+                }
+                disabled={bulkApplying}
+                style={{
+                  border: `1px solid ${UI.border}`,
+                  background: "#fef2f2",
+                  color: "#b91c1c",
+                  borderRadius: 10,
+                  padding: "6px 10px",
+                  fontSize: 12,
+                  cursor: bulkApplying ? "default" : "pointer",
+                  fontWeight: 900,
+                }}
+              >
+                Change to Open
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>
+          Bulk mode now works in steps: choose a filter, select shifts, then choose the change.
+        </div>
+      </div>
+    ) : null}
+
+    {loading && <p style={{ opacity: 0.85, marginTop: 12 }}>Loading…</p>}
+
+    {!loading && error && (
+      <pre
+        style={{
+          whiteSpace: "pre-wrap",
+          background: UI.panelBg,
+          padding: 12,
+          borderRadius: 10,
+          color: "salmon",
+          marginTop: 12,
+        }}
+      >
+        {error}
+      </pre>
+    )}
+
+        <Modal
+  open={insertRowModal.open}
+  title="Add Schedule Row"
+  onClose={closeInsertRowModal}
+>
+  <div style={{ display: "grid", gap: 14 }}>
+    <div style={{ fontSize: 12, color: UI.textDim, lineHeight: 1.4 }}>
+      {insertRowModal.anchorClientName ? (
+        <>
+          Add a row above or below <strong>{insertRowModal.anchorClientName}</strong>.
+          Column A will start with that client name.
+        </>
+      ) : (
+        <>Choose where to add the row.</>
+      )}
+    </div>
+
+    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+      <button
+        type="button"
+        onClick={() => setInsertRowPosition("above")}
+        disabled={insertRowSaving}
+        style={{
+          border: `1px solid ${
+            insertRowModal.position === "above" ? "#111827" : UI.border
+          }`,
+          background:
+            insertRowModal.position === "above" ? "#111827" : UI.panelBg,
+          color: insertRowModal.position === "above" ? "#fff" : UI.text,
+          borderRadius: 999,
+          padding: "7px 12px",
+          fontSize: 12,
+          fontWeight: 900,
+          cursor: insertRowSaving ? "default" : "pointer",
+        }}
+      >
+        Add Above
+      </button>
+
+      <button
+        type="button"
+        onClick={() => setInsertRowPosition("below")}
+        disabled={insertRowSaving}
+        style={{
+          border: `1px solid ${
+            insertRowModal.position === "below" ? "#111827" : UI.border
+          }`,
+          background:
+            insertRowModal.position === "below" ? "#111827" : UI.panelBg,
+          color: insertRowModal.position === "below" ? "#fff" : UI.text,
+          borderRadius: 999,
+          padding: "7px 12px",
+          fontSize: 12,
+          fontWeight: 900,
+          cursor: insertRowSaving ? "default" : "pointer",
+        }}
+      >
+        Add Below
+      </button>
+    </div>
+
+    <div style={{ display: "grid", gap: 6 }}>
+      <label
+        style={{
+          fontSize: 12,
+          fontWeight: 900,
+          color: UI.text,
+        }}
+      >
+        Client Name
+      </label>
+      <input
+        type="text"
+        value={insertRowModal.clientName}
+        onChange={(e) =>
+          setInsertRowModal((prev) => ({
+            ...prev,
+            clientName: e.target.value,
+          }))
+        }
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !insertRowSaving) {
+            e.preventDefault();
+            handleInsertRowSubmit();
+          }
+        }}
+        placeholder="Enter client name"
+        autoFocus
+        style={{
+          border: `1px solid ${UI.border}`,
+          borderRadius: 10,
+          padding: "10px 12px",
+          fontSize: 13,
+          outline: "none",
+          background: "#fff",
+          color: UI.text,
+        }}
+      />
+    </div>
+
+    <div style={{ fontSize: 12, color: UI.textDim }}>
+      Insert at sheet row: <strong>{insertRowModal.insertAtRow ?? "—"}</strong>
+    </div>
+
+    <div
+      style={{
+        display: "flex",
+        justifyContent: "flex-end",
+        gap: 8,
+      }}
+    >
+      <button
+        type="button"
+        onClick={closeInsertRowModal}
+        disabled={insertRowSaving}
+        style={{
+          border: `1px solid ${UI.border}`,
+          background: UI.panelBg,
+          color: UI.text,
+          borderRadius: 10,
+          padding: "8px 12px",
+          fontSize: 12,
+          fontWeight: 900,
+          cursor: insertRowSaving ? "default" : "pointer",
+        }}
+      >
+        Cancel
+      </button>
+
+      <button
+        type="button"
+        onClick={handleInsertRowSubmit}
+        disabled={insertRowSaving}
+        style={{
+          border: `1px solid ${UI.border}`,
+          background: "#111827",
+          color: "#fff",
+          borderRadius: 10,
+          padding: "8px 12px",
+          fontSize: 12,
+          fontWeight: 900,
+          cursor: insertRowSaving ? "default" : "pointer",
+        }}
+      >
+        {insertRowSaving
+          ? "Adding..."
+          : insertRowModal.position === "above"
+          ? "Add Above"
+          : "Add Below"}
+      </button>
+    </div>
+  </div>
+</Modal>
+    <Modal
+      open={clientProfileOpen}
+      title={`Client Profile • ${clientProfileName || "Client"}`}
+      onClose={() => {
+        setClientProfileOpen(false);
+        setClientProfileName("");
+      }}
+    >
+      {(() => {
+        const key = normalizeKey(clientProfileName);
+        const p = key ? clientsByName[key] : undefined;
+
+        const name = p?.name || clientProfileName || "Client";
+        const location = norm(p?.location);
+        const description = norm(p?.description);
+        const rate = norm(p?.rate);
+
+        return (
+          <div style={{ maxHeight: "70vh", overflowY: "auto", paddingRight: 6 }}>
+            <div style={{ display: "grid", gap: 14 }}>
+              <div
+                style={{
+                  border: `1px solid ${UI.borderSoft}`,
+                  borderRadius: 14,
+                  padding: 12,
+                  background: "rgba(255,255,255,0.9)",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    gap: 10,
+                    alignItems: "baseline",
+                  }}
+                >
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 12, fontWeight: 950, color: UI.textDim }}>Client</div>
+                    <div
+                      style={{
+                        marginTop: 2,
+                        fontSize: 18,
+                        fontWeight: 1000,
+                        letterSpacing: 0.2,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                      title={name}
+                    >
+                      {name}
+                    </div>
+                  </div>
+
+                  {rate ? (
+                    <div
+                      style={{
+                        fontSize: 12,
+                        fontWeight: 950,
+                        padding: "6px 10px",
+                        borderRadius: 999,
+                        border: `1px solid ${UI.borderSoft}`,
+                        background: "#f8fafc",
+                        color: UI.text,
+                        whiteSpace: "nowrap",
+                      }}
+                      title="Hourly rate"
+                    >
+                      Rate: {rate}
+                    </div>
+                  ) : null}
+                </div>
+
+                <div style={{ marginTop: 10, display: "grid", gap: 10 }}>
+                  <div>
+                    <div style={{ fontSize: 11.5, fontWeight: 950, color: UI.textDim }}>Location</div>
+                    {location ? (
                       <div
                         style={{
-                          fontSize: 12,
-                          fontWeight: 950,
-                          padding: "6px 10px",
-                          borderRadius: 999,
-                          border: `1px solid ${UI.borderSoft}`,
-                          background: "#f8fafc",
+                          marginTop: 3,
+                          fontSize: 13,
+                          fontWeight: 850,
                           color: UI.text,
-                          whiteSpace: "nowrap",
+                          whiteSpace: "pre-wrap",
                         }}
-                        title="Hourly rate"
                       >
-                        Rate: {rate}
+                        {location}
+                      </div>
+                    ) : (
+                      <div style={{ marginTop: 3, fontSize: 13, color: "#9ca3af", fontWeight: 850 }}>—</div>
+                    )}
+                  </div>
+
+                  <div>
+                    <div style={{ fontSize: 11.5, fontWeight: 950, color: UI.textDim }}>Description</div>
+                    {description ? (
+                      <div
+                        style={{
+                          marginTop: 3,
+                          fontSize: 13,
+                          color: UI.text,
+                          whiteSpace: "pre-wrap",
+                          lineHeight: 1.35,
+                        }}
+                      >
+                        {description}
+                      </div>
+                    ) : (
+                      <div style={{ marginTop: 3, fontSize: 13, color: "#9ca3af", fontWeight: 850 }}>—</div>
+                    )}
+                  </div>
+
+                  <div style={{ marginTop: 2, fontSize: 11.5, color: UI.textDim, lineHeight: 1.3 }}>
+                    {clientsLoading ? (
+                      <span>Client details: loading…</span>
+                    ) : clientsError ? (
+                      <span style={{ color: "salmon", fontWeight: 900 }}>
+                        Client details error: {clientsError}
+                      </span>
+                    ) : p ? (
+                      <span>Client details: loaded from Clients sheet.</span>
+                    ) : (
+                      <span style={{ color: "salmon", fontWeight: 900 }}>
+                        Client details not found in Clients sheet for: <strong>{clientProfileName}</strong>
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gap: 6 }}>
+                <div style={{ fontSize: 12, fontWeight: 950, color: UI.textDim }}>
+                  Caregivers who have been here
+                </div>
+
+                {histLoading ? (
+                  <div style={{ fontSize: 13, color: UI.textDim }}>Loading history…</div>
+                ) : histError ? (
+                  <div style={{ fontSize: 13, color: "salmon", fontWeight: 800 }}>{histError}</div>
+                ) : clientCaregiverHistory.length === 0 ? (
+                  <div style={{ fontSize: 13, color: UI.textDim }}>
+                    No historical visits found in the loaded window.
+                  </div>
+                ) : (
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {clientCaregiverHistory.slice(0, 20).map((h) => {
+                      const prof = h.caregiverId ? caregiversById[h.caregiverId] : undefined;
+                      const cert = norm(prof?.certification);
+                      const certOk = cert && cert.toLowerCase() !== "none";
+
+                      return (
+                        <div
+                          key={(h.caregiverId || h.caregiverName) + "::" + h.lastDate}
+                          style={{
+                            border: `1px solid ${UI.borderSoft}`,
+                            borderRadius: 12,
+                            padding: "8px 10px",
+                            background: "rgba(255,255,255,0.85)",
+                            display: "flex",
+                            justifyContent: "space-between",
+                            gap: 10,
+                            alignItems: "baseline",
+                          }}
+                        >
+                          <div style={{ minWidth: 0 }}>
+                            <div
+                              style={{
+                                fontWeight: 950,
+                                fontSize: 13,
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {h.caregiverName}
+                              {certOk ? (
+                                <span
+                                  style={{
+                                    marginLeft: 8,
+                                    fontSize: 11,
+                                    fontWeight: 900,
+                                    padding: "2px 8px",
+                                    borderRadius: 999,
+                                    border: `1px solid ${UI.borderSoft}`,
+                                    background: "#f8fafc",
+                                    color: UI.textDim,
+                                    whiteSpace: "nowrap",
+                                  }}
+                                  title="Certification"
+                                >
+                                  {cert}
+                                </span>
+                              ) : null}
+                            </div>
+
+                            <div style={{ marginTop: 2, fontSize: 11.5, color: UI.textDim }}>
+                              Last visit: <strong>{h.lastDate || "—"}</strong>
+                              {h.caregiverId ? <span style={{ marginLeft: 8 }}>ID: {h.caregiverId}</span> : null}
+                            </div>
+                          </div>
+
+                          <div style={{ fontSize: 12, fontWeight: 950, whiteSpace: "nowrap" }}>
+                            {h.visitCount} visit{h.visitCount === 1 ? "" : "s"}
+                          </div>
+                        </div>
+                      );
+                    })}
+
+                    {clientCaregiverHistory.length > 20 ? (
+                      <div style={{ fontSize: 12, color: UI.textDim }}>
+                        Showing top 20 (of {clientCaregiverHistory.length}) by visits/recentness.
                       </div>
                     ) : null}
                   </div>
-
-                  <div style={{ marginTop: 10, display: "grid", gap: 10 }}>
-                    <div>
-                      <div style={{ fontSize: 11.5, fontWeight: 950, color: UI.textDim }}>Location</div>
-                      {location ? (
-                        <div
-                          style={{
-                            marginTop: 3,
-                            fontSize: 13,
-                            fontWeight: 850,
-                            color: UI.text,
-                            whiteSpace: "pre-wrap",
-                          }}
-                        >
-                          {location}
-                        </div>
-                      ) : (
-                        <div style={{ marginTop: 3, fontSize: 13, color: "#9ca3af", fontWeight: 850 }}>—</div>
-                      )}
-                    </div>
-
-                    <div>
-                      <div style={{ fontSize: 11.5, fontWeight: 950, color: UI.textDim }}>Description</div>
-                      {description ? (
-                        <div style={{ marginTop: 3, fontSize: 13, color: UI.text, whiteSpace: "pre-wrap", lineHeight: 1.35 }}>
-                          {description}
-                        </div>
-                      ) : (
-                        <div style={{ marginTop: 3, fontSize: 13, color: "#9ca3af", fontWeight: 850 }}>—</div>
-                      )}
-                    </div>
-
-                    <div style={{ marginTop: 2, fontSize: 11.5, color: UI.textDim, lineHeight: 1.3 }}>
-                      {clientsLoading ? (
-                        <span>Client details: loading…</span>
-                      ) : clientsError ? (
-                        <span style={{ color: "salmon", fontWeight: 900 }}>Client details error: {clientsError}</span>
-                      ) : p ? (
-                        <span>Client details: loaded from Clients sheet.</span>
-                      ) : (
-                        <span style={{ color: "salmon", fontWeight: 900 }}>
-                          Client details not found in Clients sheet for: <strong>{clientProfileName}</strong>
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                <div style={{ display: "grid", gap: 6 }}>
-                  <div style={{ fontSize: 12, fontWeight: 950, color: UI.textDim }}>
-                    Caregivers who have been here
-                  </div>
-
-                  {histLoading ? (
-                    <div style={{ fontSize: 13, color: UI.textDim }}>Loading history…</div>
-                  ) : histError ? (
-                    <div style={{ fontSize: 13, color: "salmon", fontWeight: 800 }}>{histError}</div>
-                  ) : clientCaregiverHistory.length === 0 ? (
-                    <div style={{ fontSize: 13, color: UI.textDim }}>
-                      No historical visits found in the loaded window.
-                    </div>
-                  ) : (
-                    <div style={{ display: "grid", gap: 8 }}>
-                      {clientCaregiverHistory.slice(0, 20).map((h) => {
-                        const prof = h.caregiverId ? caregiversById[h.caregiverId] : undefined;
-                        const cert = norm(prof?.certification);
-                        const certOk = cert && cert.toLowerCase() !== "none";
-
-                        return (
-                          <div
-                            key={(h.caregiverId || h.caregiverName) + "::" + h.lastDate}
-                            style={{
-                              border: `1px solid ${UI.borderSoft}`,
-                              borderRadius: 12,
-                              padding: "8px 10px",
-                              background: "rgba(255,255,255,0.85)",
-                              display: "flex",
-                              justifyContent: "space-between",
-                              gap: 10,
-                              alignItems: "baseline",
-                            }}
-                          >
-                            <div style={{ minWidth: 0 }}>
-                              <div
-                                style={{
-                                  fontWeight: 950,
-                                  fontSize: 13,
-                                  overflow: "hidden",
-                                  textOverflow: "ellipsis",
-                                  whiteSpace: "nowrap",
-                                }}
-                              >
-                                {h.caregiverName}
-                                {certOk ? (
-                                  <span
-                                    style={{
-                                      marginLeft: 8,
-                                      fontSize: 11,
-                                      fontWeight: 900,
-                                      padding: "2px 8px",
-                                      borderRadius: 999,
-                                      border: `1px solid ${UI.borderSoft}`,
-                                      background: "#f8fafc",
-                                      color: UI.textDim,
-                                      whiteSpace: "nowrap",
-                                    }}
-                                    title="Certification"
-                                  >
-                                    {cert}
-                                  </span>
-                                ) : null}
-                              </div>
-
-                              <div style={{ marginTop: 2, fontSize: 11.5, color: UI.textDim }}>
-                                Last visit: <strong>{h.lastDate || "—"}</strong>
-                                {h.caregiverId ? <span style={{ marginLeft: 8 }}>ID: {h.caregiverId}</span> : null}
-                              </div>
-                            </div>
-
-                            <div style={{ fontSize: 12, fontWeight: 950, whiteSpace: "nowrap" }}>
-                              {h.visitCount} visit{h.visitCount === 1 ? "" : "s"}
-                            </div>
-                          </div>
-                        );
-                      })}
-
-                      {clientCaregiverHistory.length > 20 ? (
-                        <div style={{ fontSize: 12, color: UI.textDim }}>
-                          Showing top 20 (of {clientCaregiverHistory.length}) by visits/recentness.
-                        </div>
-                      ) : null}
-                    </div>
-                  )}
-                </div>
+                )}
               </div>
             </div>
-          );
-        })()}
-      </Modal>
+          </div>
+        );
+      })()}
+    </Modal>
 
-      {/* ✅ LAYOUT FIX: responsive grid + no squeezing + table scroll */}
-      {!loading && !error && data?.ok && (
-        <>
+    <Modal
+  open={Boolean(editHistoryModalTarget)}
+  title={
+    editHistoryModalTarget
+      ? `Edit History + Rate • ${editHistoryModalTarget.clientName} • ${editHistoryModalTarget.dayLabel}`
+      : "Edit History + Rate"
+  }
+  onClose={() => {
+    setEditHistoryModalTarget(null);
+    setShiftRateError(null);
+    setShiftRateReason("");
+  }}
+>
+  {editHistoryModalTarget ? (
+    <div style={{ display: "grid", gap: 10 }}>
+      <div
+        style={{
+          border: `1px solid ${UI.borderSoft}`,
+          borderRadius: 12,
+          padding: 12,
+          background: "rgba(255,255,255,0.88)",
+        }}
+      >
         <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))",
+            gap: 12,
+            alignItems: "start",
+          }}
+        >
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 950, color: UI.textDim }}>Cell</div>
+            <div style={{ marginTop: 3, fontSize: 14, fontWeight: 950 }}>
+              {editHistoryModalTarget.a1}
+            </div>
+          </div>
+
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 950, color: UI.textDim }}>Client</div>
+            <div style={{ marginTop: 3, fontSize: 14, fontWeight: 900 }}>
+              {editHistoryModalTarget.clientName}
+            </div>
+          </div>
+
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 950, color: UI.textDim }}>Date</div>
+            <div style={{ marginTop: 3, fontSize: 14, fontWeight: 900 }}>
+              {editHistoryModalTarget.dateStr}
+            </div>
+          </div>
+
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 950, color: UI.textDim }}>Time</div>
+            <div style={{ marginTop: 3, fontSize: 14, fontWeight: 900 }}>
+              {formatTimeRangeForDisplay(
+                editHistoryModalTarget.startTime,
+                editHistoryModalTarget.endTime
+              )}
+            </div>
+          </div>
+
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 950, color: UI.textDim }}>Caregiver</div>
+            <div style={{ marginTop: 3, fontSize: 14, fontWeight: 900 }}>
+              {editHistoryModalTarget.caregiverName || "Open"}
+            </div>
+          </div>
+
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 950, color: UI.textDim }}>Week</div>
+            <div style={{ marginTop: 3, fontSize: 14, fontWeight: 900 }}>
+              {editHistoryModalTarget.week.toUpperCase()}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div
+        style={{
+          border: `1px solid ${UI.borderSoft}`,
+          borderRadius: 12,
+          padding: 12,
+          background: "#fffdf7",
+          display: "grid",
+          gap: 10,
+        }}
+      >
+        <div style={{ fontSize: 13, fontWeight: 950, color: UI.text }}>
+          Shift Rate
+        </div>
+
+        {shiftRateLoading ? (
+          <div style={{ color: UI.textDim, fontSize: 13, fontWeight: 800 }}>
+            Loading shift rate…
+          </div>
+        ) : (
+          <>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "minmax(160px, 220px) 1fr",
+                gap: 10,
+                alignItems: "end",
+              }}
+            >
+              <label style={{ display: "grid", gap: 6 }}>
+                <span style={{ fontSize: 11, fontWeight: 950, color: UI.textDim }}>
+                  Rate
+                </span>
+                <input
+                  value={shiftRateValue}
+                  onChange={(e) => setShiftRateValue(e.target.value)}
+                  placeholder="18"
+                  inputMode="decimal"
+                  style={{
+                    border: `1px solid ${UI.border}`,
+                    borderRadius: 10,
+                    padding: "9px 10px",
+                    fontSize: 14,
+                    fontWeight: 800,
+                    outline: "none",
+                  }}
+                />
+              </label>
+
+              <label style={{ display: "grid", gap: 6 }}>
+                <span style={{ fontSize: 11, fontWeight: 950, color: UI.textDim }}>
+                  Reason (optional)
+                </span>
+                <input
+                  value={shiftRateReason}
+                  onChange={(e) => setShiftRateReason(e.target.value)}
+                  placeholder="Manual override"
+                  style={{
+                    border: `1px solid ${UI.border}`,
+                    borderRadius: 10,
+                    padding: "9px 10px",
+                    fontSize: 14,
+                    fontWeight: 700,
+                    outline: "none",
+                  }}
+                />
+              </label>
+            </div>
+
+            <div
+              style={{
+                display: "flex",
+                flexWrap: "wrap",
+                gap: 12,
+                alignItems: "center",
+                justifyContent: "space-between",
+              }}
+            >
+              <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 700 }}>
+  {shiftRateOriginalValue
+    ? (
+        shiftRateUpdatedAt || shiftRateUpdatedBy
+          ? `Last updated${shiftRateUpdatedBy ? ` by ${shiftRateUpdatedBy}` : ""}${
+              shiftRateUpdatedAt ? ` • ${formatIsoTimestampForDisplay(shiftRateUpdatedAt)}` : ""
+            }`
+          : "Saved shift rate found."
+      )
+    : "No saved shift rate found yet."}
+</div>
+
+              <button
+                type="button"
+                onClick={handleSaveShiftRate}
+                disabled={shiftRateSaving || shiftRateLoading}
+                style={{
+                  border: `1px solid ${UI.border}`,
+                  background: "#111827",
+                  color: "#fff",
+                  borderRadius: 10,
+                  padding: "8px 12px",
+                  cursor: shiftRateSaving || shiftRateLoading ? "default" : "pointer",
+                  fontWeight: 900,
+                  fontSize: 13,
+                  opacity: shiftRateSaving || shiftRateLoading ? 0.7 : 1,
+                }}
+              >
+                {shiftRateSaving ? "Saving..." : "Save Rate"}
+              </button>
+            </div>
+
+            {shiftRateError ? (
+              <div
+                style={{
+                  border: `1px dashed #fca5a5`,
+                  borderRadius: 10,
+                  padding: 10,
+                  color: "#991b1b",
+                  background: "#fef2f2",
+                  fontSize: 12.5,
+                  fontWeight: 800,
+                }}
+              >
+                {shiftRateError}
+              </div>
+            ) : null}
+          </>
+        )}
+      </div>
+
+      {editHistoryLoading ? (
+        <div
+          style={{
+            border: `1px dashed ${UI.border}`,
+            borderRadius: 12,
+            padding: 12,
+            color: UI.textDim,
+            fontSize: 13,
+            fontWeight: 800,
+            background: "rgba(248,250,252,0.9)",
+          }}
+        >
+          Loading edit history…
+        </div>
+      ) : editHistoryError ? (
+        <div
+          style={{
+            border: `1px dashed #fca5a5`,
+            borderRadius: 12,
+            padding: 12,
+            color: "#991b1b",
+            fontSize: 13,
+            fontWeight: 800,
+            background: "#fef2f2",
+          }}
+        >
+          {editHistoryError}
+        </div>
+      ) : selectedCellHistoryRows.length === 0 ? (
+        <div
+          style={{
+            border: `1px dashed ${UI.border}`,
+            borderRadius: 12,
+            padding: 12,
+            color: UI.textDim,
+            fontSize: 13,
+            fontWeight: 800,
+            background: "rgba(248,250,252,0.9)",
+          }}
+        >
+          No edit history found for this cell.
+        </div>
+      ) : (
+        <div
+          style={{
+            display: "grid",
+            gap: 10,
+            maxHeight: "44vh",
+            overflowY: "auto",
+            paddingRight: 4,
+          }}
+        >
+          {selectedCellHistoryRows.map((row, idx) => (
+            <div
+              key={`${row.timestamp}-${idx}`}
+              style={{
+                border: `1px solid ${UI.borderSoft}`,
+                borderRadius: 12,
+                padding: 12,
+                background: idx % 2 === 0 ? "#fff" : "#fafafa",
+              }}
+            >
+              <div style={{ display: "grid", gap: 6 }}>
+                <div style={{ fontWeight: 900, fontSize: 13 }}>
+                  {row.actionType || "Edit"}
+                </div>
+                <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 700 }}>
+                  {row.user || "Unknown user"} • {formatIsoTimestampForDisplay(row.timestamp)}
+                </div>
+                <div style={{ fontSize: 12.5 }}>
+                  <strong>Old:</strong> {row.oldValue || "—"}
+                </div>
+                <div style={{ fontSize: 12.5 }}>
+                  <strong>New:</strong> {row.newValue || "—"}
+                </div>
+                {row.notes ? (
+                  <div style={{ fontSize: 12.5 }}>
+                    <strong>Notes:</strong> {row.notes}
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  ) : null}
+</Modal>
+
+    <OnboardingPanel open={onboardingOpen} onClose={() => setOnboardingOpen(false)} />
+
+    {!loading && !error && data?.ok && (
+      <>
+       <div
   className="scheduleLayout"
   style={{
     marginTop: 14,
-    display: "grid",
-    gridTemplateColumns: panelOpen ? "1fr 460px" : "1fr",
-    gap: 12,
-    alignItems: "start",
+    display: "block",
   }}
 >
-  <div className="scheduleMain" style={{ minWidth: 0 }}>
-  <div
-    style={{
-      border: `1px solid ${UI.border}`,
-      borderRadius: 12,
-      background: UI.panelBg,
+          <div className="scheduleMain" style={{ minWidth: 0 }}>
+            <div
+              style={{
+                border: `1px solid ${UI.border}`,
+                borderRadius: 12,
+                background: UI.panelBg,
+                overflow: "hidden",
+                position: "relative",
+              }}
+            >
+              <div
+                style={{
+                  overflowX: "auto",
+                  overflowY: "visible",
+                  WebkitOverflowScrolling: "touch",
+                  position: "relative",
+                  background: UI.panelBg,
+                }}
+              >
+                <table
+                  style={{
+                    width: "100%",
+                    minWidth: selectedDow == null ? 1200 : 680,
+                    borderCollapse: "separate",
+                    borderSpacing: 0,
+                    tableLayout: "fixed",
+                  }}
+                >
+                  <thead>
+                    <tr>
+                      <th
+                        style={{
+                          position: "sticky",
+                          top: STICKY_DAY_ROW_TOP,
+                          left: 0,
+                          zIndex: STICKY_DAY_Z + 5,
+                          background: UI.headerBg,
+                          backgroundClip: "padding-box",
+                          boxShadow: `0 1px 0 ${UI.border}`,
+                          textAlign: "left",
+                          padding: "10px 12px",
+                          borderBottom: `1px solid ${UI.border}`,
+                          width: CLIENT_COL_WIDTH,
+                          maxWidth: CLIENT_COL_WIDTH,
+                          fontSize: 13,
+                          borderRight: `1px solid ${UI.borderSoft}`,
+                          height: STICKY_DAY_ROW_HEIGHT,
+                        }}
+                      >
+                        {dayHeaders?.[0] || "Client Name"}
+                      </th>
 
-      // ✅ IMPORTANT: do NOT set overflow hidden/auto/scroll on an ancestor of sticky
-      // Let the table wrapper handle horizontal scrolling.
-      overflow: "visible",
-    }}
-  >
-    {/* table scroll wrapper (this is the ONLY place we want overflowX) */}
-    <div
-      style={{
-        overflowX: "auto",
-        overflowY: "visible",
-        WebkitOverflowScrolling: "touch",
-      }}
-    >
-      <table
-        style={{
-          width: "100%",
-          minWidth: selectedDow == null ? 1200 : 680,
-          borderCollapse: "separate",
-          borderSpacing: 0,
-          tableLayout: "fixed",
-        }}
-      >
-          <thead>
-            <tr>
-              <th
-  style={{
-    position: "sticky",
-    top: STICKY_DAY_ROW_TOP,
-    left: 0,
-    zIndex: STICKY_DAY_Z + 5, // ✅ above other day headers
-    background: UI.headerBg,
-    textAlign: "left",
-    padding: "10px 12px",
-    borderBottom: `1px solid ${UI.border}`,
-    width: CLIENT_COL_WIDTH,
-    maxWidth: CLIENT_COL_WIDTH,
-    fontSize: 13,
-    borderRight: `1px solid ${UI.borderSoft}`,
-    height: STICKY_DAY_ROW_HEIGHT,
-  }}
->
-                {dayHeaders?.[0] || "Client Name"}
-              </th>
+                      {visibleDows.map((dow) => (
+                        <th
+                          key={`day_${dow}`}
+                          style={{
+                            position: "sticky",
+                            top: STICKY_DAY_ROW_TOP,
+                            zIndex: STICKY_DAY_Z,
+                            background: UI.headerBg,
+                            backgroundClip: "padding-box",
+                            boxShadow: `0 1px 0 ${UI.border}`,
+                            textAlign: "left",
+                            padding: "10px 10px",
+                            borderBottom: `1px solid ${UI.border}`,
+                            fontSize: 13,
+                            borderRight:
+                              dow === visibleDows[visibleDows.length - 1]
+                                ? "none"
+                                : `1px solid ${UI.borderSoft}`,
+                            height: STICKY_DAY_ROW_HEIGHT,
+                          }}
+                        >
+                          <div style={{ fontWeight: 700 }}>
+                            {dayHeaders?.[dow + 1] || DOW_LABELS[dow]}
+                          </div>
+                        </th>
+                      ))}
+                    </tr>
 
-              {visibleDows.map((dow) => (
-                <th
-  key={`day_${dow}`}
-  style={{
-    position: "sticky",
-    top: STICKY_DAY_ROW_TOP,
-    zIndex: STICKY_DAY_Z,
-    background: UI.headerBg,
-    textAlign: "left",
-    padding: "10px 10px",
-    borderBottom: `1px solid ${UI.border}`,
-    fontSize: 13,
-    borderRight:
-      dow === visibleDows[visibleDows.length - 1]
-        ? "none"
-        : `1px solid ${UI.borderSoft}`,
-    height: STICKY_DAY_ROW_HEIGHT,
-  }}
->
-                  <div style={{ fontWeight: 700 }}>
-                    {dayHeaders?.[dow + 1] || DOW_LABELS[dow]}
-                  </div>
-                </th>
-              ))}
-            </tr>
+                    <tr>
+                      <th
+                        style={{
+                          position: "sticky",
+                          top: STICKY_DATE_ROW_TOP,
+                          left: 0,
+                          zIndex: STICKY_DATE_Z + 5,
+                          background: UI.headerBg,
+                          backgroundClip: "padding-box",
+                          boxShadow: `0 1px 0 ${UI.border}`,
+                          textAlign: "left",
+                          padding: "8px 12px",
+                          borderBottom: `1px solid ${UI.border}`,
+                          width: CLIENT_COL_WIDTH,
+                          maxWidth: CLIENT_COL_WIDTH,
+                          fontSize: 12,
+                          color: UI.textDim,
+                          borderRight: `1px solid ${UI.borderSoft}`,
+                          height: STICKY_DATE_ROW_HEIGHT,
+                        }}
+                      >
+                        {dateHeaders?.[0] || "Date"}
+                      </th>
 
-            <tr>
-              <th
-  style={{
-    position: "sticky",
-    top: STICKY_DATE_ROW_TOP,
-    left: 0,
-    zIndex: STICKY_DATE_Z + 5, // ✅ above other date headers
-    background: UI.headerBg,
-    textAlign: "left",
-    padding: "8px 12px",
-    borderBottom: `1px solid ${UI.border}`,
-    width: CLIENT_COL_WIDTH,
-    maxWidth: CLIENT_COL_WIDTH,
-    fontSize: 12,
-    color: UI.textDim,
-    borderRight: `1px solid ${UI.borderSoft}`,
-    height: 40,
-  }}
->
-                {dateHeaders?.[0] || "Date"}
-              </th>
+                      {visibleDows.map((dow) => (
+                        <th
+                          key={`date_${dow}`}
+                          style={{
+                            position: "sticky",
+                            top: STICKY_DATE_ROW_TOP,
+                            zIndex: STICKY_DATE_Z,
+                            background: UI.headerBg,
+                            backgroundClip: "padding-box",
+                            boxShadow: `0 1px 0 ${UI.border}`,
+                            textAlign: "left",
+                            padding: "8px 10px",
+                            borderBottom: `1px solid ${UI.border}`,
+                            fontSize: 12,
+                            color: UI.textDim,
+                            borderRight:
+                              dow === visibleDows[visibleDows.length - 1]
+                                ? "none"
+                                : `1px solid ${UI.borderSoft}`,
+                            height: STICKY_DATE_ROW_HEIGHT,
+                          }}
+                        >
+                          {dateHeaders?.[dow + 1] || ""}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
 
-              {visibleDows.map((dow) => (
-               <th
-  key={`date_${dow}`}
-  style={{
-    position: "sticky",
-    top: STICKY_DATE_ROW_TOP,
-    zIndex: STICKY_DATE_Z,
-    background: UI.headerBg,
-    textAlign: "left",
-    padding: "8px 10px",
-    borderBottom: `1px solid ${UI.border}`,
-    fontSize: 12,
-    color: UI.textDim,
-    borderRight:
-      dow === visibleDows[visibleDows.length - 1]
-        ? "none"
-        : `1px solid ${UI.borderSoft}`,
-    height: 40,
-  }}
->
-                  {dateHeaders?.[dow + 1] || ""}
-                </th>
-              ))}
-            </tr>
-          </thead>
+                  <tbody>
+                    {rows.length === 0 ? (
+                      <tr>
+                        <td colSpan={1 + visibleDows.length} style={{ padding: 12, opacity: 0.85 }}>
+                          No rows match the current filters.
+                        </td>
+                      </tr>
+                    ) : (
+                      (() => {
+                        let lastClient = "";
+                        let groupIndex = -1;
+                        const seenClientForHours = new Set<string>();
 
-                    <tbody>
-                      {rows.length === 0 ? (
-                        <tr>
-                          <td colSpan={1 + visibleDows.length} style={{ padding: 12, opacity: 0.85 }}>
-                            No rows match the current filters.
-                          </td>
-                        </tr>
-                      ) : (
-                        (() => {
-                          let lastClient = "";
-                          let groupIndex = -1;
-                          const seenClientForHours = new Set<string>();
+                        return rows.map((r) => {
+                          const name = norm(r.clientName);
 
-                          return rows.map((r) => {
-                            const name = norm(r.clientName);
+                          if (name !== lastClient) {
+                            groupIndex += 1;
+                            lastClient = name;
+                          }
 
-                            if (name !== lastClient) {
-                              groupIndex += 1;
-                              lastClient = name;
-                            }
+                          const groupBg = groupIndex % 2 === 0 ? UI.rowA : UI.rowB;
+                          const rowIsEmpty = visibleDows.every((dow) => !norm(r.cells?.[dow]?.value));
 
-                            const groupBg = groupIndex % 2 === 0 ? UI.rowA : UI.rowB;
-                            const rowIsEmpty = visibleDows.every((dow) => !norm(r.cells?.[dow]?.value));
+                          const status = name ? clientWorstStatus.get(name) ?? "none" : "none";
+                          const clientColor = SHEET_COLORS[status] || UI.text;
 
-                            const status = name ? clientWorstStatus.get(name) ?? "none" : "none";
-                            const clientColor = SHEET_COLORS[status] || UI.text;
+                          const clientHours = name ? hoursByClient.get(name) ?? 0 : 0;
+                          const showClientHours = Boolean(name) && !seenClientForHours.has(name);
+                          if (name) seenClientForHours.add(name);
 
-                            const clientHours = name ? hoursByClient.get(name) ?? 0 : 0;
-                            const showClientHours = Boolean(name) && !seenClientForHours.has(name);
-                            if (name) seenClientForHours.add(name);
+                          const clientKey = normalizeKey(name);
+                          const clientProfile = clientKey ? clientsByName[clientKey] : undefined;
+                          const clientDescription = norm(clientProfile?.description);
 
-                            const clientKey = normalizeKey(name);
-                            const clientProfile = clientKey ? clientsByName[clientKey] : undefined;
-                            const clientDescription = norm(clientProfile?.description);
-
-                            return (
-                              <tr key={r.row}>
-                                <td
+                          return (
+                            <tr key={r.row}>
+                              <td
+                                style={{
+                                  position: "sticky",
+                                  left: 0,
+                                  zIndex: 2,
+                                  background: groupBg,
+                                  padding: rowIsEmpty ? "6px 12px" : "10px 12px",
+                                  borderBottom: `1px solid ${UI.borderSoft}`,
+                                  fontWeight: 800,
+                                  fontSize: 13,
+                                  color: clientColor,
+                                  borderRight: `1px solid ${UI.borderSoft}`,
+                                  whiteSpace: "nowrap",
+                                  maxWidth: CLIENT_COL_WIDTH,
+                                }}
+                                title={
+                                  status === "none"
+                                    ? undefined
+                                    : `Status: ${status} • Double click for profile`
+                                }
+                              >
+                                                                <div
                                   style={{
-                                    position: "sticky",
-                                    left: 0,
-                                    zIndex: 2,
-                                    background: groupBg,
-                                    padding: rowIsEmpty ? "6px 12px" : "10px 12px",
-                                    borderBottom: `1px solid ${UI.borderSoft}`,
-                                    fontWeight: 800,
-                                    fontSize: 13,
-                                    color: clientColor,
-                                    borderRight: `1px solid ${UI.borderSoft}`,
-                                    whiteSpace: "nowrap",
-                                    maxWidth: CLIENT_COL_WIDTH,
+                                    display: "flex",
+                                    justifyContent: "space-between",
+                                    gap: 10,
+                                    alignItems: "baseline",
+                                    minWidth: 0,
                                   }}
-                                  title={status === "none" ? undefined : `Status: ${status} • Double click for profile`}
                                 >
                                   <div
                                     style={{
                                       display: "flex",
-                                      justifyContent: "space-between",
-                                      gap: 10,
+                                      gap: 8,
                                       alignItems: "baseline",
                                       minWidth: 0,
+                                      flex: "1 1 auto",
                                     }}
                                   >
-                                    <div style={{ display: "flex", gap: 8, alignItems: "baseline", minWidth: 0, flex: "1 1 auto" }}>
-                                      {/* ✅ was a <button>; now a safe role-button */}
-                                      <div
-                                        role="button"
-                                        tabIndex={0}
-                                        onDoubleClick={() => openClientProfile(r.clientName || "")}
-                                        onKeyDown={(e) => {
-                                          if (e.key === "Enter" || e.key === " ") {
-                                            e.preventDefault();
-                                            openClientProfile(r.clientName || "");
-                                          }
-                                        }}
-                                        style={{
-                                          border: "none",
-                                          background: "transparent",
-                                          padding: 0,
-                                          margin: 0,
-                                          cursor: "pointer",
-                                          textAlign: "left",
-                                          color: "inherit",
-                                          font: "inherit",
-                                          fontWeight: 900,
-                                          overflow: "hidden",
-                                          textOverflow: "ellipsis",
-                                          whiteSpace: "nowrap",
-                                          minWidth: 0,
-                                          flex: "1 1 auto",
-                                          outline: "none",
-                                        }}
-                                        title="Double click (or Enter/Space) to open client profile"
-                                      >
-                                        {r.clientName || ""}
-                                      </div>
-
-                                      {(() => {
-  const ck = clientKey;
-  const b = ck ? badgeByClientKey[ck] : null;
-
-  const reqCount = b?.reqCount || 0;
-  if (reqCount <= 0) return null;
-
-  const uncoveredDays = b?.uncoveredDays || 0;
-  const isCovered = uncoveredDays === 0;
-
-  const title = isCovered
-    ? `All service-request day(s) already have schedule shifts. (${reqCount} request${reqCount === 1 ? "" : "s"})`
-    : `${uncoveredDays} service-request day(s) have NO schedule shifts. (${reqCount} request${reqCount === 1 ? "" : "s"})`;
-
-  return (
-    <button
-      type="button"
-      onClick={() => openServiceRequestsForClient(r.clientName || "")}
-      title={title}
-      aria-label={title}
-      style={{
-        border: "none",
-        background: "transparent",
-        padding: 0,
-        margin: 0,
-        cursor: "pointer",
-        lineHeight: 1,
-        display: "inline-flex",
-        alignItems: "center",
-        flex: "0 0 auto",
-      }}
-    >
-      <span
-        style={{
-          minWidth: 18,
-          height: 18,
-          padding: "0 6px",
-          borderRadius: 999,
-          background: isCovered ? "#22c55e" : "#ef4444", // ✅ green ✓ vs red
-          color: "#fff",
-          fontSize: 11,
-          fontWeight: 1000,
-          lineHeight: "18px",
-          textAlign: "center",
-          border: "2px solid #fff",
-          boxShadow: "0 2px 6px rgba(0,0,0,0.18)",
-        }}
-      >
-        {isCovered ? "✓" : String(uncoveredDays)}
-      </span>
-    </button>
-  );
-})()}
+                                    <div
+                                      role="button"
+                                      tabIndex={0}
+                                      onDoubleClick={() => openClientProfile(r.clientName || "")}
+                                      onKeyDown={(e) => {
+                                        if (e.key === "Enter" || e.key === " ") {
+                                          e.preventDefault();
+                                          openClientProfile(r.clientName || "");
+                                        }
+                                      }}
+                                      style={{
+                                        border: "none",
+                                        background: "transparent",
+                                        padding: 0,
+                                        margin: 0,
+                                        cursor: "pointer",
+                                        textAlign: "left",
+                                        color: "inherit",
+                                        font: "inherit",
+                                        fontWeight: 900,
+                                        overflow: "hidden",
+                                        textOverflow: "ellipsis",
+                                        whiteSpace: "nowrap",
+                                        minWidth: 0,
+                                        flex: "1 1 auto",
+                                        outline: "none",
+                                      }}
+                                      title="Double click (or Enter/Space) to open client profile"
+                                    >
+                                      {r.clientName || ""}
                                     </div>
 
-                                    {showClientHours ? (
-                                      <span
-                                        style={{
-                                          fontSize: 12,
-                                          fontWeight: 900,
-                                          color: UI.textDim,
-                                          whiteSpace: "nowrap",
-                                          flex: "0 0 auto",
-                                        }}
-                                      >
-                                        {clientHours.toFixed(1)}h
-                                      </span>
-                                    ) : null}
+                                  <button
+  type="button"
+  onClick={() =>
+    openInsertRowModal({
+      anchorRow: r.row,
+      anchorClientName: r.clientName || "",
+    })
+  }
+  title={`Add row near ${r.clientName || "this row"}`}
+  aria-label={`Add row near ${r.clientName || "this row"}`}
+  style={{
+    width: 22,
+    height: 22,
+    border: `1px solid ${UI.border}`,
+    background: "#fff8e1",
+    color: UI.text,
+    borderRadius: 999,
+    padding: 0,
+    fontSize: 14,
+    fontWeight: 1000,
+    cursor: "pointer",
+    lineHeight: "20px",
+    textAlign: "center",
+    flex: "0 0 auto",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+  }}
+>
+  +
+</button>
+
+                                    {(() => {
+                                      const ck = clientKey;
+                                      const b = ck ? badgeByClientKey[ck] : null;
+
+                                      const reqCount = b?.reqCount || 0;
+                                      if (reqCount <= 0) return null;
+
+                                      const uncoveredDays = b?.uncoveredDays || 0;
+                                      const isCovered = uncoveredDays === 0;
+
+                                      const title = isCovered
+                                        ? `All service-request day(s) already have schedule shifts. (${reqCount} request${reqCount === 1 ? "" : "s"})`
+                                        : `${uncoveredDays} service-request day(s) have NO schedule shifts. (${reqCount} request${reqCount === 1 ? "" : "s"})`;
+
+                                      return (
+                                        <button
+                                          type="button"
+                                          onClick={() => openServiceRequestsForClient(r.clientName || "")}
+                                          title={title}
+                                          aria-label={title}
+                                          style={{
+                                            border: "none",
+                                            background: "transparent",
+                                            padding: 0,
+                                            margin: 0,
+                                            cursor: "pointer",
+                                            lineHeight: 1,
+                                            display: "inline-flex",
+                                            alignItems: "center",
+                                            flex: "0 0 auto",
+                                          }}
+                                        >
+                                          <span
+                                            style={{
+                                              minWidth: 18,
+                                              height: 18,
+                                              padding: "0 6px",
+                                              borderRadius: 999,
+                                              background: isCovered ? "#22c55e" : "#ef4444",
+                                              color: "#fff",
+                                              fontSize: 11,
+                                              fontWeight: 1000,
+                                              lineHeight: "18px",
+                                              textAlign: "center",
+                                              border: "2px solid #fff",
+                                              boxShadow: "0 2px 6px rgba(0,0,0,0.18)",
+                                            }}
+                                          >
+                                            {isCovered ? "✓" : String(uncoveredDays)}
+                                          </span>
+                                        </button>
+                                      );
+                                    })()}
                                   </div>
-                                </td>
 
-                                {visibleDows.map((dow, idx) => {
-                                  const c = r.cells[dow];
-                                  const a1 = c?.a1 || "";
-                                  const value = norm(c?.value);
-
-                                  const isSaving = savingA1 === a1;
-                                  const cellStatus = statusFromCellValue(value);
-                                  const dateStrForDow = norm(dateHeaders?.[dow + 1]);
-                                  const dayLabel = dayHeaders?.[dow + 1] || DOW_LABELS[dow];
-
-                                  const isExpanded = Boolean(a1) && expandedA1.has(a1);
-
-                                  const ck = normalizeKey(name);
-                                  const dk = dateKey(dateStrForDow);
-                                  const ghostKey = `${ck}__${dk}`;
-                                  const ghostShiftsForCell = ghostByCell[ghostKey] ?? [];
-
-                                  return (
-                                    <td
-                                      key={a1 || `${r.row}_${dow}`}
+                                  {showClientHours ? (
+                                    <span
                                       style={{
-                                        verticalAlign: "top",
-                                        padding: rowIsEmpty ? 4 : 10,
-                                        borderBottom: `1px solid ${UI.borderSoft}`,
-                                        background: groupBg,
-                                        borderRight:
-                                          idx === visibleDows.length - 1 ? "none" : `1px solid ${UI.borderSoft}`,
-                                        cursor: "default",
-                                        whiteSpace: "pre-wrap",
+                                        fontSize: 12,
+                                        fontWeight: 900,
+                                        color: UI.textDim,
+                                        whiteSpace: "nowrap",
+                                        flex: "0 0 auto",
                                       }}
                                     >
+                                      {clientHours.toFixed(1)}h
+                                    </span>
+                                  ) : null}
+                                </div>
+                              </td>
+
+                              {visibleDows.map((dow, idx) => {
+                                const c = r.cells[dow];
+                                const a1 = c?.a1 || "";
+                                const originalValue = norm(c?.value);
+                                const value =
+                                  draftMode && a1
+                                    ? norm(
+                                        getDraftValue({
+                                          a1,
+                                          week,
+                                          originalValue,
+                                        })
+                                      )
+                                    : originalValue;
+
+                                const isDraftChanged =
+                                  draftMode && a1
+                                    ? isCellChanged({
+                                        a1,
+                                        week,
+                                      })
+                                    : false;
+
+                                const isSaving = a1 ? isCellSaving(a1) : false;
+                                const cellStatus = statusFromCellValue(value);
+                                const dateStrForDow = norm(dateHeaders?.[dow + 1]);
+                                const dayLabel = dayHeaders?.[dow + 1] || DOW_LABELS[dow];
+
+                                const isExpanded = Boolean(a1) && expandedA1.has(a1);
+                                const isEditing = Boolean(a1) && editingA1 === a1;
+
+                                const ck = normalizeKey(name);
+                                const dk = dateKey(dateStrForDow);
+                                const ghostKey = `${ck}__${dk}`;
+                                const ghostShiftsForCell = ghostByCell[ghostKey] ?? [];
+
+                                const isBulkSelected = a1 ? isBulkCellSelected(a1) : false;
+
+                                return (
+                                  <td
+                                    key={a1 || `${r.row}_${dow}`}
+                                    onClick={() => {
+                                      if (!bulkMode || !a1) return;
+
+                                      toggleBulkCellSelection({
+                                        a1,
+                                        week,
+                                        clientName: name,
+                                        dateStr: dateStrForDow,
+                                        dayLabel,
+                                        originalValue: value,
+                                      });
+                                    }}
+                                    onDoubleClick={() => {
+                                      if (bulkMode) return;
+                                      if (!a1 || isSaving) return;
+                                      startInlineEdit(a1, value);
+                                    }}
+                                    onDragEnter={(e) => {
+                                      if (!a1 || bulkMode) return;
+                                      e.preventDefault();
+                                      setDragOverA1(a1);
+                                    }}
+                                    onDragOver={(e) => {
+                                      if (!a1 || bulkMode) return;
+                                      e.preventDefault();
+                                      e.dataTransfer.dropEffect = "move";
+                                      if (dragOverA1 !== a1) setDragOverA1(a1);
+                                    }}
+                                    onDragLeave={(e) => {
+                                      if (!a1 || bulkMode) return;
+
+                                      const nextTarget = e.relatedTarget as Node | null;
+                                      if (nextTarget && e.currentTarget.contains(nextTarget)) return;
+
+                                      setDragOverA1((prev) => (prev === a1 ? null : prev));
+                                    }}
+                                    onDrop={async (e) => {
+                                      if (!a1 || bulkMode) return;
+                                      await handleCaregiverDropToShift({
+                                        dropEvent: e,
+                                        a1,
+                                        clientName: name,
+                                        dateStrForDow,
+                                        dayLabel,
+                                        originalCellValue: originalValue,
+                                      });
+                                    }}
+                                    style={{
+                                      verticalAlign: "top",
+                                      padding: rowIsEmpty ? 4 : 10,
+                                      borderBottom: `1px solid ${UI.borderSoft}`,
+                                      background:
+                                        dragOverA1 === a1
+                                          ? "#dbeafe"
+                                          : isBulkSelected
+                                          ? "#fef3c7"
+                                          : isDraftChanged
+                                          ? "#eff6ff"
+                                          : groupBg,
+                                      borderRight:
+                                        idx === visibleDows.length - 1
+                                          ? "none"
+                                          : `1px solid ${UI.borderSoft}`,
+                                      cursor: bulkMode ? "pointer" : "default",
+                                      whiteSpace: "pre-wrap",
+                                      boxShadow:
+                                        dragOverA1 === a1
+                                          ? "inset 0 0 0 3px #2563eb"
+                                          : isBulkSelected
+                                          ? "inset 0 0 0 3px #f59e0b"
+                                          : isDraftChanged
+                                          ? "inset 0 0 0 2px #3b82f6"
+                                          : undefined,
+                                      outline:
+                                        dragOverA1 === a1
+                                          ? "2px dashed #60a5fa"
+                                          : isBulkSelected
+                                          ? "2px solid #fbbf24"
+                                          : "1px dashed rgba(59,130,246,0.18)",
+                                      transition:
+                                        "background 120ms ease, box-shadow 120ms ease, outline 120ms ease",
+                                    }}
+                                  >
+                                    {isEditing && !bulkMode ? (
+                                      <div
+                                        style={{
+                                          display: "grid",
+                                          gap: 8,
+                                          padding: 6,
+                                          border: `1px solid ${UI.border}`,
+                                          borderRadius: 10,
+                                          background: "#fff",
+                                        }}
+                                      >
+                                        <div
+                                          style={{
+                                            display: "flex",
+                                            justifyContent: "space-between",
+                                            alignItems: "center",
+                                            gap: 8,
+                                            flexWrap: "wrap",
+                                          }}
+                                        >
+                                          <div
+                                            style={{
+                                              fontSize: 11,
+                                              fontWeight: 900,
+                                              color: UI.textDim,
+                                            }}
+                                          >
+                                            {name} • {dayLabel} • {a1}
+                                          </div>
+
+                                          {draftMode ? (
+                                            <span
+                                              style={{
+                                                fontSize: 10,
+                                                fontWeight: 1000,
+                                                color: "#1d4ed8",
+                                                background: "#dbeafe",
+                                                border: "1px solid #93c5fd",
+                                                borderRadius: 999,
+                                                padding: "2px 8px",
+                                              }}
+                                            >
+                                              Draft Edit
+                                            </span>
+                                          ) : null}
+                                        </div>
+
+                                        <textarea
+                                          value={draftByA1[a1] ?? ""}
+                                          onChange={(e) =>
+                                            setDraftByA1((prev) => ({
+                                              ...prev,
+                                              [a1]: e.target.value,
+                                            }))
+                                          }
+                                          rows={4}
+                                          autoFocus
+                                          disabled={isSaving}
+                                          onKeyDown={(e) => {
+                                            if (e.key === "Escape") {
+                                              e.preventDefault();
+                                              cancelInlineEdit(a1);
+                                            }
+
+                                            if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                                              e.preventDefault();
+                                              saveInlineEdit({
+                                                a1,
+                                                newVal: draftByA1[a1] ?? "",
+                                                clientName: name,
+                                                shiftDateForSave: dateStrForDow,
+                                                dayLabel,
+                                                weekOf: weekStartYmd,
+                                              });
+                                            }
+                                          }}
+                                          style={{
+                                            width: "100%",
+                                            boxSizing: "border-box",
+                                            border: `1px solid ${UI.border}`,
+                                            borderRadius: 10,
+                                            padding: "8px 10px",
+                                            fontSize: 13,
+                                            outline: "none",
+                                            background: "#fff",
+                                            color: UI.text,
+                                            resize: "vertical",
+                                            fontFamily: "inherit",
+                                            whiteSpace: "pre-wrap",
+                                          }}
+                                        />
+
+                                        <div
+                                          style={{
+                                            display: "flex",
+                                            gap: 8,
+                                            justifyContent: "flex-end",
+                                            flexWrap: "wrap",
+                                          }}
+                                        >
+                                          <button
+                                            type="button"
+                                            onClick={() => cancelInlineEdit(a1)}
+                                            disabled={isSaving}
+                                            style={{
+                                              border: `1px solid ${UI.border}`,
+                                              background: UI.panelBg,
+                                              color: UI.text,
+                                              borderRadius: 8,
+                                              padding: "6px 10px",
+                                              cursor: isSaving ? "default" : "pointer",
+                                              fontWeight: 900,
+                                              fontSize: 12,
+                                            }}
+                                          >
+                                            Cancel
+                                          </button>
+
+                                          <button
+                                            type="button"
+                                            onClick={() =>
+                                              saveInlineEdit({
+                                                a1,
+                                                newVal: draftByA1[a1] ?? "",
+                                                clientName: name,
+                                                shiftDateForSave: dateStrForDow,
+                                                dayLabel,
+                                                weekOf: weekStartYmd,
+                                              })
+                                            }
+                                            disabled={isSaving}
+                                            style={{
+                                              border: "1px solid #111827",
+                                              background: "#111827",
+                                              color: "#fff",
+                                              borderRadius: 8,
+                                              padding: "6px 10px",
+                                              cursor: isSaving ? "default" : "pointer",
+                                              fontWeight: 900,
+                                              fontSize: 12,
+                                            }}
+                                          >
+                                            {draftMode ? "Save to Draft" : isSaving ? "Saving..." : "Save"}
+                                          </button>
+                                        </div>
+
+                                        <div
+                                          style={{
+                                            fontSize: 11,
+                                            color: UI.textDim,
+                                            fontWeight: 800,
+                                            lineHeight: 1.35,
+                                          }}
+                                        >
+                                          Double click a shift to edit • Esc = cancel • Ctrl/Cmd + Enter ={" "}
+                                          {draftMode ? "save to draft" : "save"}
+                                        </div>
+                                      </div>
+                                    ) : (
                                       <ShiftCard
-                                        a1Key={a1 || `${r.row}_${dow}`}
-                                        value={value}
-                                        status={cellStatus}
-                                        disabled={isSaving}
-                                        onRequestEdit={() => {
-                                          if (!a1) return;
-                                          openEditModal(a1, value, name, dayLabel);
-                                        }}
-                                        expanded={isExpanded}
-                                        onToggleExpanded={() => {
-                                          if (!a1) return;
-                                          setExpandedA1((prev) => {
-                                            const next = new Set(prev);
-                                            if (next.has(a1)) next.delete(a1);
-                                            else next.add(a1);
-                                            return next;
-                                          });
-                                        }}
-                                        dateStrForDow={dateStrForDow}
-                                        clientName={name}
-                                        shiftInfo={shiftInfo}
-                                        rowIsEmpty={rowIsEmpty}
-                                        cellBg={groupBg}
-                                        sheetColors={SHEET_COLORS}
-                                        week={week}
-                                        messagesUI={messagesUI}
-                                        clientDescription={clientDescription}
-                                        requests={ghostShiftsForCell}
-                                      />
-                                    </td>
-                                  );
-                                })}
-                              </tr>
-                            );
-                          });
-                        })()
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </div>
-
-           <CaregiverWebSchedulePanel
-  open={panelOpen}
-  onClose={() => setPanelOpen(false)}
-  caregiversError={caregiversError}
-  availLoading={availLoading}
-  availError={availError}
-  caregiverPanelRows={caregiverPanelRows}
-  panelSearch={panelSearch ?? ""}
-  setPanelSearch={(v: any) => setPanelSearch(String(v ?? ""))}
-  panelSelectedDow={panelSelectedDow}
-  setPanelSelectedDow={setPanelSelectedDow}
-  applicants={applicants}
-  applicantsLoading={applicantsLoading}
-  applicantsError={applicantsError}
-  applicantSearch={applicantSearch ?? ""}
-  setApplicantSearch={(v: string) => setApplicantSearch(v)}
+  a1Key={a1 || `${r.row}_${dow}`}
+  value={value}
+  status={cellStatus}
+  disabled={isSaving}
+  onRequestEdit={() => {
+    if (bulkMode) return;
+    if (!a1 || isSaving) return;
+    startInlineEdit(a1, value);
+  }}
+  expanded={isExpanded}
+  onToggleExpanded={() => {
+    if (!a1) return;
+    setExpandedA1((prev) => {
+      const next = new Set(prev);
+      if (next.has(a1)) next.delete(a1);
+      else next.add(a1);
+      return next;
+    });
+  }}
+  dateStrForDow={dateStrForDow}
+  clientName={name}
+  shiftInfo={shiftInfo}
+  rowIsEmpty={rowIsEmpty}
+  cellBg={groupBg}
+  sheetColors={SHEET_COLORS}
+  week={week}
+  hasEditHistory={true}
+  onOpenEditHistory={handleOpenEditHistory}
+  messagesUI={messagesUI}
+  clientDescription={clientDescription}
+  requests={ghostShiftsForCell}
 />
+                                    )}
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          );
+                        });
+                      })()
+                    )}
+                  </tbody>
+                </table>
+              </div>
+                       </div>
           </div>
+        </div>
 
-          {/* Responsive behavior: stack panel below schedule on smaller screens */}
-          <style jsx>{`
-            .scheduleLayout {
-              gap: 12px;
-              align-items: start;
-            }
+        <CaregiverWebSchedulePanel
+          open={panelOpen}
+          onClose={() => setPanelOpen(false)}
+          width={panelWidth}
+          onResize={handlePanelResize}
+          caregiversError={caregiversError}
+          availLoading={availLoading}
+          availError={availError}
+          caregiverPanelRows={caregiverPanelRows}
+          panelSearch={panelSearch ?? ""}
+          setPanelSearch={(v: any) => setPanelSearch(String(v ?? ""))}
+          panelSelectedDow={panelSelectedDow}
+          setPanelSelectedDow={setPanelSelectedDow}
+          draftMode={draftMode}
+          applicants={applicants}
+          applicantsLoading={applicantsLoading}
+          applicantsError={applicantsError}
+          applicantSearch={applicantSearch ?? ""}
+          setApplicantSearch={(v: string) => setApplicantSearch(v)}
+        />
 
-            @media (max-width: 1200px) {
-              .scheduleLayout {
-                grid-template-columns: 1fr;
-              }
-              .caregiverAside {
-                position: static !important;
-                width: auto !important;
-                top: auto !important;
-              }
-            }
+        <style jsx>{`
+          .scheduleLayout {
+            width: 100%;
+            min-width: 0;
+          }
+        `}</style>
+      </>
+    )}
 
-            @media (max-width: 900px) {
-              .caregiverAside {
-                max-height: 60vh;
-                overflow: auto;
-              }
-            }
-          `}</style>
-        </>
-      )}
-
-      {/* ✅ FIXED: render default export directly (no .default wrapper) */}
-      <ServiceRequestsPanel
-        open={svcPanelOpen}
-        onClose={() => setSvcPanelOpen(false)}
-        clientName={svcClientName}
-        weekStartYmd={weekStartYmd}
-        weekKind={week}
-      />
-    </main>
-  );
+    <ServiceRequestsPanel
+      open={svcPanelOpen}
+      onClose={() => setSvcPanelOpen(false)}
+      clientName={svcClientName}
+      weekStartYmd={weekStartYmd}
+      weekKind={week}
+    />
+  </main>
+);
 }

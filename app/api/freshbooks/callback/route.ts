@@ -1,83 +1,148 @@
 // app/api/freshbooks/callback/route.ts
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
 
-type TokenResp = {
-  access_token: string;
-  refresh_token: string;
-  token_type: string;
-  expires_in: number;
-  scope: string;
-  created_at: number;
-};
-
-export async function GET(req: Request) {
-  const url = new URL(req.url);
-  const code = url.searchParams.get("code");
-  const error = url.searchParams.get("error");
-
-  if (error) {
-    return NextResponse.json({ ok: false, error }, { status: 400 });
+function mustEnv(name: string) {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Missing env var: ${name}`);
   }
-  if (!code) {
-    return NextResponse.json({ ok: false, error: "Missing ?code=" }, { status: 400 });
-  }
+  return value;
+}
 
-  const clientId = process.env.FRESHBOOKS_CLIENT_ID!;
-  const clientSecret = process.env.FRESHBOOKS_CLIENT_SECRET!;
-  const redirectUri = process.env.FRESHBOOKS_REDIRECT_URI!;
+export async function GET(req: NextRequest) {
+  try {
+    const url = new URL(req.url);
 
-  if (!clientId || !clientSecret || !redirectUri) {
-    return NextResponse.json(
-      { ok: false, error: "Missing FreshBooks env vars" },
-      { status: 500 }
+    const code = url.searchParams.get("code");
+    const state = url.searchParams.get("state");
+    const error = url.searchParams.get("error");
+    const errorDescription = url.searchParams.get("error_description");
+
+    if (error) {
+      return NextResponse.redirect(
+        new URL(
+          `/billing-payroll?freshbooks=error&reason=${encodeURIComponent(
+            errorDescription || error
+          )}`,
+          req.url
+        )
+      );
+    }
+
+    if (!code) {
+      return NextResponse.redirect(
+        new URL(
+          `/billing-payroll?freshbooks=error&reason=${encodeURIComponent(
+            "Missing authorization code"
+          )}`,
+          req.url
+        )
+      );
+    }
+
+    const cookieState = req.cookies.get("fb_oauth_state")?.value;
+
+    if (!state || !cookieState || state !== cookieState) {
+      return NextResponse.redirect(
+        new URL(
+          `/billing-payroll?freshbooks=error&reason=${encodeURIComponent(
+            "Invalid OAuth state"
+          )}`,
+          req.url
+        )
+      );
+    }
+
+    const clientId = mustEnv("FRESHBOOKS_CLIENT_ID");
+    const clientSecret = mustEnv("FRESHBOOKS_CLIENT_SECRET");
+    const redirectUri = mustEnv("FRESHBOOKS_REDIRECT_URI");
+
+    const tokenRes = await fetch("https://api.freshbooks.com/auth/oauth/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      cache: "no-store",
+      body: JSON.stringify({
+        grant_type: "authorization_code",
+        client_id: clientId,
+        client_secret: clientSecret,
+        code,
+        redirect_uri: redirectUri,
+      }),
+    });
+
+    const tokenJson = await tokenRes.json().catch(() => null);
+
+    if (!tokenRes.ok) {
+      return NextResponse.redirect(
+        new URL(
+          `/billing-payroll?freshbooks=error&reason=${encodeURIComponent(
+            tokenJson?.error_description ||
+              tokenJson?.error ||
+              "Token exchange failed"
+          )}`,
+          req.url
+        )
+      );
+    }
+
+    const accessToken = tokenJson?.access_token;
+    const refreshToken = tokenJson?.refresh_token;
+    const expiresIn = Number(tokenJson?.expires_in || 0);
+
+    if (!accessToken || !refreshToken) {
+      return NextResponse.redirect(
+        new URL(
+          `/billing-payroll?freshbooks=error&reason=${encodeURIComponent(
+            "FreshBooks did not return tokens"
+          )}`,
+          req.url
+        )
+      );
+    }
+
+    const response = NextResponse.redirect(
+      new URL("/billing-payroll?freshbooks=connected", req.url)
+    );
+
+    response.cookies.set("fb_access_token", accessToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+      maxAge: expiresIn || 60 * 60 * 12,
+    });
+
+    response.cookies.set("fb_refresh_token", refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+      maxAge: 60 * 60 * 24 * 30,
+    });
+
+    response.cookies.set("fb_connected", "true", {
+      httpOnly: false,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+      maxAge: 60 * 60 * 24 * 30,
+    });
+
+    response.cookies.delete("fb_oauth_state");
+
+    return response;
+  } catch (error: any) {
+    return NextResponse.redirect(
+      new URL(
+        `/billing-payroll?freshbooks=error&reason=${encodeURIComponent(
+          error?.message || "Unexpected callback error"
+        )}`,
+        req.url
+      )
     );
   }
-
-  // Exchange auth code -> tokens
-  // FreshBooks token endpoint: https://api.freshbooks.com/auth/oauth/token :contentReference[oaicite:1]{index=1}
-  const form = new FormData();
-  form.set("grant_type", "authorization_code");
-  form.set("client_id", clientId);
-  form.set("client_secret", clientSecret);
-  form.set("code", code);
-  form.set("redirect_uri", redirectUri);
-
-  const tokenRes = await fetch("https://api.freshbooks.com/auth/oauth/token", {
-    method: "POST",
-    body: form,
-  });
-
-  const text = await tokenRes.text();
-  if (!tokenRes.ok) {
-    return NextResponse.json(
-      { ok: false, error: "Token exchange failed", details: text },
-      { status: 502 }
-    );
-  }
-
-  const tokenData = JSON.parse(text) as TokenResp;
-
-  // ✅ NEXT: store these securely (DB/secret manager). For dev, we can set httpOnly cookies.
-  // WARNING: Don't put tokens in client-side localStorage.
-
-  const resp = NextResponse.redirect(new URL("/billing-payroll?freshbooks=connected", url.origin));
-  resp.cookies.set("fb_access_token", tokenData.access_token, {
-    httpOnly: true,
-    secure: true,
-    sameSite: "lax",
-    path: "/",
-    maxAge: tokenData.expires_in, // seconds
-  });
-  resp.cookies.set("fb_refresh_token", tokenData.refresh_token, {
-    httpOnly: true,
-    secure: true,
-    sameSite: "lax",
-    path: "/",
-    // refresh token doesn't expire quickly; choose a long maxAge for dev
-    maxAge: 60 * 60 * 24 * 30,
-  });
-
-  return resp;
 }

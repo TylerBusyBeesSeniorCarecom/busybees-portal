@@ -69,6 +69,135 @@ type CaregiversApiResponse = {
   error?: string;
 };
 
+type ShiftRatesApiResponse = {
+  ok: boolean;
+  rows?: Record<string, any>[];
+  rates?: Record<string, any>[];
+  error?: string;
+};
+
+type PayrollMessage = {
+  messageId: string;
+  parentMessageId: string;
+  timestamp: string;
+  category: string;
+  status: string;
+  text: string;
+  notified: string;
+  readReceiptsRaw: string;
+  caregiverId: string;
+  caregiverName: string;
+  sender: {
+    id: string;
+    name: string;
+  };
+};
+
+type PayrollMessagesByCaregiverEntry = {
+  caregiverId: string;
+  caregiverName: string;
+  count: number;
+  messages: PayrollMessage[];
+};
+
+type PayrollMessagesApiResponse = {
+  ok: boolean;
+  count?: number;
+  messages?: PayrollMessage[];
+  grouped?: Record<string, PayrollMessagesByCaregiverEntry>;
+  error?: string;
+};
+
+type ShiftRateRule = {
+  ruleId: string;
+  active: string;
+  priority: string;
+  ruleName: string;
+  ruleType: string;
+  rateMode: string;
+  client: string;
+  caregiverId: string;
+  shiftType: string;
+  holidayRule: string;
+  startDate: string;
+  endDate: string;
+  payRate: string;
+  addAmount: string;
+  requiresApproval: string;
+};
+
+type ShiftRateMeta = {
+  finalRate: string;
+  baseRate: string;
+  addOnTotal: string;
+
+  updatedBy: string;
+  updatedAt: string;
+  updatedSource: string;
+
+  rateSource: string;
+  rateSourceDetail: string;
+
+  approvedBy: string;
+  approvedAt: string;
+  approvalStatus: string;
+  requiresApprovalFromRules: string;
+
+  appliedRuleIds: string[];
+  appliedRuleSummary: string;
+  appliedRules: ShiftRateRule[];
+
+  raw?: Record<string, any>;
+};
+
+type RateRuleFormState = {
+  ruleId: string;
+  ruleIdManuallyEdited: boolean;
+  active: boolean;
+  priority: string;
+  ruleName: string;
+  ruleType: "Base" | "Addon";
+  rateMode: "Set" | "Add";
+  client: string;
+  caregiverId: string;
+  shiftType: string;
+  holidayRule: string;
+  startDate: string;
+  endDate: string;
+  payRate: string;
+  addAmount: string;
+  requiresApproval: boolean;
+};
+
+type CreateRateRuleApiResponse = {
+  ok: boolean;
+  ruleId?: string;
+  rule?: Record<string, any>;
+  error?: string;
+};
+type CaregiverOption = {
+  caregiverId: string;
+  label: string;
+  sublabel: string;
+};
+
+type RateRuleFormChange = (
+  key: keyof RateRuleFormState,
+  value: RateRuleFormState[keyof RateRuleFormState]
+) => void;
+
+type AddRuleModalProps = {
+  open: boolean;
+  saving: boolean;
+  error: string | null;
+  success: string | null;
+  form: RateRuleFormState;
+  clientOptions: string[];
+  caregiverOptions: CaregiverOption[];
+  onClose: () => void;
+  onSubmit: () => void;
+  onChange: RateRuleFormChange;
+};
 const UI = {
   pageBg: "#f3f4f6",
   panelBg: "#ffffff",
@@ -78,7 +207,7 @@ const UI = {
   text: "#111827",
   textDim: "#6b7280",
 
-  green: "#1f7a3a",
+  green: "#166534",
   red: "#d64545",
   blue: "#2b6fd6",
   orange: "#d08a1a",
@@ -114,6 +243,157 @@ function parseNumber(raw: string): number | null {
   if (!m) return null;
   const v = Number(m[0]);
   return isFinite(v) ? v : null;
+}
+
+function toIsoDate(d: Date) {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function getDateRangeFromShifts(rows: ShiftRow[]) {
+  const dates = rows
+    .map((r) => toDateSafe(r.date))
+    .filter((d): d is Date => !!d)
+    .sort((a, b) => a.getTime() - b.getTime());
+
+  if (!dates.length) return null;
+
+  return {
+    dateFrom: toIsoDate(dates[0]),
+    dateTo: toIsoDate(dates[dates.length - 1]),
+  };
+}
+
+function buildPayRateMapFromApi(rows: any[] | undefined) {
+  const out: Record<string, string> = {};
+
+  for (const row of rows || []) {
+    const shiftId = norm(
+      row?.shiftId ??
+      row?.["Shift ID"] ??
+      row?.ShiftID ??
+      row?.shift_id
+    );
+    if (!shiftId) continue;
+
+    const raw =
+      row?.["Final Pay Rate"] ??
+      row?.["Base Rate"] ??
+      row?.newRate ??
+      row?.payRate ??
+      row?.rate;
+
+    const parsed = parseRate(String(raw ?? ""));
+    if (parsed != null) {
+      out[shiftId] = parsed.toFixed(2);
+    }
+  }
+
+  return out;
+}
+
+function buildShiftRateMetaMapFromApi(rows: any[] | undefined) {
+  const out: Record<string, ShiftRateMeta> = {};
+
+  for (const row of rows || []) {
+    const shiftId = norm(
+      row?.shiftId ??
+      row?.["Shift ID"] ??
+      row?.ShiftID ??
+      row?.shift_id
+    );
+    if (!shiftId) continue;
+
+    const finalRateParsed = parseRate(
+      String(
+        row?.["Final Pay Rate"] ??
+          row?.newRate ??
+          row?.payRate ??
+          row?.rate ??
+          ""
+      )
+    );
+    if (finalRateParsed == null) continue;
+
+    const baseRateParsed = parseRate(String(row?.["Base Rate"] ?? ""));
+    const addOnTotalParsed = parseRate(String(row?.["Add on Total"] ?? ""));
+
+    const approvedBy = norm(row?.["Approved By"]);
+    const approvedAt = norm(row?.["Approved Timestamp"]);
+    const explicitApprovalStatus = norm(
+      row?.["Approval Status"] ??
+        row?.["Approved"] ??
+        row?.["Is Approved"]
+    );
+
+    const rawAppliedRules = Array.isArray(row?.["Applied Rules"])
+      ? row["Applied Rules"]
+      : [];
+
+    const appliedRules: ShiftRateRule[] = rawAppliedRules.map((rule: any) => ({
+      ruleId: norm(rule?.["Rule ID"]),
+      active: norm(rule?.["Active"]),
+      priority: norm(rule?.["Priority"]),
+      ruleName: norm(rule?.["Rule Name"]),
+      ruleType: norm(rule?.["Rule Type"]),
+      rateMode: norm(rule?.["Rate Mode"]),
+      client: norm(rule?.["Client"]),
+      caregiverId: norm(rule?.["Caregiver ID"]),
+      shiftType: norm(rule?.["Shift Type"]),
+      holidayRule: norm(rule?.["Holiday Rule"]),
+      startDate: norm(rule?.["Start Date"]),
+      endDate: norm(rule?.["End Date"]),
+      payRate: norm(rule?.["Pay Rate"]),
+      addAmount: norm(rule?.["Add Amount"]),
+      requiresApproval: norm(rule?.["Requires Approval"]),
+    }));
+
+   const parsedRuleIds: string[] = Array.isArray(row?.["Applied Rule IDs Parsed"])
+  ? row["Applied Rule IDs Parsed"]
+      .map((v: unknown) => norm(v))
+      .filter((v: string) => Boolean(v))
+  : norm(row?.["Applied Rule IDs"])
+      .split(/[,|;]+/)
+      .map((v: string) => norm(v))
+      .filter((v: string) => Boolean(v));
+
+    out[shiftId] = {
+      finalRate: finalRateParsed.toFixed(2),
+      baseRate: baseRateParsed != null ? baseRateParsed.toFixed(2) : "",
+      addOnTotal: addOnTotalParsed != null ? addOnTotalParsed.toFixed(2) : "",
+
+      updatedBy: norm(row?.["Updated By"]),
+      updatedAt: norm(
+        row?.["TimeStamp"] ??
+          row?.["Timestamp"] ??
+          row?.["Last Updated"] ??
+          row?.["Updated At"]
+      ),
+      updatedSource: norm(row?.["Updated Source"]),
+
+      rateSource: norm(row?.["Rate Source"] ?? row?.["Source"]),
+      rateSourceDetail: norm(
+        row?.["Rate Source Detail"] ?? row?.["Reason"]
+      ),
+
+      approvedBy,
+      approvedAt,
+      approvalStatus:
+        explicitApprovalStatus ||
+        (approvedBy || approvedAt ? "Approved" : "Not approved"),
+      requiresApprovalFromRules: norm(row?.["Requires Approval From Rules"]),
+
+      appliedRuleIds: parsedRuleIds,
+      appliedRuleSummary: norm(row?.["Applied Rule Summary"]),
+      appliedRules,
+
+      raw: row,
+    };
+  }
+
+  return out;
 }
 
 /** ---------- normalize schedule values (accept schedule API "as-is") ---------- */
@@ -261,6 +541,21 @@ function hoursBetween(start: string, end: string): number {
   let e = e0;
   if (e <= s) e += 24 * 60;
   return (e - s) / 60;
+}
+
+function roundHours(n: number) {
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+function splitWeeklyOvertime(hoursSoFar: number, shiftHours: number) {
+  const regularRemaining = Math.max(0, 40 - hoursSoFar);
+  const regularHours = roundHours(Math.min(shiftHours, regularRemaining));
+  const overtimeHours = roundHours(Math.max(0, shiftHours - regularHours));
+
+  return {
+    regularHours,
+    overtimeHours,
+  };
 }
 
 /** ---------- Verdict helpers ---------- */
@@ -455,14 +750,14 @@ function Pill({
       style={{
         display: "inline-flex",
         alignItems: "center",
-        gap: 6,
-        padding: "3px 8px",
+        gap: 5,
+        padding: "2px 7px",
         borderRadius: 999,
         background: bg,
         color,
         fontWeight: 900,
-        fontSize: 11.5,
-        lineHeight: 1.1,
+        fontSize: 10.5,
+        lineHeight: 1.05,
         whiteSpace: "nowrap",
       }}
     >
@@ -471,19 +766,81 @@ function Pill({
   );
 }
 
+function summarizeReasons(reasons: string[]) {
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  const add = (label: string) => {
+    if (!seen.has(label)) {
+      seen.add(label);
+      out.push(label);
+    }
+  };
+
+  for (const reason of reasons) {
+    const r = norm(reason);
+
+    if (!r) continue;
+
+    if (r.includes("Missing Clock In")) {
+      add("Missing clock in");
+      continue;
+    }
+
+    if (r.includes("Missing Clock Out")) {
+      add("Missing clock out");
+      continue;
+    }
+
+    if (r.includes("Missing IN verdict") || r.startsWith("IN ")) {
+      add("IN issue");
+      continue;
+    }
+
+    if (r.includes("Missing OUT verdict") || r.startsWith("OUT ")) {
+      add("OUT issue");
+      continue;
+    }
+
+    if (r.includes("Clock In early")) {
+      add("Clock in early");
+      continue;
+    }
+
+    if (r.includes("Clock In late")) {
+      add("Clock in late");
+      continue;
+    }
+
+    if (r.includes("Clock Out early")) {
+      add("Clock out early");
+      continue;
+    }
+
+    if (r.includes("Clock Out late")) {
+      add("Clock out late");
+      continue;
+    }
+
+    add(r);
+  }
+
+  return out;
+}
+
 function ReasonList({ reasons }: { reasons: string[] }) {
   if (!reasons.length) return null;
   return (
-    <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", gap: 6 }}>
-      {reasons.slice(0, 6).map((r, idx) => (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+      {reasons.map((r) => (
         <span
-          key={`${r}_${idx}`}
+          key={r}
           style={{
             display: "inline-block",
             padding: "2px 7px",
             borderRadius: 999,
             background: "rgba(239,68,68,0.10)",
-            border: "1px solid rgba(239,68,68,0.28)",
+            border: "1px solid rgba(239,68,68,0.22)",
             color: "#991b1b",
             fontSize: 10.5,
             fontWeight: 900,
@@ -494,11 +851,6 @@ function ReasonList({ reasons }: { reasons: string[] }) {
           {r}
         </span>
       ))}
-      {reasons.length > 6 ? (
-        <span style={{ fontSize: 10.5, fontWeight: 900, color: UI.textDim }}>
-          +{reasons.length - 6} more
-        </span>
-      ) : null}
     </div>
   );
 }
@@ -508,11 +860,13 @@ function TextInput({
   onChange,
   placeholder,
   width = 120,
+  textAlign = "left",
 }: {
   value: string;
   onChange: (v: string) => void;
   placeholder?: string;
   width?: number | string;
+  textAlign?: "left" | "center" | "right";
 }) {
   return (
     <input
@@ -521,17 +875,147 @@ function TextInput({
       placeholder={placeholder}
       style={{
         width,
-        padding: "6px 8px",
-        borderRadius: 10,
+        padding: "4px 6px",
+        borderRadius: 8,
         border: `1px solid ${UI.border}`,
         background: UI.panelBg,
         fontWeight: 800,
+        fontSize: 12,
+        lineHeight: 1.2,
+        textAlign,
         outline: "none",
       }}
     />
   );
 }
 
+function getApprovalPill(meta?: ShiftRateMeta) {
+  const status = normalizeName(meta?.approvalStatus || "");
+
+  if (
+    status.includes("approved") &&
+    !status.includes("not approved") &&
+    !status.includes("unapproved")
+  ) {
+    return {
+      text: "Approved",
+      bg: "rgba(34,197,94,0.10)",
+      color: "#166534",
+    };
+  }
+
+  if (meta?.approvedBy || meta?.approvedAt) {
+    return {
+      text: "Approved",
+      bg: "rgba(34,197,94,0.08)",
+      color: "#166534",
+    };
+  }
+
+  return {
+    text: "Not approved",
+    bg: "rgba(245,158,11,0.14)",
+    color: "#7c2d12",
+  };
+}
+
+function yesNoLabel(v: string) {
+  const x = normalizeName(v);
+  if (x === "true" || x === "yes" || x === "1") return "Yes";
+  if (x === "false" || x === "no" || x === "0") return "No";
+  return v || "—";
+}
+
+function formatAuditDate(value: string) {
+  const raw = norm(value);
+  if (!raw) return "—";
+
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return raw;
+
+  let hours = d.getHours();
+  const minutes = String(d.getMinutes()).padStart(2, "0");
+  const month = d.getMonth() + 1;
+  const day = d.getDate();
+  const year = d.getFullYear();
+
+  if (hours === 0) hours = 12;
+  if (hours > 12) hours -= 12;
+
+  return `${hours}:${minutes} ${month}/${day}/${year}`;
+}
+
+function formatPayrollMessageStamp(value: string) {
+  const raw = norm(value);
+  if (!raw) return "—";
+
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return raw;
+
+  let hours = d.getHours();
+  const minutes = String(d.getMinutes()).padStart(2, "0");
+  const ap = hours >= 12 ? "PM" : "AM";
+  const month = d.getMonth() + 1;
+  const day = d.getDate();
+  const year = d.getFullYear();
+
+  if (hours === 0) hours = 12;
+  else if (hours > 12) hours -= 12;
+
+  return `${month}/${day}/${year} ${hours}:${minutes} ${ap}`;
+}
+
+function formatClockStamp(value: string | null | undefined) {
+  const raw = norm(value);
+  if (!raw) return "—";
+
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return raw;
+
+  let hours = d.getHours();
+  const minutes = String(d.getMinutes()).padStart(2, "0");
+  const ap = hours >= 12 ? "PM" : "AM";
+
+  if (hours === 0) hours = 12;
+  else if (hours > 12) hours -= 12;
+
+  return `${hours}:${minutes} ${ap}`;
+}
+
+function makeBlankRateRuleForm(): RateRuleFormState {
+  return {
+    ruleId: "",
+    ruleIdManuallyEdited: false,
+    active: true,
+    priority: "5",
+    ruleName: "",
+    ruleType: "Addon",
+    rateMode: "Add",
+    client: "",
+    caregiverId: "",
+    shiftType: "",
+    holidayRule: "",
+    startDate: "",
+    endDate: "",
+    payRate: "",
+    addAmount: "",
+    requiresApproval: false,
+  };
+}
+function slugifyRuleIdPart(value: string) {
+  return norm(value)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-+/g, "-");
+}
+
+function buildRuleIdFromName(ruleName: string) {
+  const slug = slugifyRuleIdPart(ruleName);
+  if (!slug) return "";
+  const digits = String(Date.now()).slice(-4);
+  return `${slug}-${digits}`;
+}
 /** ---------- Payroll Shift type ---------- */
 type PayrollShift = ShiftRow & {
   durationHours: number;
@@ -541,13 +1025,432 @@ type PayrollShift = ShiftRow & {
   outVerdict: string | null;
   diffInMin: number | null;
   diffOutMin: number | null;
-  payRate: number; // effective for export group display
+  payRate: number;
   payDue: number;
-  isManuallyConfirmed?: boolean; // local-only (for now)
+
+  regularHours: number;
+  overtimeHours: number;
+  overtimePayDue: number;
+
+  clockInTime: string | null;
+  clockOutTime: string | null;
+  isManuallyConfirmed?: boolean;
   adjustedStartTime?: string;
   adjustedEndTime?: string;
 };
+function AddRuleModal({
+  open,
+  saving,
+  error,
+  success,
+  form,
+  clientOptions,
+  caregiverOptions,
+  onClose,
+  onSubmit,
+  onChange,
+}: AddRuleModalProps) {
+  if (!open) return null;
 
+  const fieldLabelStyle: React.CSSProperties = {
+    fontSize: 12,
+    fontWeight: 900,
+    color: UI.textDim,
+    marginBottom: 6,
+    display: "block",
+  };
+
+  const inputStyle: React.CSSProperties = {
+    width: "100%",
+    padding: "9px 10px",
+    borderRadius: 10,
+    border: `1px solid ${UI.border}`,
+    background: UI.panelBg,
+    fontWeight: 800,
+    fontSize: 13,
+    outline: "none",
+  };
+
+  const selectedCaregiver =
+    caregiverOptions.find((cg) => cg.caregiverId === form.caregiverId) || null;
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(15,23,42,0.45)",
+        zIndex: 55,
+        display: "grid",
+        placeItems: "center",
+        padding: 16,
+      }}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        style={{
+          width: 780,
+          maxWidth: "100%",
+          maxHeight: "92vh",
+          overflow: "auto",
+          background: UI.panelBg,
+          border: `1px solid ${UI.borderSoft}`,
+          borderRadius: 18,
+          padding: 18,
+          boxShadow: "0 20px 60px rgba(15,23,42,0.22)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            gap: 12,
+            alignItems: "flex-start",
+          }}
+        >
+          <div>
+            <div style={{ fontSize: 20, fontWeight: 950 }}>Add Rule</div>
+            <div style={{ marginTop: 6, color: UI.textDim, fontSize: 13 }}>
+              Create a new rate rule and add it to the Rate Rules sheet.
+            </div>
+          </div>
+
+          <button
+            onClick={onClose}
+            disabled={saving}
+            style={{
+              padding: "8px 10px",
+              borderRadius: 10,
+              border: `1px solid ${UI.border}`,
+              background: UI.panelBg,
+              fontWeight: 900,
+              cursor: saving ? "not-allowed" : "pointer",
+              opacity: saving ? 0.6 : 1,
+            }}
+          >
+            Close
+          </button>
+        </div>
+
+        {error ? (
+          <div
+            style={{
+              marginTop: 14,
+              padding: 10,
+              borderRadius: 12,
+              background: "rgba(239,68,68,0.10)",
+              border: "1px solid rgba(239,68,68,0.18)",
+              color: "#991b1b",
+              fontWeight: 900,
+              fontSize: 13,
+            }}
+          >
+            {error}
+          </div>
+        ) : null}
+
+        {success ? (
+          <div
+            style={{
+              marginTop: 14,
+              padding: 10,
+              borderRadius: 12,
+              background: "rgba(34,197,94,0.10)",
+              border: "1px solid rgba(34,197,94,0.18)",
+              color: "#166534",
+              fontWeight: 900,
+              fontSize: 13,
+            }}
+          >
+            {success}
+          </div>
+        ) : null}
+
+        <div
+          style={{
+            marginTop: 16,
+            display: "grid",
+            gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+            gap: 14,
+          }}
+        >
+          <div>
+            <label style={fieldLabelStyle}>Rule ID</label>
+            <input
+              value={form.ruleId}
+              onChange={(e) => onChange("ruleId", e.target.value)}
+              placeholder="Auto-generated from rule name"
+              style={inputStyle}
+            />
+          </div>
+
+          <div>
+            <label style={fieldLabelStyle}>Rule Name</label>
+            <input
+              value={form.ruleName}
+              onChange={(e) => onChange("ruleName", e.target.value)}
+              placeholder="Ex: Christmas Day Add On"
+              style={inputStyle}
+            />
+          </div>
+
+          <div>
+            <label style={fieldLabelStyle}>Priority</label>
+            <select
+              value={form.priority}
+              onChange={(e) => onChange("priority", e.target.value)}
+              style={inputStyle}
+            >
+              {Array.from({ length: 10 }, (_, i) => String(i + 1)).map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label style={fieldLabelStyle}>Rule Type</label>
+            <select
+              value={form.ruleType}
+              onChange={(e) =>
+                onChange("ruleType", e.target.value as RateRuleFormState["ruleType"])
+              }
+              style={inputStyle}
+            >
+              <option value="Base">Base</option>
+              <option value="Addon">Addon</option>
+            </select>
+          </div>
+
+          <div>
+            <label style={fieldLabelStyle}>Rate Mode</label>
+            <select
+              value={form.rateMode}
+              onChange={(e) =>
+                onChange("rateMode", e.target.value as RateRuleFormState["rateMode"])
+              }
+              style={inputStyle}
+            >
+              <option value="Set">Set</option>
+              <option value="Add">Add</option>
+            </select>
+          </div>
+
+          <div>
+            <label style={fieldLabelStyle}>Client</label>
+            <input
+              list="rate-rule-client-options"
+              value={form.client}
+              onChange={(e) => onChange("client", e.target.value)}
+              placeholder="Start typing client name"
+              style={inputStyle}
+            />
+            <datalist id="rate-rule-client-options">
+              {clientOptions.map((client) => (
+                <option key={client} value={client} />
+              ))}
+            </datalist>
+          </div>
+
+          <div>
+            <label style={fieldLabelStyle}>Caregiver</label>
+            <select
+              value={form.caregiverId}
+              onChange={(e) => onChange("caregiverId", e.target.value)}
+              style={inputStyle}
+            >
+              <option value="">Select caregiver</option>
+              {caregiverOptions.map((cg) => (
+                <option key={cg.caregiverId} value={cg.caregiverId}>
+                  {cg.label}
+                  {cg.sublabel ? ` — ${cg.sublabel}` : ""}
+                  {` (${cg.caregiverId})`}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label style={fieldLabelStyle}>Selected Caregiver ID</label>
+            <div
+              style={{
+                ...inputStyle,
+                minHeight: 39,
+                display: "flex",
+                alignItems: "center",
+                color: selectedCaregiver ? UI.text : UI.textDim,
+              }}
+            >
+              {selectedCaregiver?.caregiverId || "—"}
+            </div>
+          </div>
+
+          <div>
+            <label style={fieldLabelStyle}>Shift Type</label>
+            <input
+              value={form.shiftType}
+              onChange={(e) => onChange("shiftType", e.target.value)}
+              placeholder="Optional"
+              style={inputStyle}
+            />
+          </div>
+
+          <div>
+            <label style={fieldLabelStyle}>Holiday Rule</label>
+            <input
+              value={form.holidayRule}
+              onChange={(e) => onChange("holidayRule", e.target.value)}
+              placeholder="Ex: Christmas Day"
+              style={inputStyle}
+            />
+          </div>
+
+          <div>
+            <label style={fieldLabelStyle}>Start Date</label>
+            <input
+              value={form.startDate}
+              onChange={(e) => onChange("startDate", e.target.value)}
+              placeholder="12/25/2026"
+              style={inputStyle}
+            />
+          </div>
+
+          <div>
+            <label style={fieldLabelStyle}>End Date</label>
+            <input
+              value={form.endDate}
+              onChange={(e) => onChange("endDate", e.target.value)}
+              placeholder="12/25/2026"
+              style={inputStyle}
+            />
+          </div>
+
+          <div>
+            <label style={fieldLabelStyle}>
+              {form.rateMode === "Set" ? "Pay Rate" : "Add Amount"}
+            </label>
+            <input
+              value={form.rateMode === "Set" ? form.payRate : form.addAmount}
+              onChange={(e) =>
+                form.rateMode === "Set"
+                  ? onChange("payRate", e.target.value)
+                  : onChange("addAmount", e.target.value)
+              }
+              placeholder={form.rateMode === "Set" ? "17" : "3"}
+              style={inputStyle}
+            />
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              justifyContent: "flex-end",
+              gap: 10,
+            }}
+          >
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                fontWeight: 900,
+                fontSize: 13,
+                color: UI.text,
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={form.active}
+                onChange={(e) => onChange("active", e.target.checked)}
+              />
+              Active
+            </label>
+
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                fontWeight: 900,
+                fontSize: 13,
+                color: UI.text,
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={form.requiresApproval}
+                onChange={(e) => onChange("requiresApproval", e.target.checked)}
+              />
+              Requires Approval
+            </label>
+          </div>
+        </div>
+
+        <div
+          style={{
+            marginTop: 18,
+            padding: 12,
+            borderRadius: 12,
+            background: UI.headerBg,
+            border: `1px solid ${UI.borderSoft}`,
+            fontSize: 12.5,
+            color: UI.textDim,
+            lineHeight: 1.45,
+          }}
+        >
+          Add at least one condition so the rule knows what it should match:
+          client, caregiver ID, shift type, holiday, or date range.
+        </div>
+
+        <div
+          style={{
+            marginTop: 18,
+            display: "flex",
+            justifyContent: "flex-end",
+            gap: 10,
+          }}
+        >
+          <button
+            onClick={onClose}
+            disabled={saving}
+            style={{
+              padding: "9px 12px",
+              borderRadius: 10,
+              border: `1px solid ${UI.border}`,
+              background: UI.panelBg,
+              fontWeight: 900,
+              cursor: saving ? "not-allowed" : "pointer",
+              opacity: saving ? 0.6 : 1,
+            }}
+          >
+            Cancel
+          </button>
+
+          <button
+            onClick={onSubmit}
+            disabled={saving}
+            style={{
+              padding: "9px 14px",
+              borderRadius: 10,
+              border: `1px solid ${UI.green}`,
+              background: UI.green,
+              color: "#fff",
+              fontWeight: 950,
+              cursor: saving ? "not-allowed" : "pointer",
+              opacity: saving ? 0.7 : 1,
+            }}
+          >
+            {saving ? "Saving..." : "Save Rule"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 export default function BillingPayrollClient() {
   const [week, setWeek] = useState<WeekKind>("cw");
   const [viewMode, setViewMode] = useState<ViewMode>("billing");
@@ -561,15 +1464,22 @@ export default function BillingPayrollClient() {
     {}
   );
 
-  // shiftId -> pay rate input (payroll)
+      // shiftId -> pay rate input (payroll)
   const [payRateByShift, setPayRateByShift] = useState<Record<string, string>>(
     {}
   );
+  const [savingRateByShift, setSavingRateByShift] = useState<Record<string, boolean>>(
+    {}
+  );
+  const [shiftRateMetaByShift, setShiftRateMetaByShift] = useState<
+    Record<string, ShiftRateMeta>
+  >({});
 
-  // clientName (normalized) -> base rate from sheet
+    // clientName (normalized) -> base rate from sheet
   const [clientRateMap, setClientRateMap] = useState<Record<string, number>>(
     {}
   );
+  const [clientOptions, setClientOptions] = useState<string[]>([]);
 
   // ✅ Billing overrides (local-only)
   const [clientRateOverride, setClientRateOverride] = useState<Record<string, string>>(
@@ -594,19 +1504,46 @@ export default function BillingPayrollClient() {
     {}
   );
 
-  // Payroll expanded caregivers
+    // Payroll expanded caregivers
   const [expandedCaregivers, setExpandedCaregivers] = useState<Record<
     string,
     boolean
   >>({});
 
-  // Search bars
+  // Payroll messages
+  const [payrollMessagesByCaregiver, setPayrollMessagesByCaregiver] = useState<
+    Record<string, PayrollMessagesByCaregiverEntry>
+  >({});
+  const [payrollMessagesLoading, setPayrollMessagesLoading] = useState(false);
+  const [payrollMessagesError, setPayrollMessagesError] = useState<string | null>(null);
+
+    // Search bars
   const [billingSearch, setBillingSearch] = useState("");
   const [payrollSearch, setPayrollSearch] = useState("");
 
-  // Export side panel
-  const [exportOpen, setExportOpen] = useState(false);
+   // Add Rule modal
+  const [addRuleOpen, setAddRuleOpen] = useState(false);
+  const [addRuleSaving, setAddRuleSaving] = useState(false);
+  const [addRuleError, setAddRuleError] = useState<string | null>(null);
+  const [addRuleSuccess, setAddRuleSuccess] = useState<string | null>(null);
+  const [rateRuleForm, setRateRuleForm] = useState<RateRuleFormState>(
+    makeBlankRateRuleForm()
+  );
 
+   // Sync rates
+  const [syncingRates, setSyncingRates] = useState(false);
+  const [syncRatesError, setSyncRatesError] = useState<string | null>(null);
+  const [syncRatesSuccess, setSyncRatesSuccess] = useState<string | null>(null);
+
+  // Rules view
+  const [rulesOpen, setRulesOpen] = useState(false);
+
+  // Payroll details dropdown per shift
+
+  // Payroll details dropdown per shift
+  const [expandedRateDetailsByShift, setExpandedRateDetailsByShift] = useState<
+    Record<string, boolean>
+  >({});
   // Local-only overrides
   const [manualConfirmByShiftId, setManualConfirmByShiftId] = useState<Record<
     string,
@@ -617,14 +1554,60 @@ export default function BillingPayrollClient() {
     { startTime: string; endTime: string }
   >>({});
 
+  // Editable pay due per shift
+  const [payDueOverrideByShiftId, setPayDueOverrideByShiftId] = useState<
+    Record<string, string>
+  >({});
+
   const timeOptions = useMemo(() => buildTimeOptions(15), []);
+  const caregiverOptions = useMemo<CaregiverOption[]>(() => {
+  return Object.values(caregiverById)
+    .map((cg) => ({
+      caregiverId: norm(cg.caregiverId),
+      label:
+        norm(cg.name) ||
+        norm(cg.nameOnSchedule) ||
+        norm(cg.caregiverId),
+      sublabel: norm(cg.nameOnSchedule),
+    }))
+    .filter((cg) => cg.caregiverId)
+    .sort((a, b) => a.label.localeCompare(b.label));
+}, [caregiverById]);
+
+  const reloadShiftRates = async (rowsForRange: ShiftRow[]) => {
+    const range = getDateRangeFromShifts(rowsForRange);
+
+    if (!range) {
+      setPayRateByShift({});
+      setShiftRateMetaByShift({});
+      return;
+    }
+
+    const rateRes = await fetch(
+      `/api/shift-rates?dateFrom=${encodeURIComponent(range.dateFrom)}&dateTo=${encodeURIComponent(range.dateTo)}`,
+      { cache: "no-store" }
+    );
+
+    const rateJson = (await rateRes.json()) as ShiftRatesApiResponse;
+
+    if (!rateJson.ok) {
+      throw new Error(rateJson.error || "Failed to load shift rates");
+    }
+
+    const rawRows = rateJson.rows || rateJson.rates || [];
+
+    setPayRateByShift(buildPayRateMapFromApi(rawRows));
+    setShiftRateMetaByShift(buildShiftRateMetaMapFromApi(rawRows));
+  };
 
   useEffect(() => {
     let cancelled = false;
 
-    async function load() {
+        async function load() {
       setLoading(true);
       setError(null);
+      setPayrollMessagesLoading(true);
+      setPayrollMessagesError(null);
 
       try {
         // 1) schedule + maps
@@ -655,17 +1638,25 @@ export default function BillingPayrollClient() {
         const nameIdx = headers.findIndex((h) => normalizeName(h) === "name");
         const rateIdx = headers.findIndex((h) => normalizeName(h) === "rate");
 
-        const rateMap: Record<string, number> = {};
-        if (nameIdx >= 0 && rateIdx >= 0) {
-          for (const r of rowsClients) {
-            const name = norm(r[nameIdx]);
-            const rateRaw = norm(r[rateIdx]);
-            const rate = parseRate(rateRaw);
-            if (name && rate != null) rateMap[normalizeName(name)] = rate;
+                const rateMap: Record<string, number> = {};
+        const clientNameSet = new Set<string>();
+
+        for (const r of rowsClients) {
+          const name = nameIdx >= 0 ? norm(r[nameIdx]) : "";
+          const rateRaw = rateIdx >= 0 ? norm(r[rateIdx]) : "";
+          const rate = parseRate(rateRaw);
+
+          if (name) clientNameSet.add(name);
+          if (name && rate != null) {
+            rateMap[normalizeName(name)] = rate;
           }
         }
 
-        // 3) caregivers profiles
+        const sortedClientOptions = Array.from(clientNameSet).sort((a, b) =>
+          a.localeCompare(b)
+        );
+
+                // 3) caregivers profiles
         let byId: Record<string, CaregiverProfile> = {};
         try {
           const cgRes = await fetch(`/api/caregivers`, { cache: "no-store" });
@@ -675,34 +1666,102 @@ export default function BillingPayrollClient() {
           // ignore; fallback will be schedule names
         }
 
+                           // 4) shift rates for the displayed week
+        let rateMapByShift: Record<string, string> = {};
+        let rateMetaMapByShift: Record<string, ShiftRateMeta> = {};
+
+        try {
+          const range = getDateRangeFromShifts(rowsFromApi);
+          if (range) {
+            const rateRes = await fetch(
+              `/api/shift-rates?dateFrom=${encodeURIComponent(range.dateFrom)}&dateTo=${encodeURIComponent(range.dateTo)}`,
+              { cache: "no-store" }
+            );
+            const rateJson = (await rateRes.json()) as ShiftRatesApiResponse;
+
+            if (!rateJson.ok) {
+              throw new Error(rateJson.error || "Failed to load shift rates");
+            }
+
+            const rawRows = rateJson.rows || rateJson.rates || [];
+
+            rateMapByShift = buildPayRateMapFromApi(rawRows);
+            rateMetaMapByShift = buildShiftRateMetaMapFromApi(rawRows);
+          }
+        } catch (err) {
+          console.error("[billing-payroll] failed to load shift rates:", err);
+          // do not block the page if rates fail; fallback to default $16
+        }
+
+        // 5) payroll messages for the displayed week
+        let groupedPayrollMessages: Record<string, PayrollMessagesByCaregiverEntry> = {};
+        let payrollMessagesLoadError: string | null = null;
+
+        try {
+          const range = getDateRangeFromShifts(rowsFromApi);
+          if (range) {
+            const msgRes = await fetch(
+              `/api/payroll-messages?dateFrom=${encodeURIComponent(range.dateFrom)}&dateTo=${encodeURIComponent(range.dateTo)}&groupByCaregiver=true`,
+              { cache: "no-store" }
+            );
+
+            const msgJson = (await msgRes.json()) as PayrollMessagesApiResponse;
+
+            if (!msgJson.ok) {
+              throw new Error(msgJson.error || "Failed to load payroll messages");
+            }
+
+            groupedPayrollMessages = msgJson.grouped || {};
+          }
+        } catch (err: any) {
+          console.error("[billing-payroll] failed to load payroll messages:", err);
+          payrollMessagesLoadError = err?.message || "Failed to load payroll messages";
+        }
+
         if (cancelled) return;
 
         setShifts(rowsFromApi);
         setClockMap(clocks);
         setLocationMap(locs);
         setClientRateMap(rateMap);
+        setClientOptions(sortedClientOptions);
         setCaregiverById(byId);
+        setPayRateByShift(rateMapByShift);
+        setShiftRateMetaByShift(rateMetaMapByShift);
+        setPayrollMessagesByCaregiver(groupedPayrollMessages);
+        setPayrollMessagesError(payrollMessagesLoadError);
 
-        // reset expansions/searches on week change
-        setExpandedClients({});
+               // reset expansions/searches on week change
+                      setExpandedClients({});
         setExpandedCaregivers({});
+        setExpandedRateDetailsByShift({});
+        setPayrollMessagesByCaregiver(groupedPayrollMessages);
         setBillingSearch("");
         setPayrollSearch("");
-        setExportOpen(false);
-
+        setAddRuleOpen(false);
+        setAddRuleSaving(false);
+        setAddRuleError(null);
+        setAddRuleSuccess(null);
+        setRateRuleForm(makeBlankRateRuleForm());
+        setSyncingRates(false);
+        setSyncRatesError(null);
+        setSyncRatesSuccess(null);
         // clear local per-shift overrides on week change
         setManualConfirmByShiftId({});
         setTimeOverrideByShiftId({});
+        setPayDueOverrideByShiftId({});
 
         // keep billing overrides across week toggle? (feels safer to clear)
         setClientRateOverride({});
         setClientScheduledOverride({});
         setClientAdjustOverride({});
-        setPayRateByShift({});
       } catch (e: any) {
         if (!cancelled) setError(e?.message || "Unknown error");
-      } finally {
-        if (!cancelled) setLoading(false);
+         } finally {
+        if (!cancelled) {
+          setLoading(false);
+          setPayrollMessagesLoading(false);
+        }
       }
     }
 
@@ -711,7 +1770,26 @@ export default function BillingPayrollClient() {
       cancelled = true;
     };
   }, [week]);
+  const weeklyRules = useMemo(() => {
+    const byId = new Map<string, ShiftRateRule>();
 
+    Object.values(shiftRateMetaByShift).forEach((meta) => {
+      (meta.appliedRules || []).forEach((rule) => {
+        const id = norm(rule.ruleId);
+        if (!id) return;
+        if (!byId.has(id)) {
+          byId.set(id, rule);
+        }
+      });
+    });
+
+    return Array.from(byId.values()).sort((a, b) => {
+      const ap = Number(a.priority || 0);
+      const bp = Number(b.priority || 0);
+      if (ap !== bp) return bp - ap;
+      return norm(a.ruleName).localeCompare(norm(b.ruleName));
+    });
+  }, [shiftRateMetaByShift]);
   const workedShifts = useMemo(() => shifts.filter(isWorkedShift), [shifts]);
 
   const weekLabel = useMemo(() => {
@@ -964,7 +2042,7 @@ export default function BillingPayrollClient() {
   }, [billingRows]);
 
   /** ---- Payroll (by caregiver) ---- */
-  const payrollGroups = useMemo(() => {
+    const payrollGroups = useMemo(() => {
     const map = new Map<
       string,
       {
@@ -993,12 +2071,12 @@ export default function BillingPayrollClient() {
       const baseState = ev?.state ?? "unknown";
       const confirmState = effectiveConfirmState(sid, ev);
 
-      const isConfirmed = confirmState === "confirmed";
+      const shiftClock = sid ? clockMap[sid] : undefined;
+      const clockInTime = shiftClock?.clockInTime ?? null;
+      const clockOutTime = shiftClock?.clockOutTime ?? null;
 
-      const payRateRaw = norm(payRateByShift[s0.shiftId] ?? "");
+      const payRateRaw = norm(payRateByShift[sid] ?? "");
       const payRate = parseRate(payRateRaw) ?? DEFAULT_EXPORT_PAY_RATE;
-
-      const payDue = isConfirmed ? durationHours * payRate : 0;
 
       const prev = map.get(caregiverId) || {
         caregiverId,
@@ -1033,7 +2111,14 @@ export default function BillingPayrollClient() {
         diffInMin: ev?.diffInMin ?? null,
         diffOutMin: ev?.diffOutMin ?? null,
         payRate,
-        payDue,
+        payDue: 0,
+
+        regularHours: 0,
+        overtimeHours: 0,
+        overtimePayDue: 0,
+
+        clockInTime,
+        clockOutTime,
         isManuallyConfirmed: Boolean(manualConfirmByShiftId[sid]),
         adjustedStartTime: timeOverrideByShiftId[sid]?.startTime,
         adjustedEndTime: timeOverrideByShiftId[sid]?.endTime,
@@ -1052,10 +2137,37 @@ export default function BillingPayrollClient() {
         const bm = parseTimeToMinutes(b.startTime) ?? 0;
         return am - bm;
       });
+
+      let runningHours = 0;
+
+      g.shifts = g.shifts.map((s) => {
+        const { regularHours, overtimeHours } = splitWeeklyOvertime(
+          runningHours,
+          s.durationHours
+        );
+
+        runningHours += s.durationHours;
+
+        const computedPayDue =
+          s.confirmState === "confirmed"
+            ? roundHours(regularHours * s.payRate + overtimeHours * s.payRate * 1.5)
+            : 0;
+
+        const payDueOverride = parseNumber(payDueOverrideByShiftId[norm(s.shiftId)] ?? "");
+        const payDue = payDueOverride != null ? payDueOverride : computedPayDue;
+
+        return {
+          ...s,
+          regularHours,
+          overtimeHours,
+          overtimePayDue: roundHours(overtimeHours * s.payRate * 1.5),
+          payDue,
+        };
+      });
+
       return g;
     });
 
-    // payroll search (caregiver name / schedule name / id)
     const q = normalizeName(payrollSearch);
     if (q) {
       groups = groups.filter((g) => {
@@ -1069,7 +2181,6 @@ export default function BillingPayrollClient() {
 
     groups.sort((a, b) => a.caregiverLabel.localeCompare(b.caregiverLabel));
     return groups;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     workedShifts,
     evalByShiftId,
@@ -1078,27 +2189,43 @@ export default function BillingPayrollClient() {
     payrollSearch,
     manualConfirmByShiftId,
     timeOverrideByShiftId,
+    payDueOverrideByShiftId,
+    clockMap,
   ]);
-
-  const payrollTotals = useMemo(() => {
+    const payrollTotals = useMemo(() => {
     let scheduledHours = 0;
     let confirmedHours = 0;
     let flaggedHours = 0;
+    let regularHours = 0;
+    let overtimeHours = 0;
     let payDue = 0;
     let flaggedShifts = 0;
 
     for (const g of payrollGroups) {
       for (const s of g.shifts) {
         scheduledHours += s.durationHours;
+        regularHours += s.regularHours;
+        overtimeHours += s.overtimeHours;
+
         if (s.confirmState === "confirmed") confirmedHours += s.durationHours;
         if (s.confirmState === "flagged") {
           flaggedHours += s.durationHours;
           flaggedShifts += 1;
         }
+
         payDue += s.payDue;
       }
     }
-    return { scheduledHours, confirmedHours, flaggedHours, flaggedShifts, payDue };
+
+    return {
+      scheduledHours,
+      confirmedHours,
+      flaggedHours,
+      regularHours,
+      overtimeHours,
+      flaggedShifts,
+      payDue,
+    };
   }, [payrollGroups]);
 
   const isCaregiverFinished = (g: { shifts: PayrollShift[] }) => {
@@ -1118,66 +2245,370 @@ export default function BillingPayrollClient() {
     return !hasFuture && hasNonFuture && allNonFutureConfirmed;
   };
 
-  // ✅ Export text (scheduled hours grouped by pay rate; default $16)
-  const exportText = useMemo(() => {
-    const lines: string[] = [];
-    for (const g of payrollGroups) {
-      const byRate = new Map<number, number>();
-      for (const s of g.shifts) {
-        const rate = s.payRate ?? DEFAULT_EXPORT_PAY_RATE;
-        byRate.set(rate, (byRate.get(rate) || 0) + s.durationHours);
-      }
-
-      const parts = Array.from(byRate.entries())
-        .sort((a, b) => a[0] - b[0])
-        .map(([rate, hrs]) => `${hrs.toFixed(2)} hrs @ $${rate.toFixed(2)}`);
-
-      lines.push(`${g.caregiverLabel}: ${parts.join(" ; ")}`);
+    function csvEscape(value: any) {
+    const s = norm(value);
+    if (/[",\n]/.test(s)) {
+      return `"${s.replace(/"/g, '""')}"`;
     }
-    return lines.join("\n");
+    return s;
+  }
+
+  const exportCsv = useMemo(() => {
+    const rows: string[][] = [];
+
+            rows.push([
+      "Caregiver ID",
+      "Caregiver Name",
+      "Name On Schedule",
+      "Shift ID",
+      "Date",
+      "Client",
+      "Start Time",
+      "End Time",
+      "Hours",
+      "Regular Hours",
+      "Overtime Hours",
+      "Pay Rate",
+      "Pay Due",
+    ]);
+
+       for (const g of payrollGroups) {
+      for (const s of g.shifts) {
+                rows.push([
+          g.caregiverId,
+          g.caregiverLabel,
+          g.nameOnSchedule,
+          s.shiftId,
+          s.date,
+          s.client,
+          s.startTime,
+          s.endTime,
+          s.durationHours.toFixed(2),
+          s.regularHours.toFixed(2),
+          s.overtimeHours.toFixed(2),
+          s.payRate.toFixed(2),
+          s.payDue.toFixed(2),
+        ]);
+      }
+    }
+
+    return rows.map((row) => row.map(csvEscape).join(",")).join("\n");
   }, [payrollGroups]);
 
-  const Toggle = ({
-    value,
-    onChange,
-  }: {
-    value: ViewMode;
-    onChange: (v: ViewMode) => void;
-  }) => {
-    const btn = (v: ViewMode, label: string) => {
-      const active = value === v;
-      return (
-        <button
-          onClick={() => onChange(v)}
-          style={{
-            padding: "8px 10px",
-            borderRadius: 12,
-            border: `1px solid ${active ? UI.slate : UI.border}`,
-            background: active ? UI.slate : UI.panelBg,
-            color: active ? "#fff" : UI.text,
-            fontWeight: 950,
-            fontSize: 13,
-            cursor: "pointer",
-            minWidth: 110,
-          }}
-        >
-          {label}
-        </button>
-      );
-    };
+  const downloadPayrollCsv = () => {
+    const today = new Date();
+    const y = today.getFullYear();
+    const m = String(today.getMonth() + 1).padStart(2, "0");
+    const d = String(today.getDate()).padStart(2, "0");
+    const safeWeek = week === "cw" ? "current-week" : "next-week";
+    const filename = `busybees-payroll-${safeWeek}-${y}-${m}-${d}.csv`;
 
+    const blob = new Blob([exportCsv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    URL.revokeObjectURL(url);
+  };
+
+  const Toggle = ({
+  value,
+  onChange,
+}: {
+  value: ViewMode;
+  onChange: (v: ViewMode) => void;
+}) => {
+  const btn = (v: ViewMode, label: string) => {
+    const active = value === v;
     return (
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-        {btn("billing", "Billing")}
-        {btn("payroll", "Payroll")}
-      </div>
+      <button
+        onClick={() => onChange(v)}
+        style={{
+          padding: "7px 10px",
+          borderRadius: 10,
+          border: `1px solid ${active ? UI.slate : UI.border}`,
+          background: active ? UI.slate : UI.panelBg,
+          color: active ? "#fff" : UI.text,
+          fontWeight: 950,
+          fontSize: 12,
+          cursor: "pointer",
+          minWidth: 96,
+          lineHeight: 1.1,
+        }}
+      >
+        {label}
+      </button>
     );
   };
 
-  const confirmShiftLocal = (shiftId: string) => {
+  return (
+    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+      {btn("billing", "Billing")}
+      {btn("payroll", "Payroll")}
+    </div>
+  );
+};
+
+        const confirmShiftLocal = (shiftId: string) => {
     const sid = norm(shiftId);
     if (!sid) return;
     setManualConfirmByShiftId((prev) => ({ ...prev, [sid]: true }));
+  };
+
+  const syncShiftRates = async () => {
+    try {
+      setSyncingRates(true);
+      setSyncRatesError(null);
+      setSyncRatesSuccess(null);
+      setError(null);
+
+      const range = getDateRangeFromShifts(shifts);
+      if (!range) {
+        throw new Error("No shifts found for the selected week.");
+      }
+
+      const res = await fetch(`/api/shift-rates/sync`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          action: "syncShiftRatesFromAllShifts",
+          dateFrom: range.dateFrom,
+          dateTo: range.dateTo,
+        }),
+      });
+
+      const json = await res.json();
+
+      if (!res.ok || !json?.ok) {
+        throw new Error(json?.error || "Failed to sync shift rates");
+      }
+
+      await reloadShiftRates(shifts);
+
+      setSyncRatesSuccess(
+        json?.message ||
+          `Shift rates synced successfully. Created: ${json?.created ?? 0}, Updated: ${json?.updated ?? 0}`
+      );
+    } catch (e: any) {
+      setSyncRatesError(e?.message || "Failed to sync shift rates");
+    } finally {
+      setSyncingRates(false);
+    }
+  };
+
+   const saveShiftRate = async (shiftId: string) => {
+    const sid = norm(shiftId);
+    if (!sid) return;
+
+    const parsed = parseRate(payRateByShift[sid] ?? "");
+    if (parsed == null) {
+      setError("Please enter a valid pay rate before saving.");
+      return;
+    }
+
+    try {
+      setSavingRateByShift((prev) => ({ ...prev, [sid]: true }));
+      setError(null);
+
+      const res = await fetch(`/api/shift-rates`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          action: "updateShiftRate",
+          shiftId: sid,
+          newRate: parsed,
+          updatedBy: "Billing & Payroll Page",
+          reason: "Updated from payroll section",
+        }),
+      });
+
+      const json = await res.json();
+      if (!res.ok || !json?.ok) {
+        throw new Error(json?.error || "Failed to save shift rate");
+      }
+
+      setPayRateByShift((prev) => ({
+        ...prev,
+        [sid]: parsed.toFixed(2),
+      }));
+
+            setShiftRateMetaByShift((prev) => {
+        const current = prev[sid];
+
+        return {
+          ...prev,
+          [sid]: {
+            finalRate: parsed.toFixed(2),
+            baseRate: parsed.toFixed(2),
+            addOnTotal: "0.00",
+
+            updatedBy:
+              norm(json?.rate?.updatedBy) ||
+              norm(json?.updatedBy) ||
+              "Billing & Payroll Page",
+            updatedAt:
+              norm(json?.rate?.updatedAt) ||
+              norm(json?.updatedAt) ||
+              new Date().toLocaleString(),
+            updatedSource: "SchedulerManualEdit",
+
+            rateSource: current?.rateSource || "Manual Override",
+            rateSourceDetail:
+              norm(json?.rate?.reason) ||
+              norm(json?.reason) ||
+              "Updated from payroll section",
+
+            approvedBy:
+              norm(json?.rate?.updatedBy) ||
+              norm(json?.updatedBy) ||
+              "Billing & Payroll Page",
+            approvedAt:
+              norm(json?.rate?.updatedAt) ||
+              norm(json?.updatedAt) ||
+              new Date().toLocaleString(),
+            approvalStatus: "Approved",
+            requiresApprovalFromRules: current?.requiresApprovalFromRules || "FALSE",
+
+            appliedRuleIds: ["MANUAL_OVERRIDE"],
+            appliedRuleSummary: "MANUAL_OVERRIDE • Manual scheduler override",
+            appliedRules: [],
+
+            raw: current?.raw,
+          },
+        };
+      });
+    } catch (e: any) {
+      setError(e?.message || "Failed to save shift rate");
+    } finally {
+      setSavingRateByShift((prev) => ({ ...prev, [sid]: false }));
+    }
+  };
+
+     const updateRateRuleForm: RateRuleFormChange = (key, value) => {
+  setRateRuleForm((prev) => {
+    const next: RateRuleFormState = {
+      ...prev,
+      [key]: value,
+    } as RateRuleFormState;
+
+    if (key === "ruleName" && !prev.ruleIdManuallyEdited) {
+      next.ruleId = buildRuleIdFromName(String(value || ""));
+    }
+
+    if (key === "ruleId") {
+      next.ruleIdManuallyEdited = true;
+    }
+
+    return next;
+  });
+};
+
+  const closeAddRuleModal = () => {
+    if (addRuleSaving) return;
+    setAddRuleOpen(false);
+    setAddRuleError(null);
+    setAddRuleSuccess(null);
+    setRateRuleForm(makeBlankRateRuleForm());
+  };
+
+  const submitAddRule = async () => {
+    setAddRuleError(null);
+    setAddRuleSuccess(null);
+
+    if (!norm(rateRuleForm.ruleName)) {
+      setAddRuleError("Rule name is required.");
+      return;
+    }
+
+    if (!norm(rateRuleForm.priority)) {
+      setAddRuleError("Priority is required.");
+      return;
+    }
+
+    if (rateRuleForm.rateMode === "Set" && !norm(rateRuleForm.payRate)) {
+      setAddRuleError("Pay Rate is required when Rate Mode is Set.");
+      return;
+    }
+
+    if (rateRuleForm.rateMode === "Add" && !norm(rateRuleForm.addAmount)) {
+      setAddRuleError("Add Amount is required when Rate Mode is Add.");
+      return;
+    }
+
+    if (
+      !norm(rateRuleForm.client) &&
+      !norm(rateRuleForm.caregiverId) &&
+      !norm(rateRuleForm.shiftType) &&
+      !norm(rateRuleForm.holidayRule) &&
+      !norm(rateRuleForm.startDate) &&
+      !norm(rateRuleForm.endDate)
+    ) {
+      setAddRuleError(
+        "Add at least one condition: client, caregiver, shift type, holiday, or date."
+      );
+      return;
+    }
+
+    try {
+      setAddRuleSaving(true);
+
+      const res = await fetch(`/api/shift-rates`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          action: "createRateRule",
+          ruleId: norm(rateRuleForm.ruleId),
+          active: rateRuleForm.active,
+          priority: rateRuleForm.priority,
+          ruleName: norm(rateRuleForm.ruleName),
+          ruleType: rateRuleForm.ruleType,
+          rateMode: rateRuleForm.rateMode,
+          client: norm(rateRuleForm.client),
+          caregiverId: norm(rateRuleForm.caregiverId),
+          shiftType: norm(rateRuleForm.shiftType),
+          holidayRule: norm(rateRuleForm.holidayRule),
+          startDate: norm(rateRuleForm.startDate),
+          endDate: norm(rateRuleForm.endDate),
+          payRate:
+            rateRuleForm.rateMode === "Set" ? norm(rateRuleForm.payRate) : "",
+          addAmount:
+            rateRuleForm.rateMode === "Add" ? norm(rateRuleForm.addAmount) : "",
+          requiresApproval: rateRuleForm.requiresApproval,
+        }),
+      });
+
+      const json = (await res.json()) as CreateRateRuleApiResponse;
+
+      if (!res.ok || !json?.ok) {
+        throw new Error(json?.error || "Failed to create rate rule");
+      }
+
+      setAddRuleSuccess(
+        `Rule created${json.ruleId ? `: ${json.ruleId}` : ""}`
+      );
+
+      setTimeout(() => {
+        setAddRuleOpen(false);
+        setAddRuleError(null);
+        setAddRuleSuccess(null);
+        setRateRuleForm(makeBlankRateRuleForm());
+      }, 700);
+    } catch (e: any) {
+      setAddRuleError(e?.message || "Failed to create rate rule");
+    } finally {
+      setAddRuleSaving(false);
+    }
   };
 
   const setShiftTimeLocal = (
@@ -1196,244 +2627,256 @@ export default function BillingPayrollClient() {
     });
   };
 
-  const ExportPanel = () => {
-    if (!exportOpen) return null;
-
-    const copyAll = async () => {
-      try {
-        await navigator.clipboard.writeText(exportText || "");
-      } catch {
-        // fallback (older browsers): create temp textarea
-        const ta = document.createElement("textarea");
-        ta.value = exportText || "";
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand("copy");
-        ta.remove();
-      }
-    };
-
-    return (
-      <div
-        style={{
-          position: "fixed",
-          inset: 0,
-          background: "rgba(15,23,42,0.45)",
-          zIndex: 50,
-          display: "flex",
-          justifyContent: "flex-end",
-        }}
-        onMouseDown={(e) => {
-          if (e.target === e.currentTarget) setExportOpen(false);
-        }}
-      >
-        <div
-          style={{
-            width: 520,
-            maxWidth: "92vw",
-            height: "100%",
-            background: UI.panelBg,
-            borderLeft: `1px solid ${UI.borderSoft}`,
-            padding: 14,
-            overflow: "auto",
-          }}
-        >
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-            <div>
-              <div style={{ fontSize: 16, fontWeight: 950 }}>Export</div>
-              <div style={{ marginTop: 6, color: UI.textDim, fontSize: 13 }}>
-                Scheduled hours grouped by pay rate (default{" "}
-                <b>${DEFAULT_EXPORT_PAY_RATE}</b> if blank).
-              </div>
-            </div>
-
-            <button
-              onClick={() => setExportOpen(false)}
-              style={{
-                padding: "6px 10px",
-                borderRadius: 10,
-                border: `1px solid ${UI.border}`,
-                background: UI.panelBg,
-                fontWeight: 900,
-                cursor: "pointer",
-                height: 36,
-              }}
-            >
-              Close
-            </button>
-          </div>
-
-          <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button
-              onClick={copyAll}
-              style={{
-                padding: "8px 10px",
-                borderRadius: 12,
-                border: `1px solid ${UI.slate}`,
-                background: UI.slate,
-                color: "#fff",
-                fontWeight: 950,
-                cursor: "pointer",
-              }}
-            >
-              Copy all text
-            </button>
-
-            <div style={{ color: UI.textDim, fontSize: 13, display: "flex", alignItems: "center" }}>
-              {payrollGroups.length} caregivers
-            </div>
-          </div>
-
-          <div style={{ marginTop: 12 }}>
-            <textarea
-              value={exportText}
-              readOnly
-              style={{
-                width: "100%",
-                minHeight: "70vh",
-                resize: "vertical",
-                padding: 12,
-                borderRadius: 12,
-                border: `1px solid ${UI.borderSoft}`,
-                fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-                fontSize: 12.5,
-                lineHeight: 1.5,
-                outline: "none",
-                background: UI.headerBg,
-              }}
-            />
-          </div>
-        </div>
-      </div>
-    );
-  };
-
-  const MiniSearch = ({
-    value,
-    onChange,
-    placeholder,
-  }: {
-    value: string;
-    onChange: (v: string) => void;
-    placeholder: string;
-  }) => (
+    
+ 
+ function MiniSearch({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder: string;
+}) {
+  return (
     <input
       value={value}
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
+      autoComplete="off"
+      spellCheck={false}
       style={{
-        padding: "8px 10px",
-        borderRadius: 12,
+        padding: "7px 10px",
+        borderRadius: 10,
         border: `1px solid ${UI.border}`,
         background: UI.panelBg,
         fontWeight: 800,
-        minWidth: 240,
+        fontSize: 12,
+        minWidth: 220,
         outline: "none",
       }}
     />
   );
+}
 
   return (
-    <div style={{ background: UI.pageBg, minHeight: "100vh", padding: 16, color: UI.text }}>
-      <ExportPanel />
+  <div
+    style={{
+      background: UI.pageBg,
+      minHeight: "100vh",
+      padding: 16,
+      color: UI.text,
+    }}
+  >
+    
 
-      <div style={{ maxWidth: 1300, margin: "0 auto" }}>
-        {/* Header */}
-        <div
-          style={{
-            display: "flex",
-            flexWrap: "wrap",
-            gap: 12,
-            alignItems: "center",
-            justifyContent: "space-between",
-            marginBottom: 12,
-          }}
-        >
-          <div>
-            <div style={{ fontSize: 22, fontWeight: 950 }}>Billing &amp; Payroll</div>
-            <div style={{ color: UI.textDim, marginTop: 4, fontSize: 13 }}>
-              <b>{weekLabel}</b>
-              <span style={{ marginLeft: 10 }}>
-                ✅ <b>Confirmed</b> = clock in/out within <b>15m</b> of scheduled + <b>On site</b>{" "}
-                verdict for both.
-              </span>
-            </div>
+    <AddRuleModal
+      open={addRuleOpen}
+      saving={addRuleSaving}
+      error={addRuleError}
+      success={addRuleSuccess}
+      form={rateRuleForm}
+      clientOptions={clientOptions}
+      caregiverOptions={caregiverOptions}
+      onClose={closeAddRuleModal}
+      onSubmit={submitAddRule}
+      onChange={updateRateRuleForm}
+    />
 
-            <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-              <Pill text={`Confirmed: ${totalsConfirm.confirmedCount}`} bg="rgba(34,197,94,0.14)" color="#065f46" />
-              <Pill text={`Flagged: ${totalsConfirm.flaggedCount}`} bg="rgba(239,68,68,0.14)" color="#991b1b" />
-              {totalsConfirm.futureCount ? (
-                <Pill text={`Future: ${totalsConfirm.futureCount}`} bg="rgba(148,163,184,0.25)" color="#334155" />
-              ) : null}
-            </div>
+    <div style={{ maxWidth: 1300, margin: "0 auto" }}>
+      {/* Header */}
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          gap: 12,
+          alignItems: "center",
+          justifyContent: "space-between",
+          marginBottom: 12,
+        }}
+      >
+        <div>
+          <div style={{ fontSize: 22, fontWeight: 950 }}>
+            Billing &amp; Payroll
+          </div>
 
-            {missingCaregiverIds.length ? (
-              <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                <Pill
-                  text={`Missing caregiver profiles: ${missingCaregiverIds.length}`}
-                  bg="rgba(245,158,11,0.18)"
-                  color="#7c2d12"
-                  title="These caregiver IDs appear on the schedule but are not in the Caregivers sheet."
-                />
-                <div style={{ color: UI.textDim, fontSize: 12 }}>
-                  (They’ll show as “No profile” in Payroll.)
-                </div>
-              </div>
+          <div style={{ color: UI.textDim, marginTop: 4, fontSize: 13 }}>
+            <b>{weekLabel}</b>
+          </div>
+
+          <div
+            style={{
+              marginTop: 8,
+              display: "flex",
+              gap: 8,
+              flexWrap: "wrap",
+              alignItems: "center",
+            }}
+          >
+            <Pill
+              text={`Confirmed: ${totalsConfirm.confirmedCount}`}
+              bg="rgba(22,101,52,0.12)"
+              color="#166534"
+            />
+            <Pill
+              text={`Flagged: ${totalsConfirm.flaggedCount}`}
+              bg="rgba(239,68,68,0.14)"
+              color="#991b1b"
+            />
+            {totalsConfirm.futureCount ? (
+              <Pill
+                text={`Future: ${totalsConfirm.futureCount}`}
+                bg="rgba(148,163,184,0.25)"
+                color="#334155"
+              />
             ) : null}
           </div>
 
-          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-            <Toggle value={viewMode} onChange={setViewMode} />
-
-            <button
-              onClick={() => setExportOpen(true)}
+          {missingCaregiverIds.length ? (
+            <div
               style={{
-                padding: "8px 10px",
-                borderRadius: 12,
-                border: `1px solid ${UI.border}`,
-                background: UI.panelBg,
-                fontWeight: 950,
-                cursor: "pointer",
+                marginTop: 10,
+                display: "flex",
+                gap: 8,
+                flexWrap: "wrap",
+                alignItems: "center",
               }}
             >
-              Export
-            </button>
-
-            <select
-              value={week}
-              onChange={(e) => setWeek(e.target.value as WeekKind)}
-              style={{
-                padding: "8px 10px",
-                borderRadius: 12,
-                border: `1px solid ${UI.border}`,
-                background: UI.panelBg,
-                fontWeight: 900,
-                cursor: "pointer",
-              }}
-            >
-              <option value="cw">This Week</option>
-              <option value="nw">Next Week</option>
-            </select>
-
-            <a
-              href="/schedule"
-              style={{
-                padding: "8px 10px",
-                borderRadius: 12,
-                border: `1px solid ${UI.border}`,
-                background: UI.panelBg,
-                textDecoration: "none",
-                color: UI.text,
-                fontWeight: 900,
-                fontSize: 13,
-              }}
-            >
-              Back to Schedule
-            </a>
-          </div>
+              <Pill
+                text={`Missing caregiver profiles: ${missingCaregiverIds.length}`}
+                bg="rgba(245,158,11,0.18)"
+                color="#7c2d12"
+                title="These caregiver IDs appear on the schedule but are not in the Caregivers sheet."
+              />
+            </div>
+          ) : null}
         </div>
 
-        {error && (
+                      <div
+          style={{
+            display: "flex",
+            gap: 10,
+            alignItems: "center",
+            flexWrap: "wrap",
+          }}
+        >
+          <Toggle value={viewMode} onChange={setViewMode} />
+
+                   <button
+            onClick={() => {
+              setAddRuleError(null);
+              setAddRuleSuccess(null);
+              setRateRuleForm(makeBlankRateRuleForm());
+              setAddRuleOpen(true);
+            }}
+            style={{
+              padding: "7px 10px",
+              borderRadius: 10,
+              border: `1px solid ${UI.green}`,
+              background: UI.green,
+              color: "#fff",
+              fontWeight: 950,
+              fontSize: 12,
+              cursor: "pointer",
+              lineHeight: 1.1,
+            }}
+          >
+            + Add Rule
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setRulesOpen((v) => !v)}
+            style={{
+              padding: "7px 10px",
+              borderRadius: 10,
+              border: `1px solid ${UI.purple}`,
+              background: rulesOpen ? "rgba(124,58,237,0.10)" : UI.panelBg,
+              color: UI.purple,
+              fontWeight: 950,
+              fontSize: 12,
+              cursor: "pointer",
+              lineHeight: 1.1,
+            }}
+          >
+            {rulesOpen ? "Hide Rules" : "View Rules"}
+          </button>
+
+          <button
+            type="button"
+            onClick={syncShiftRates}
+            disabled={syncingRates || loading}
+            style={{
+              padding: "7px 10px",
+              borderRadius: 10,
+              border: `1px solid ${UI.blue}`,
+              background: syncingRates ? "rgba(43,111,214,0.12)" : UI.panelBg,
+              color: UI.blue,
+              fontWeight: 950,
+              fontSize: 12,
+              cursor: syncingRates || loading ? "wait" : "pointer",
+              lineHeight: 1.1,
+              opacity: syncingRates || loading ? 0.7 : 1,
+            }}
+            title="Sync shift rates from All Shifts"
+          >
+            {syncingRates ? "Syncing Rates..." : "Sync Rates"}
+          </button>
+
+          <button
+            onClick={downloadPayrollCsv}
+            style={{
+              padding: "7px 10px",
+              borderRadius: 10,
+              border: `1px solid ${UI.border}`,
+              background: UI.panelBg,
+              fontWeight: 950,
+              fontSize: 12,
+              cursor: "pointer",
+              lineHeight: 1.1,
+            }}
+            title="Download payroll CSV"
+          >
+            Export CSV
+          </button>
+          <select
+            value={week}
+            onChange={(e) => setWeek(e.target.value as WeekKind)}
+            style={{
+              padding: "7px 10px",
+              borderRadius: 10,
+              border: `1px solid ${UI.border}`,
+              background: UI.panelBg,
+              fontWeight: 900,
+              fontSize: 12,
+              cursor: "pointer",
+              lineHeight: 1.1,
+            }}
+          >
+            <option value="cw">This Week</option>
+            <option value="nw">Next Week</option>
+          </select>
+
+          <a
+            href="/schedule"
+            style={{
+              padding: "7px 10px",
+              borderRadius: 10,
+              border: `1px solid ${UI.border}`,
+              background: UI.panelBg,
+              textDecoration: "none",
+              color: UI.text,
+              fontWeight: 900,
+              fontSize: 12,
+              lineHeight: 1.1,
+            }}
+          >
+            Back to Schedule
+          </a>
+        </div>
+      </div>
+
+            {error && (
           <div
             style={{
               background: UI.panelBg,
@@ -1449,6 +2892,120 @@ export default function BillingPayrollClient() {
           </div>
         )}
 
+      {syncRatesError && (
+        <div
+          style={{
+            background: UI.panelBg,
+            border: `1px solid ${UI.red}`,
+            borderRadius: 12,
+            padding: 12,
+            marginBottom: 12,
+            color: UI.red,
+            fontWeight: 900,
+          }}
+        >
+          {syncRatesError}
+        </div>
+      )}
+
+      {syncRatesSuccess && (
+        <div
+          style={{
+            background: UI.panelBg,
+            border: `1px solid ${UI.green}`,
+            borderRadius: 12,
+            padding: 12,
+            marginBottom: 12,
+            color: UI.green,
+            fontWeight: 900,
+          }}
+        >
+          {syncRatesSuccess}
+        </div>
+      )}
+      {rulesOpen ? (
+        <div
+          style={{
+            background: UI.panelBg,
+            border: `1px solid ${UI.borderSoft}`,
+            borderRadius: 14,
+            padding: 14,
+            marginBottom: 12,
+          }}
+        >
+          <div style={{ fontSize: 16, fontWeight: 950 }}>Rules Used This Week</div>
+          <div style={{ marginTop: 6, color: UI.textDim, fontSize: 13 }}>
+            Showing distinct applied rules found in the loaded shift-rate data for this week.
+          </div>
+
+          <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
+            {weeklyRules.length ? (
+              weeklyRules.map((rule) => (
+                <div
+                  key={rule.ruleId}
+                  style={{
+                    border: `1px solid ${UI.borderSoft}`,
+                    borderRadius: 12,
+                    padding: 12,
+                    background: UI.headerBg,
+                  }}
+                >
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                    <div style={{ fontWeight: 950 }}>{rule.ruleName || rule.ruleId}</div>
+                    <Pill
+                      text={rule.ruleType || "Rule"}
+                      bg="rgba(124,58,237,0.10)"
+                      color={UI.purple}
+                    />
+                    <Pill
+                      text={`Priority ${rule.priority || "—"}`}
+                      bg="rgba(15,23,42,0.08)"
+                      color={UI.slate}
+                    />
+                    <Pill
+                      text={yesNoLabel(rule.active) === "Yes" ? "Active" : "Inactive"}
+                      bg={
+                        yesNoLabel(rule.active) === "Yes"
+                          ? "rgba(34,197,94,0.10)"
+                          : "rgba(148,163,184,0.16)"
+                      }
+                      color={
+                        yesNoLabel(rule.active) === "Yes" ? "#166534" : "#475569"
+                      }
+                    />
+                  </div>
+
+                  <div
+                    style={{
+                      marginTop: 8,
+                      display: "grid",
+                      gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+                      gap: 8,
+                      fontSize: 12.5,
+                    }}
+                  >
+                    <div><b>ID:</b> {rule.ruleId || "—"}</div>
+                    <div><b>Mode:</b> {rule.rateMode || "—"}</div>
+                    <div><b>Client:</b> {rule.client || "—"}</div>
+                    <div><b>Caregiver:</b> {rule.caregiverId || "—"}</div>
+                    <div><b>Shift Type:</b> {rule.shiftType || "—"}</div>
+                    <div><b>Holiday:</b> {rule.holidayRule || "—"}</div>
+                    <div><b>Start:</b> {rule.startDate || "—"}</div>
+                    <div><b>End:</b> {rule.endDate || "—"}</div>
+                    <div><b>Pay Rate:</b> {rule.payRate || "—"}</div>
+                    <div><b>Add Amount:</b> {rule.addAmount || "—"}</div>
+                    <div><b>Approval:</b> {yesNoLabel(rule.requiresApproval)}</div>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div style={{ color: UI.textDim, fontSize: 13 }}>
+                No applied rules were found in the loaded shift-rate data for this week.
+              </div>
+            )}
+          </div>
+        </div>
+      ) : null}
         {loading ? (
           <div style={{ background: UI.panelBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 12, padding: 16 }}>
             Loading…
@@ -1457,18 +3014,18 @@ export default function BillingPayrollClient() {
           <>
             {/* BILLING VIEW */}
             {viewMode === "billing" ? (
-              <div style={{ background: UI.panelBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 16 }}>
-                <div
-                  style={{
-                    padding: 12,
-                    borderBottom: `1px solid ${UI.borderSoft}`,
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    gap: 12,
-                    flexWrap: "wrap",
-                  }}
-                >
+              <div style={{ background: UI.panelBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 14 }}>
+  <div
+    style={{
+      padding: 10,
+      borderBottom: `1px solid ${UI.borderSoft}`,
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      gap: 10,
+      flexWrap: "wrap",
+    }}
+  >
                   <div>
                     <div style={{ fontSize: 16, fontWeight: 950 }}>Client Billing Report</div>
                     <div style={{ color: UI.textDim, fontSize: 13, marginTop: 6 }}>
@@ -1504,23 +3061,23 @@ export default function BillingPayrollClient() {
                           "Adj (+/-)",
                           "Estimated Charge",
                         ].map((h) => (
-                          <th
-                            key={h}
-                            style={{
-                              textAlign: "left",
-                              padding: 10,
-                              fontSize: 12,
-                              color: UI.textDim,
-                              background: UI.headerBg,
-                              borderBottom: `1px solid ${UI.borderSoft}`,
-                              position: "sticky",
-                              top: 0,
-                              zIndex: 2,
-                              whiteSpace: "nowrap",
-                            }}
-                          >
-                            {h}
-                          </th>
+                         <th
+  key={h}
+  style={{
+    textAlign: "left",
+    padding: "7px 8px",
+    fontSize: 11,
+    color: UI.textDim,
+    background: UI.headerBg,
+    borderBottom: `1px solid ${UI.borderSoft}`,
+    position: "sticky",
+    top: 0,
+    zIndex: 2,
+    whiteSpace: "nowrap",
+  }}
+>
+  {h}
+</th>
                         ))}
                       </tr>
                     </thead>
@@ -1539,7 +3096,7 @@ export default function BillingPayrollClient() {
                         return (
                           <React.Fragment key={r.clientKey}>
                             <tr>
-                              <td style={{ padding: 10, borderBottom: `1px solid ${UI.borderSoft}`, fontWeight: 950 }}>
+                            <td style={{ padding: "7px 8px", borderBottom: `1px solid ${UI.borderSoft}`, fontWeight: 950, verticalAlign: "middle" }}>
                                 <button
                                   onClick={() =>
                                     setExpandedClients((prev) => ({ ...prev, [r.clientKey]: !prev[r.clientKey] }))
@@ -1564,9 +3121,9 @@ export default function BillingPayrollClient() {
                                   >
                                     {open ? "▾" : "▸"}
                                   </span>
-                                  <span style={{ color: finished ? UI.green : UI.text }}>
-                                    {r.client}
-                                  </span>
+                               <span style={{ color: finished ? UI.green : UI.text, fontSize: 13.5 }}>
+  {r.client}
+</span>
                                   {finished ? (
                                     <span style={{ marginLeft: 8 }}>
                                       <Pill text="Finished" bg="rgba(34,197,94,0.14)" color="#065f46" />
@@ -1650,38 +3207,37 @@ export default function BillingPayrollClient() {
 
                             {open ? (
                               <tr>
-                                <td colSpan={7} style={{ padding: 0, borderBottom: `1px solid ${UI.borderSoft}` }}>
-                                  <div style={{ padding: 12 }}>
-                                    <div style={{ border: `1px solid ${UI.borderSoft}`, borderRadius: 12, overflow: "hidden" }}>
+  <td colSpan={7} style={{ padding: 0, borderBottom: `1px solid ${UI.borderSoft}` }}>
+    <div style={{ padding: 6 }}>
+      <div style={{ border: `1px solid ${UI.borderSoft}`, borderRadius: 8, overflow: "hidden" }}>
                                       <div style={{ overflowX: "auto" }}>
                                         <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 0 }}>
                                           <thead>
                                             <tr>
                                               {["Date", "Caregiver", "Time (adjustable)", "Confirm", "Actions"].map((h) => (
-                                                <th
-                                                  key={h}
-                                                  style={{
-                                                    textAlign: "left",
-                                                    padding: 10,
-                                                    fontSize: 12,
-                                                    color: UI.textDim,
-                                                    background: UI.headerBg,
-                                                    borderBottom: `1px solid ${UI.borderSoft}`,
-                                                    whiteSpace: "nowrap",
-                                                  }}
-                                                >
-                                                  {h}
-                                                </th>
+                                               <th
+  key={h}
+  style={{
+    textAlign: "left",
+    padding: "6px 7px",
+    fontSize: 11,
+    color: UI.textDim,
+    background: UI.headerBg,
+    borderBottom: `1px solid ${UI.borderSoft}`,
+    whiteSpace: "nowrap",
+  }}
+>
+  {h}
+</th>
                                               ))}
                                             </tr>
                                           </thead>
                                           <tbody>
-                                            {clientShifts.map((s) => {
-                                              const id = norm(s.shiftId);
-                                              const ev = evalByShiftId[id];
-                                              const state = effectiveConfirmState(id, ev);
-
-                                              const badge =
+                                           {clientShifts.map((s) => {
+  const id = norm(s.shiftId);
+  const ev = evalByShiftId[id];
+  const state = effectiveConfirmState(id, ev);
+  const badge =
                                                 state === "confirmed" ? (
                                                   <Pill text="Confirmed" bg={UI.green} />
                                                 ) : state === "flagged" ? (
@@ -1697,36 +3253,37 @@ export default function BillingPayrollClient() {
 
                                               return (
                                                 <tr key={s.shiftId}>
-                                                  <td style={{ padding: 10, borderBottom: `1px solid ${UI.borderSoft}`, whiteSpace: "nowrap" }}>
-                                                    {s.date}
-                                                  </td>
+                                                 <td style={{ padding: "6px 7px", borderBottom: `1px solid ${UI.borderSoft}`, whiteSpace: "nowrap", fontSize: 12.5 }}>
+  {s.date}
+</td>
 
                                                   <td
-                                                    style={{ padding: 10, borderBottom: `1px solid ${UI.borderSoft}`, fontWeight: 900 }}
-                                                    title={cgNos && cgNos !== cgFull ? `Name on schedule: ${cgNos}` : undefined}
-                                                  >
-                                                    {cgFull}
-                                                  </td>
+  style={{ padding: "6px 7px", borderBottom: `1px solid ${UI.borderSoft}`, fontWeight: 900, fontSize: 12.5, verticalAlign: "middle" }}
+  title={cgNos && cgNos !== cgFull ? `Name on schedule: ${cgNos}` : undefined}
+>
+  {cgFull}
+</td>
 
-                                                  <td style={{ padding: 10, borderBottom: `1px solid ${UI.borderSoft}`, whiteSpace: "nowrap" }}>
-                                                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                                                      <select
-                                                        value={timeOverrideByShiftId[id]?.startTime ?? s.startTime}
-                                                        onChange={(e) =>
-                                                          setShiftTimeLocal(id, {
-                                                            startTime: e.target.value,
-                                                            endTime: timeOverrideByShiftId[id]?.endTime ?? s.endTime,
-                                                          })
-                                                        }
-                                                        style={{
-                                                          padding: "6px 8px",
-                                                          borderRadius: 10,
-                                                          border: `1px solid ${UI.border}`,
-                                                          background: UI.panelBg,
-                                                          fontWeight: 800,
-                                                          cursor: "pointer",
-                                                        }}
-                                                      >
+                                                  <td style={{ padding: "6px 7px", borderBottom: `1px solid ${UI.borderSoft}`, whiteSpace: "nowrap", verticalAlign: "middle" }}>
+  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+    <select
+      value={timeOverrideByShiftId[id]?.startTime ?? s.startTime}
+      onChange={(e) =>
+        setShiftTimeLocal(id, {
+          startTime: e.target.value,
+          endTime: timeOverrideByShiftId[id]?.endTime ?? s.endTime,
+        })
+      }
+      style={{
+        padding: "4px 6px",
+        borderRadius: 8,
+        border: `1px solid ${UI.border}`,
+        background: UI.panelBg,
+        fontWeight: 800,
+        fontSize: 12,
+        cursor: "pointer",
+      }}
+    >
                                                         {timeOptions.map((opt) => (
                                                           <option key={opt.value} value={opt.value}>
                                                             {opt.label}
@@ -1835,25 +3392,27 @@ export default function BillingPayrollClient() {
 
             {/* PAYROLL VIEW */}
             {viewMode === "payroll" ? (
-              <div style={{ background: UI.panelBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 16 }}>
-                <div
-                  style={{
-                    padding: 12,
-                    borderBottom: `1px solid ${UI.borderSoft}`,
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    gap: 12,
-                    flexWrap: "wrap",
-                  }}
-                >
+             <div style={{ background: UI.panelBg, border: `1px solid ${UI.borderSoft}`, borderRadius: 14 }}>
+  <div
+    style={{
+      padding: 10,
+      borderBottom: `1px solid ${UI.borderSoft}`,
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      gap: 10,
+      flexWrap: "wrap",
+    }}
+  >
                   <div>
                     <div style={{ fontSize: 16, fontWeight: 950 }}>Payroll Report</div>
-                    <div style={{ color: UI.textDim, fontSize: 13, marginTop: 6 }}>
+                                        <div style={{ color: UI.textDim, fontSize: 13, marginTop: 6 }}>
                       Totals:{" "}
+                      <b style={{ color: UI.slate }}>{payrollTotals.regularHours.toFixed(2)}</b> regular hrs ·{" "}
+                      <b style={{ color: UI.orange }}>{payrollTotals.overtimeHours.toFixed(2)}</b> OT hrs ·{" "}
                       <b style={{ color: UI.green }}>{payrollTotals.confirmedHours.toFixed(2)}</b> confirmed hrs ·{" "}
                       <b style={{ color: UI.red }}>{payrollTotals.flaggedHours.toFixed(2)}</b> flagged hrs ·{" "}
-                      <b style={{ color: UI.slate }}>{money(payrollTotals.payDue)}</b>{" "}
+                      <b style={{ color: UI.slate }}>{money(payrollTotals.payDue)}</b>
                       {payrollTotals.flaggedShifts ? (
                         <span style={{ marginLeft: 10 }}>
                           · <b style={{ color: UI.red }}>{payrollTotals.flaggedShifts}</b> flagged shifts
@@ -1865,13 +3424,15 @@ export default function BillingPayrollClient() {
                   <MiniSearch value={payrollSearch} onChange={setPayrollSearch} placeholder="Search caregivers…" />
                 </div>
 
-                <div style={{ padding: 12, color: UI.textDim, fontSize: 13 }}>
-                  Default view is summary-only. Expand a caregiver to see shifts.
-                </div>
+               <div style={{ padding: "8px 10px", color: UI.textDim, fontSize: 12 }}>
+  Default view is summary-only. Expand a caregiver to see shifts.
+</div>
 
-                <div style={{ display: "grid", gap: 12, padding: 12 }}>
-                  {payrollGroups.map((g) => {
+<div style={{ display: "grid", gap: 10, padding: 10 }}>
+                                   {payrollGroups.map((g) => {
                     const caregiverScheduled = g.shifts.reduce((a, s) => a + s.durationHours, 0);
+                    const caregiverRegular = g.shifts.reduce((a, s) => a + s.regularHours, 0);
+                    const caregiverOvertime = g.shifts.reduce((a, s) => a + s.overtimeHours, 0);
                     const caregiverConfirmed = g.shifts.reduce(
                       (a, s) => a + (s.confirmState === "confirmed" ? s.durationHours : 0),
                       0
@@ -1880,331 +3441,524 @@ export default function BillingPayrollClient() {
                       (a, s) => a + (s.confirmState === "flagged" ? s.durationHours : 0),
                       0
                     );
-                    const flaggedCount = g.shifts.reduce((a, s) => a + (s.confirmState === "flagged" ? 1 : 0), 0);
-                    const caregiverPay = g.shifts.reduce((a, s) => a + s.payDue, 0);
-
+                    const flaggedCount = g.shifts.reduce(
+                      (a, s) => a + (s.confirmState === "flagged" ? 1 : 0),
+                      0
+                    );
+                                       const caregiverPay = g.shifts.reduce((a, s) => a + s.payDue, 0);
+                    const payrollMessageEntry = payrollMessagesByCaregiver[g.caregiverId];
+                    const caregiverPayrollMessages = payrollMessageEntry?.messages || [];
+                    const caregiverPayrollMessageCount = payrollMessageEntry?.count || 0;
                     const open = !!expandedCaregivers[g.caregiverId];
                     const finished = isCaregiverFinished(g);
-
                     return (
                       <div
-                        key={g.caregiverId}
-                        style={{
-                          border: `1px solid ${UI.borderSoft}`,
-                          borderRadius: 14,
-                          overflow: "hidden",
-                        }}
-                      >
-                        <button
-                          onClick={() =>
-                            setExpandedCaregivers((prev) => ({ ...prev, [g.caregiverId]: !prev[g.caregiverId] }))
-                          }
-                          style={{
-                            all: "unset",
-                            cursor: "pointer",
-                            display: "flex",
-                            width: "100%",
-                            padding: 12,
-                            alignItems: "flex-start",
-                            justifyContent: "flex-start",
-                            gap: 12,
-                            borderBottom: open ? `1px solid ${UI.borderSoft}` : "none",
-                          }}
-                          title="Show shifts"
-                        >
-                          {/* Left: arrow + name + pills + metrics (moved left so it always shows) */}
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                              <span style={{ width: 16, textAlign: "center", color: UI.textDim, fontWeight: 950 }}>
-                                {open ? "▾" : "▸"}
-                              </span>
+  key={g.caregiverId}
+  style={{
+    border: `1px solid ${UI.borderSoft}`,
+    borderRadius: 10,
+    overflow: "hidden",
+  }}
+>
+  <button
+    onClick={() =>
+      setExpandedCaregivers((prev) => ({ ...prev, [g.caregiverId]: !prev[g.caregiverId] }))
+    }
+    style={{
+      all: "unset",
+      cursor: "pointer",
+      display: "flex",
+      width: "100%",
+      padding: "8px 10px",
+      alignItems: "flex-start",
+      justifyContent: "flex-start",
+      gap: 10,
+      borderBottom: open ? `1px solid ${UI.borderSoft}` : "none",
+    }}
+    title="Show shifts"
+  >
+    <div style={{ flex: 1, minWidth: 0 }}>
+           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+        <span style={{ width: 16, textAlign: "center", color: UI.textDim, fontWeight: 950 }}>
+          {open ? "▾" : "▸"}
+        </span>
 
-                              <span
-                                title={g.nameOnSchedule ? `Name on schedule: ${g.nameOnSchedule}` : undefined}
-                                style={{
-                                  fontWeight: 950,
-                                  color: finished ? UI.green : UI.text,
-                                }}
-                              >
-                                {g.caregiverLabel}
-                              </span>
+        <span
+          title={g.nameOnSchedule ? `Name on schedule: ${g.nameOnSchedule}` : undefined}
+          style={{
+            fontWeight: 950,
+            color: finished ? UI.green : UI.text,
+          }}
+        >
+          {g.caregiverLabel}
+        </span>
 
-                              {finished ? (
-                                <Pill text="Finished" bg="rgba(34,197,94,0.14)" color="#065f46" />
-                              ) : null}
+        {finished ? (
+          <Pill text="Finished" bg="rgba(22,101,52,0.12)" color="#166534" />
+        ) : null}
 
-                              {!g.hasProfile ? (
-                                <Pill
-                                  text="No profile"
-                                  bg="rgba(245,158,11,0.18)"
-                                  color="#7c2d12"
-                                  title="This caregiver is on the schedule but not in the Caregivers sheet."
-                                />
-                              ) : null}
+        {!g.hasProfile ? (
+          <Pill
+            text="No profile"
+            bg="rgba(245,158,11,0.18)"
+            color="#7c2d12"
+            title="This caregiver is on the schedule but not in the Caregivers sheet."
+          />
+        ) : null}
 
-                              {flaggedCount ? (
-                                <Pill text={`${flaggedCount} flagged`} bg="rgba(239,68,68,0.14)" color="#991b1b" />
-                              ) : null}
-                            </div>
+        <Pill
+          text={`${caregiverScheduled.toFixed(2)}h scheduled`}
+          bg="rgba(15,23,42,0.08)"
+          color={UI.slate}
+        />
 
-                            <div style={{ marginTop: 6, color: UI.textDim, fontSize: 13 }}>
-                              <b style={{ color: UI.green }}>{caregiverConfirmed.toFixed(2)}</b> confirmed ·{" "}
-                              <b style={{ color: UI.red }}>{caregiverFlagged.toFixed(2)}</b> flagged ·{" "}
-                              <b style={{ color: UI.slate }}>{caregiverScheduled.toFixed(2)}</b> scheduled ·{" "}
-                              <b style={{ color: UI.slate }}>{money(caregiverPay)}</b>
-                            </div>
+        <Pill
+          text={`OT ${caregiverOvertime.toFixed(2)}h`}
+          bg="rgba(245,158,11,0.14)"
+          color="#9a3412"
+        />
+
+        <Pill
+          text={`${caregiverConfirmed.toFixed(2)}h confirmed`}
+          bg="rgba(34,197,94,0.12)"
+          color="#166534"
+        />
+
+              {flaggedCount ? (
+          <Pill
+            text={`${flaggedCount} flagged`}
+            bg="rgba(239,68,68,0.14)"
+            color="#991b1b"
+          />
+        ) : null}
+
+        <Pill
+          text={`💬 ${caregiverPayrollMessageCount}`}
+          bg={
+            caregiverPayrollMessageCount
+              ? "rgba(124,58,237,0.12)"
+              : "rgba(15,23,42,0.06)"
+          }
+          color={caregiverPayrollMessageCount ? UI.purple : UI.textDim}
+          title="Payroll messages sent by this caregiver during the selected week"
+        />
+
+        <Pill
+          text={money(caregiverPay)}
+          bg="rgba(15,23,42,0.08)"
+          color={UI.slate}
+        />
+      </div>
+
+      <div style={{ marginTop: 4, color: UI.textDim, fontSize: 12, lineHeight: 1.3 }}>
+        <b style={{ color: UI.red }}>{caregiverFlagged.toFixed(2)}</b> flagged hrs
+      </div>
                           </div>
                         </button>
 
-                        {open ? (
-                          <div style={{ overflowX: "auto" }}>
-                            <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 0 }}>
-                              <thead>
-                                <tr>
+                                           {open ? (
+                          <div style={{ display: "grid", gap: 12 }}>
+                            <div style={{ overflowX: "auto" }}>
+                              <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 0 }}>
+                                <thead>
+                                  <tr>
                                   {[
-                                    "Date",
-                                    "Client",
-                                    "Time (adjustable)",
-                                    "Confirm",
-                                    "Why (if flagged)",
-                                    "Pay Rate ($/hr) (default $16)",
-                                    "Pay Due",
-                                    "Actions",
-                                  ].map((h) => (
-                                    <th
-                                      key={h}
-                                      style={{
-                                        textAlign: "left",
-                                        padding: 10,
-                                        fontSize: 12,
-                                        color: UI.textDim,
-                                        background: UI.headerBg,
-                                        borderBottom: `1px solid ${UI.borderSoft}`,
-                                        whiteSpace: "nowrap",
-                                      }}
-                                    >
-                                      {h}
-                                    </th>
-                                  ))}
-                                </tr>
-                              </thead>
-
+    "Date",
+    "Client",
+    "Time",
+    "Confirm",
+    "Shift Flags",
+    "Pay Rate / Rule Details",
+    "Pay Due",
+    "Actions",
+  ].map((h) => (
+                                     <th
+    key={h}
+    style={{
+      textAlign: "left",
+      padding: "6px 7px",
+      fontSize: 11,
+      color: UI.textDim,
+      background: UI.headerBg,
+      borderBottom: `1px solid ${UI.borderSoft}`,
+      whiteSpace: "nowrap",
+    }}
+  >
+    {h}
+  </th>
+                                    ))}
+                                  </tr>
+                                </thead>
                               <tbody>
-                                {g.shifts.map((s) => {
-                                  const id = norm(s.shiftId);
-                                  const ev = evalByShiftId[id];
-                                  const state = s.confirmState;
+                              {g.shifts.map((s) => {
+  const id = norm(s.shiftId);
+  const state = s.confirmState;
+  const rateMeta = shiftRateMetaByShift[id];
+  const approvalPill = getApprovalPill(rateMeta);
+  const simpleReasons = summarizeReasons(s.reasons);
 
-                                  const badge =
-                                    state === "confirmed" ? (
-                                      <Pill text="Confirmed" bg={UI.green} />
-                                    ) : state === "flagged" ? (
-                                      <Pill text="Flagged" bg={UI.red} />
-                                    ) : state === "future" ? (
-                                      <Pill text="Future" bg="rgba(148,163,184,0.75)" color="#0f172a" />
-                                    ) : (
-                                      <Pill text="Unknown" bg="rgba(100,116,139,0.75)" color="#0f172a" />
-                                    );
+  const rowBg =
+    state === "confirmed"
+      ? "rgba(22,101,52,0.06)"
+      : state === "flagged"
+      ? "rgba(239,68,68,0.06)"
+      : "transparent";
 
-                                  const rowBg =
-                                    state === "confirmed"
-                                      ? "rgba(34,197,94,0.06)"
-                                      : state === "flagged"
-                                      ? "rgba(239,68,68,0.06)"
-                                      : "transparent";
+  return (
+    <tr key={s.shiftId} style={{ background: rowBg }}>
+      <td
+        style={{
+          padding: "6px 7px",
+          borderBottom: `1px solid ${UI.borderSoft}`,
+          whiteSpace: "nowrap",
+          fontSize: 12.5,
+          verticalAlign: "top",
+        }}
+      >
+        {s.date}
+      </td>
 
-                                  return (
-                                    <tr key={s.shiftId} style={{ background: rowBg }}>
-                                      <td style={{ padding: 10, borderBottom: `1px solid ${UI.borderSoft}`, whiteSpace: "nowrap" }}>
-                                        {s.date}
-                                      </td>
+      <td
+        style={{
+          padding: "6px 7px",
+          borderBottom: `1px solid ${UI.borderSoft}`,
+          verticalAlign: "top",
+        }}
+      >
+        <div style={{ fontWeight: 900, fontSize: 14.5, lineHeight: 1.2 }}>
+          {s.client}
+        </div>
+      </td>
 
-                                      <td style={{ padding: 10, borderBottom: `1px solid ${UI.borderSoft}`, fontWeight: 900 }}>
-                                        {s.client}
-                                      </td>
+      <td
+        style={{
+          padding: "6px 7px",
+          borderBottom: `1px solid ${UI.borderSoft}`,
+          whiteSpace: "nowrap",
+          verticalAlign: "top",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            gap: 6,
+            flexWrap: "wrap",
+            alignItems: "center",
+          }}
+        >
+          <select
+            value={timeOverrideByShiftId[id]?.startTime ?? s.startTime}
+            onChange={(e) =>
+              setShiftTimeLocal(id, {
+                startTime: e.target.value,
+                endTime: timeOverrideByShiftId[id]?.endTime ?? s.endTime,
+              })
+            }
+            style={{
+              padding: "4px 6px",
+              borderRadius: 8,
+              border: `1px solid ${UI.border}`,
+              background: UI.panelBg,
+              fontWeight: 900,
+              fontSize: 13.5,
+              cursor: "pointer",
+            }}
+          >
+            {timeOptions.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
 
-                                      <td style={{ padding: 10, borderBottom: `1px solid ${UI.borderSoft}`, whiteSpace: "nowrap" }}>
-                                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                                          <select
-                                            value={timeOverrideByShiftId[id]?.startTime ?? s.startTime}
-                                            onChange={(e) =>
-                                              setShiftTimeLocal(id, {
-                                                startTime: e.target.value,
-                                                endTime: timeOverrideByShiftId[id]?.endTime ?? s.endTime,
-                                              })
-                                            }
-                                            style={{
-                                              padding: "6px 8px",
-                                              borderRadius: 10,
-                                              border: `1px solid ${UI.border}`,
-                                              background: UI.panelBg,
-                                              fontWeight: 800,
-                                              cursor: "pointer",
-                                            }}
-                                          >
-                                            {timeOptions.map((opt) => (
-                                              <option key={opt.value} value={opt.value}>
-                                                {opt.label}
-                                              </option>
-                                            ))}
-                                          </select>
+          <span style={{ color: UI.textDim, fontWeight: 900 }}>–</span>
 
-                                          <span style={{ color: UI.textDim, fontWeight: 900 }}>–</span>
+          <select
+            value={timeOverrideByShiftId[id]?.endTime ?? s.endTime}
+            onChange={(e) =>
+              setShiftTimeLocal(id, {
+                startTime: timeOverrideByShiftId[id]?.startTime ?? s.startTime,
+                endTime: e.target.value,
+              })
+            }
+            style={{
+              padding: "4px 6px",
+              borderRadius: 8,
+              border: `1px solid ${UI.border}`,
+              background: UI.panelBg,
+              fontWeight: 900,
+              fontSize: 13.5,
+              cursor: "pointer",
+            }}
+          >
+            {timeOptions.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
 
-                                          <select
-                                            value={timeOverrideByShiftId[id]?.endTime ?? s.endTime}
-                                            onChange={(e) =>
-                                              setShiftTimeLocal(id, {
-                                                startTime: timeOverrideByShiftId[id]?.startTime ?? s.startTime,
-                                                endTime: e.target.value,
-                                              })
-                                            }
-                                            style={{
-                                              padding: "6px 8px",
-                                              borderRadius: 10,
-                                              border: `1px solid ${UI.border}`,
-                                              background: UI.panelBg,
-                                              fontWeight: 800,
-                                              cursor: "pointer",
-                                            }}
-                                          >
-                                            {timeOptions.map((opt) => (
-                                              <option key={opt.value} value={opt.value}>
-                                                {opt.label}
-                                              </option>
-                                            ))}
-                                          </select>
+          <span style={{ color: UI.textDim, fontWeight: 900, fontSize: 12 }}>
+            ({s.durationHours.toFixed(2)}h)
+          </span>
+        </div>
+      </td>
 
-                                          <span style={{ color: UI.textDim, fontWeight: 900 }}>
-                                            (
-                                            {hoursBetween(
-                                              timeOverrideByShiftId[id]?.startTime ?? s.startTime,
-                                              timeOverrideByShiftId[id]?.endTime ?? s.endTime
-                                            ).toFixed(2)}
-                                            h)
-                                          </span>
-                                        </div>
-                                      </td>
+      <td
+        style={{
+          padding: "6px 7px",
+          borderBottom: `1px solid ${UI.borderSoft}`,
+          verticalAlign: "top",
+        }}
+      >
+        {state === "confirmed" ? (
+          <Pill
+            text="Confirmed"
+            bg="rgba(22,101,52,0.12)"
+            color="#166534"
+          />
+        ) : state === "flagged" ? (
+          <Pill
+            text="Flagged"
+            bg="rgba(239,68,68,0.10)"
+            color="#991b1b"
+          />
+        ) : state === "future" ? (
+          <Pill
+            text="Future"
+            bg="rgba(148,163,184,0.22)"
+            color="#334155"
+          />
+        ) : (
+          <Pill
+            text="Unknown"
+            bg="rgba(100,116,139,0.18)"
+            color="#334155"
+          />
+        )}
+      </td>
 
-                                      <td style={{ padding: 10, borderBottom: `1px solid ${UI.borderSoft}` }}>
-                                        {badge}
-                                        {s.isManuallyConfirmed ? (
-                                          <span style={{ marginLeft: 8 }}>
-                                            <Pill text="Manual" bg="rgba(2,132,199,0.16)" color="#075985" title="Local override" />
-                                          </span>
-                                        ) : null}
-                                      </td>
+      <td
+        style={{
+          padding: "6px 7px",
+          borderBottom: `1px solid ${UI.borderSoft}`,
+          verticalAlign: "top",
+        }}
+      >
+        {state === "flagged" && simpleReasons.length ? (
+          <ReasonList reasons={simpleReasons} />
+        ) : state === "future" ? (
+          <span
+            style={{ color: UI.textDim, fontWeight: 800, fontSize: 12 }}
+          >
+            Not evaluated yet
+          </span>
+        ) : (
+          <span
+            style={{ color: UI.textDim, fontWeight: 800, fontSize: 12 }}
+          >
+            —
+          </span>
+        )}
+      </td>
 
-                                      <td style={{ padding: 10, borderBottom: `1px solid ${UI.borderSoft}`, minWidth: 280 }}>
-                                        {state === "flagged" ? (
-                                          <div>
-                                            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                                              {s.inVerdict ? (
-                                                <Pill
-                                                  text={`IN: ${verdictLabel(s.inVerdict)}`}
-                                                  bg={
-                                                    isOnSite(s.inVerdict)
-                                                      ? "rgba(34,197,94,0.18)"
-                                                      : isOffSite(s.inVerdict)
-                                                      ? "rgba(239,68,68,0.18)"
-                                                      : "rgba(245,158,11,0.22)"
-                                                  }
-                                                  color={isOnSite(s.inVerdict) ? "#065f46" : "#7c2d12"}
-                                                />
-                                              ) : (
-                                                <Pill text="IN: (no verdict)" bg="rgba(239,68,68,0.14)" color="#991b1b" />
-                                              )}
+      <td
+        style={{
+          padding: "6px 7px",
+          borderBottom: `1px solid ${UI.borderSoft}`,
+          verticalAlign: "top",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 5,
+            minWidth: 240,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              gap: 6,
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
+            <TextInput
+              value={payRateByShift[id] ?? ""}
+              onChange={(v) =>
+                setPayRateByShift((prev) => ({ ...prev, [id]: v }))
+              }
+              placeholder={s.payRate.toFixed(2)}
+              width={88}
+            />
+            <span
+              style={{ color: UI.textDim, fontWeight: 900, fontSize: 12 }}
+            >
+              / hr
+            </span>
+            <Pill
+              text={approvalPill.text}
+              bg={approvalPill.bg}
+              color={approvalPill.color}
+            />
 
-                                              {s.outVerdict ? (
-                                                <Pill
-                                                  text={`OUT: ${verdictLabel(s.outVerdict)}`}
-                                                  bg={
-                                                    isOnSite(s.outVerdict)
-                                                      ? "rgba(34,197,94,0.18)"
-                                                      : isOffSite(s.outVerdict)
-                                                      ? "rgba(239,68,68,0.18)"
-                                                      : "rgba(245,158,11,0.22)"
-                                                  }
-                                                  color={isOnSite(s.outVerdict) ? "#065f46" : "#7c2d12"}
-                                                />
-                                              ) : (
-                                                <Pill text="OUT: (no verdict)" bg="rgba(239,68,68,0.14)" color="#991b1b" />
-                                              )}
+            <button
+              type="button"
+              onClick={() =>
+                setExpandedRateDetailsByShift((prev) => ({
+                  ...prev,
+                  [id]: !prev[id],
+                }))
+              }
+              style={{
+                border: "none",
+                background: "transparent",
+                padding: 0,
+                color: UI.blue,
+                fontWeight: 900,
+                fontSize: 11.5,
+                cursor: "pointer",
+              }}
+            >
+              {expandedRateDetailsByShift[id]
+                ? "Hide details"
+                : "View details"}
+            </button>
+          </div>
 
-                                              {s.diffInMin != null ? (
-                                                <Pill
-                                                  text={`ΔIN ${s.diffInMin}m`}
-                                                  bg={Math.abs(s.diffInMin) <= 15 ? "rgba(34,197,94,0.18)" : "rgba(239,68,68,0.18)"}
-                                                  color={Math.abs(s.diffInMin) <= 15 ? "#065f46" : "#991b1b"}
-                                                />
-                                              ) : (
-                                                <Pill text="ΔIN —" bg="rgba(239,68,68,0.14)" color="#991b1b" />
-                                              )}
+          {expandedRateDetailsByShift[id] ? (
+            <div
+              style={{
+                border: `1px solid ${UI.borderSoft}`,
+                borderRadius: 8,
+                background: UI.headerBg,
+                padding: 8,
+                display: "grid",
+                gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                gap: "4px 10px",
+                fontSize: 11,
+                lineHeight: 1.25,
+                color: UI.textDim,
+              }}
+            >
+              <div>
+                <b style={{ color: UI.text }}>Final:</b> $
+                {rateMeta?.finalRate || "—"}
+              </div>
+              <div>
+                <b style={{ color: UI.text }}>Base:</b> $
+                {rateMeta?.baseRate || "—"}
+              </div>
+              <div>
+                <b style={{ color: UI.text }}>Add:</b> $
+                {rateMeta?.addOnTotal || "0.00"}
+              </div>
+              <div>
+                <b style={{ color: UI.text }}>Req. approval:</b>{" "}
+                {yesNoLabel(rateMeta?.requiresApprovalFromRules || "")}
+              </div>
+              <div>
+                <b style={{ color: UI.text }}>Source:</b>{" "}
+                {rateMeta?.rateSource || "—"}
+              </div>
+              <div>
+                <b style={{ color: UI.text }}>Rule count:</b>{" "}
+                {rateMeta?.appliedRuleIds?.length || 0}
+              </div>
+              <div style={{ gridColumn: "1 / -1" }}>
+                <b style={{ color: UI.text }}>Rule IDs:</b>{" "}
+                {rateMeta?.appliedRuleIds?.length
+                  ? rateMeta.appliedRuleIds.join(", ")
+                  : "—"}
+              </div>
+              <div style={{ gridColumn: "1 / -1" }}>
+                <b style={{ color: UI.text }}>Rule summary:</b>{" "}
+                {rateMeta?.appliedRuleSummary || "—"}
+              </div>
+              <div>
+                <b style={{ color: UI.text }}>Updated by:</b>{" "}
+                {rateMeta?.updatedBy || "—"}
+              </div>
+              <div>
+                <b style={{ color: UI.text }}>Updated at:</b>{" "}
+                {formatAuditDate(rateMeta?.updatedAt || "")}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      </td>
 
-                                              {s.diffOutMin != null ? (
-                                                <Pill
-                                                  text={`ΔOUT ${s.diffOutMin}m`}
-                                                  bg={Math.abs(s.diffOutMin) <= 15 ? "rgba(34,197,94,0.18)" : "rgba(239,68,68,0.18)"}
-                                                  color={Math.abs(s.diffOutMin) <= 15 ? "#065f46" : "#991b1b"}
-                                                />
-                                              ) : (
-                                                <Pill text="ΔOUT —" bg="rgba(239,68,68,0.14)" color="#991b1b" />
-                                              )}
-                                            </div>
+      <td
+        style={{
+          padding: "6px 7px",
+          borderBottom: `1px solid ${UI.borderSoft}`,
+          verticalAlign: "top",
+        }}
+      >
+        <TextInput
+          value={payDueOverrideByShiftId[id] ?? s.payDue.toFixed(2)}
+          onChange={(v) =>
+            setPayDueOverrideByShiftId((prev) => ({
+              ...prev,
+              [id]: v,
+            }))
+          }
+          width={96}
+          textAlign="right"
+        />
+      </td>
 
-                                            <ReasonList reasons={s.reasons} />
-                                          </div>
-                                        ) : state === "confirmed" ? (
-                                          <span style={{ color: UI.green, fontWeight: 900 }}>✓ 15m + on-site + both clocks</span>
-                                        ) : state === "future" ? (
-                                          <span style={{ color: UI.textDim, fontWeight: 900 }}>Not evaluated yet</span>
-                                        ) : (
-                                          <span style={{ color: UI.textDim, fontWeight: 900 }}>—</span>
-                                        )}
-                                      </td>
+      <td
+        style={{
+          padding: "6px 7px",
+          borderBottom: `1px solid ${UI.borderSoft}`,
+          verticalAlign: "top",
+        }}
+      >
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {state === "flagged" ? (
+            <button
+              onClick={() => confirmShiftLocal(id)}
+              style={{
+                padding: "6px 8px",
+                borderRadius: 8,
+                border: `1px solid ${UI.green}`,
+                background: "rgba(22,101,52,0.10)",
+                color: "#166534",
+                fontWeight: 900,
+                fontSize: 12,
+                lineHeight: 1.1,
+                cursor: "pointer",
+              }}
+            >
+              Confirm
+            </button>
+          ) : null}
 
-                                      <td style={{ padding: 10, borderBottom: `1px solid ${UI.borderSoft}` }}>
-                                        <TextInput
-                                          value={payRateByShift[s.shiftId] ?? ""}
-                                          onChange={(v) =>
-                                            setPayRateByShift((prev) => ({
-                                              ...prev,
-                                              [s.shiftId]: v,
-                                            }))
-                                          }
-                                          placeholder={`${DEFAULT_EXPORT_PAY_RATE}`}
-                                          width={140}
-                                        />
-                                      </td>
-
-                                      <td style={{ padding: 10, borderBottom: `1px solid ${UI.borderSoft}`, fontWeight: 950 }}>
-                                        {money(s.payDue)}
-                                      </td>
-
-                                      <td style={{ padding: 10, borderBottom: `1px solid ${UI.borderSoft}` }}>
-                                        {state === "flagged" ? (
-                                          <button
-                                            onClick={() => confirmShiftLocal(id)}
-                                            style={{
-                                              padding: "6px 10px",
-                                              borderRadius: 10,
-                                              border: `1px solid ${UI.green}`,
-                                              background: "rgba(34,197,94,0.10)",
-                                              color: UI.green,
-                                              fontWeight: 950,
-                                              cursor: "pointer",
-                                            }}
-                                            title="Local override (does not write to Sheets yet)"
-                                          >
-                                            Confirm shift
-                                          </button>
-                                        ) : (
-                                          <span style={{ color: UI.textDim, fontWeight: 900 }}>—</span>
-                                        )}
-                                      </td>
-                                    </tr>
-                                  );
-                                })}
+          <button
+            onClick={() => saveShiftRate(id)}
+            disabled={!!savingRateByShift[id]}
+            style={{
+              padding: "6px 8px",
+              borderRadius: 8,
+              border: `1px solid ${UI.slate}`,
+              background: UI.slate,
+              color: "#fff",
+              fontWeight: 900,
+              fontSize: 12,
+              lineHeight: 1.1,
+              cursor: savingRateByShift[id] ? "wait" : "pointer",
+            }}
+          >
+            {savingRateByShift[id] ? "Saving..." : "Save rate"}
+          </button>
+        </div>
+      </td>
+    </tr>
+  );
+})}
 
                                 {g.shifts.length === 0 && (
                                   <tr>
@@ -2216,14 +3970,131 @@ export default function BillingPayrollClient() {
                               </tbody>
                             </table>
                           </div>
+
+                                               <div
+                            style={{
+                              margin: "0 10px 10px",
+                              border: `1px solid ${UI.borderSoft}`,
+                              borderRadius: 10,
+                              overflow: "hidden",
+                              background: UI.panelBg,
+                            }}
+                          >
+                            <div
+                              style={{
+                                padding: "8px 10px",
+                                background: UI.headerBg,
+                                borderBottom: `1px solid ${UI.borderSoft}`,
+                                display: "flex",
+                                justifyContent: "space-between",
+                                alignItems: "center",
+                                gap: 10,
+                                flexWrap: "wrap",
+                              }}
+                            >
+                              <div style={{ fontWeight: 900, color: UI.text }}>
+                                Payroll Messages
+                              </div>
+
+                              <div style={{ fontSize: 12, color: UI.textDim }}>
+                                {payrollMessagesLoading
+                                  ? "Loading..."
+                                  : caregiverPayrollMessageCount
+                                  ? `${caregiverPayrollMessageCount} message${
+                                      caregiverPayrollMessageCount === 1 ? "" : "s"
+                                    }`
+                                  : "No payroll messages"}
+                              </div>
+                            </div>
+
+                            {payrollMessagesError ? (
+                              <div
+                                style={{
+                                  padding: 10,
+                                  fontSize: 12,
+                                  color: "#991b1b",
+                                  background: "rgba(239,68,68,0.06)",
+                                }}
+                              >
+                                {payrollMessagesError}
+                              </div>
+                            ) : caregiverPayrollMessages.length ? (
+                              <div style={{ display: "grid" }}>
+                                {caregiverPayrollMessages.map((msg, idx) => (
+                                  <div
+                                    key={msg.messageId || `${g.caregiverId}-${idx}`}
+                                    style={{
+                                      padding: "10px 12px",
+                                      borderTop:
+                                        idx === 0 ? "none" : `1px solid ${UI.borderSoft}`,
+                                      display: "grid",
+                                      gap: 6,
+                                    }}
+                                  >
+                                    <div
+                                      style={{
+                                        display: "flex",
+                                        justifyContent: "space-between",
+                                        alignItems: "center",
+                                        gap: 10,
+                                        flexWrap: "wrap",
+                                      }}
+                                    >
+                                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                                        <Pill
+                                          text="Payroll"
+                                          bg="rgba(124,58,237,0.12)"
+                                          color={UI.purple}
+                                        />
+                                        {msg.status ? (
+                                          <Pill
+                                            text={msg.status}
+                                            bg="rgba(15,23,42,0.08)"
+                                            color={UI.slate}
+                                          />
+                                        ) : null}
+                                      </div>
+
+                                      <div style={{ fontSize: 12, color: UI.textDim }}>
+                                        {formatPayrollMessageStamp(msg.timestamp)}
+                                      </div>
+                                    </div>
+
+                                    <div
+                                      style={{
+                                        fontSize: 13,
+                                        color: UI.text,
+                                        lineHeight: 1.45,
+                                        whiteSpace: "pre-wrap",
+                                      }}
+                                    >
+                                      {msg.text || "—"}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                                                       ) : (
+                              <div
+                                style={{
+                                  padding: 10,
+                                  fontSize: 12,
+                                  color: UI.textDim,
+                                }}
+                              >
+                                No payroll messages sent by this caregiver during this week.
+                              </div>
+                            )}
+                          </div>
+                        </div>
                         ) : null}
                       </div>
                     );
                   })}
-
-                  {payrollGroups.length === 0 && (
-                    <div style={{ color: UI.textDim, padding: 8 }}>No payroll data found for this week.</div>
-                  )}
+                  {payrollGroups.length === 0 ? (
+                    <div style={{ color: UI.textDim, padding: 8 }}>
+                      No payroll data found for this week.
+                    </div>
+                  ) : null}
                 </div>
               </div>
             ) : null}

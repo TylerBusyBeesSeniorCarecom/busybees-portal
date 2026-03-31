@@ -18,6 +18,17 @@ export type ShiftStatus =
 
 type WeekKind = "cw" | "nw";
 
+export type EditHistoryOpenPayload = {
+  shiftId: string;
+  a1Key: string;
+  clientName: string;
+  dateStr: string;
+  caregiverName: string;
+  startTime: string;
+  endTime: string;
+  status: ShiftStatus;
+  week: WeekKind;
+};
 type ClockEval = {
   state: "good" | "bad" | "none";
   scheduledStart: Date | null;
@@ -848,7 +859,51 @@ function MessageBubbleIcon({ size = 20 }: { size?: number }) {
     </svg>
   );
 }
+function InfoCircleIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle
+        cx="12"
+        cy="12"
+        r="9"
+        stroke="currentColor"
+        strokeWidth="2"
+      />
+      <path
+        d="M12 10.25v5.25"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+      <circle cx="12" cy="7.25" r="1.15" fill="currentColor" />
+    </svg>
+  );
+}
 
+function LightbulbIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M9 18h6"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+      <path
+        d="M10 21h4"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+      <path
+        d="M8.8 14.8C7.7 13.9 7 12.5 7 11a5 5 0 1 1 10 0c0 1.5-.7 2.9-1.8 3.8-.7.6-1.2 1.3-1.5 2.2h-3.4c-.3-.9-.8-1.6-1.5-2.2Z"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
 function formatFriendlyDate(raw: string): string {
   const d = new Date(raw);
   if (Number.isNaN(d.getTime())) return raw;
@@ -890,6 +945,11 @@ export default function ShiftCard({
   sheetColors,
   week,
 
+   // ✅ history/rate affordance
+// The parent can still pass hasEditHistory if needed, but the actual button
+// visibility is now driven by whether this is a real shift with a shiftId.
+hasEditHistory = false,
+onOpenEditHistory,
   // ✅ new: ghost request payload(s) (only used when status === "requested")
   requests,
 
@@ -924,6 +984,8 @@ export default function ShiftCard({
   sheetColors: Record<string, string>;
   week: WeekKind;
 
+    hasEditHistory?: boolean;
+  onOpenEditHistory?: (payload: EditHistoryOpenPayload) => void;
 
   requests?: ServiceRequestGhost[];
   messagesUI?: MessagesUI;
@@ -985,10 +1047,11 @@ const info = canBuildInfo
       endTime: end,
       caregiverName: caregiver || "",
       isCancelled,
+      // caregiverId: undefined,
     })
   : null;
 
-  const shiftId = info?.shiftId ?? "";
+const shiftId = norm(info?.shiftId);
   const clockEval =
     info?.clockEval ??
     ({
@@ -1014,10 +1077,10 @@ const info = canBuildInfo
   const isVerified = Boolean(info?.isVerified) && tState !== "future";
   const showFlag = Boolean(info?.showFlag) && tState !== "future";
 
-   // ✅ show "i" for:
-  // - future real shifts (existing behavior)
-  // - requested/ghost shifts (always, as long as they have times)
-  const showInfoIcon =
+   // ✅ show the lightbulb shift-menu button for:
+// - future real shifts
+// - requested/ghost shifts that have usable times
+const showInfoIcon =
   !isEmpty &&
   !isCancelled &&
   (tState === "future" || isRequested) &&
@@ -1048,8 +1111,16 @@ const info = canBuildInfo
     fg = "#9a3412";                         // orange-brown text
   }
 
-  const hasClockGood = clockEval.state === "good";
+     const hasClockGood = clockEval.state === "good";
 
+  // Show the history/rate icon on every real shift that can load rate/history data.
+// We do not require pre-existing edit history anymore because every real shift
+// should be able to open the combined history + rate modal.
+const showHistoryIcon =
+  !isEmpty &&
+  !isRequestedEmpty &&
+  !isCancelled &&
+  Boolean(shiftId);
    const border = isEmpty
     ? "none"
     : isRequested
@@ -1061,7 +1132,6 @@ const info = canBuildInfo
           : hasClockGood
             ? "2px solid #22c55e"
             : "1px solid rgba(255,255,255,0.35)";
-
   const shadow = isEmpty
     ? "none"
     : isRequested
@@ -1520,6 +1590,30 @@ clientHistoryCache.set(key, { ts: Date.now(), data: cleaned });
   const titleText =
     tState === "future" ? "Click to edit • Double click for shift menu" : "Click to edit • Double click to toggle clocks";
 
+      function handleOpenEditHistory(e: React.MouseEvent | React.KeyboardEvent) {
+  e.preventDefault();
+  e.stopPropagation();
+
+  if (!showHistoryIcon) return;
+  if (!onOpenEditHistory) return;
+  if (!shiftId) return;
+
+  const safeStart = norm(start);
+  const safeEnd = norm(end);
+  if (!safeStart || !safeEnd) return;
+
+  onOpenEditHistory({
+    shiftId,
+    a1Key,
+    clientName,
+    dateStr: dateStrForDow,
+    caregiverName: displayCaregiver,
+    startTime: safeStart,
+    endTime: safeEnd,
+    status,
+    week,
+  });
+}
   /** ---------- Derived data for caregiver list ---------- */
   const histByNameKey = useMemo(() => {
     const m = new Map<string, { count: number; lastDate: string | null }>();
@@ -2094,7 +2188,7 @@ return (
   title={titleText}
   aria-label={`Shift ${a1Key}`}
 >
-  <div
+    <div
     style={{
       background: bg,
       color: fg,
@@ -2118,8 +2212,44 @@ return (
       overflow: "hidden",
     }}
   >
+         {showHistoryIcon && (
+  <button
+    type="button"
+    onClick={handleOpenEditHistory}
+    onDoubleClick={(e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    }}
+    style={{
+      position: "absolute",
+      top: 7,
+      left: 8,
+      width: 22,
+      height: 22,
+      borderRadius: 999,
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
+      fontSize: 13,
+      fontWeight: 950,
+      background: "rgba(255,255,255,0.22)",
+      color: fg,
+      border: "1px solid rgba(255,255,255,0.5)",
+      filter: "drop-shadow(0 1px 0 rgba(0,0,0,0.25))",
+      cursor: "pointer",
+      userSelect: "none",
+      padding: 0,
+      zIndex: 5,
+    }}
+    aria-label="View edit history and rate"
+    title="View edit history and rate"
+  >
+    <InfoCircleIcon size={13} />
+  </button>
+)}
+
           {isEmpty ? (
-            <div
+                       <div
               style={{
                 height: "100%",
                 minHeight: rowIsEmpty ? EMPTY_CELL_HEIGHT : 34,
@@ -2130,6 +2260,7 @@ return (
                 fontWeight: 900,
                 color: "#9ca3af",
                 userSelect: "none",
+                paddingLeft: showHistoryIcon ? 18 : 0,
               }}
             >
               —
@@ -2138,41 +2269,42 @@ return (
             <>
               {isCancelled && <div style={{ fontSize: 12, fontWeight: 950, letterSpacing: 0.2 }}>Cancelled</div>}
 
-              {/* ✅ Future shifts: "i" icon */}
-              {showInfoIcon && (
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    openShiftMenu();
-                  }}
-                  style={{
-                    position: "absolute",
-                    top: 7,
-                    right: 8,
-                    width: 22,
-                    height: 22,
-                    borderRadius: 999,
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    fontSize: 13,
-                    fontWeight: 950,
-                    background: "rgba(255,255,255,0.22)",
-                    color: fg,
-                    border: "1px solid rgba(255,255,255,0.5)",
-                    filter: "drop-shadow(0 1px 0 rgba(0,0,0,0.25))",
-                    cursor: canOpenShiftMenu ? "pointer" : "default",
-                    userSelect: "none",
-                    padding: 0,
-                  }}
-                  aria-label="Shift info"
-                  title="Open shift menu"
-                >
-                  i
-                </button>
-              )}
+              {/* ✅ Future/requested shifts: lightbulb icon for shift suggestions/menu */}
+{showInfoIcon && (
+  <button
+    type="button"
+    onClick={(e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openShiftMenu();
+    }}
+    style={{
+      position: "absolute",
+      top: 7,
+      right: 8,
+      width: 22,
+      height: 22,
+      borderRadius: 999,
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
+      fontSize: 13,
+      fontWeight: 950,
+      background: "rgba(255,255,255,0.22)",
+      color: fg,
+      border: "1px solid rgba(255,255,255,0.5)",
+      filter: "drop-shadow(0 1px 0 rgba(0,0,0,0.25))",
+      cursor: "pointer",
+      userSelect: "none",
+      padding: 0,
+      zIndex: 5,
+    }}
+    aria-label="Open shift suggestions and details"
+    title="Open shift suggestions and details"
+  >
+    <LightbulbIcon size={13} />
+  </button>
+)}
 
               {/* 🚩 (NOT on future shifts) */}
               {showFlag && (
@@ -2219,7 +2351,17 @@ return (
                 </span>
               )}
 
-              <div style={{ fontSize: 12, fontWeight: 950, letterSpacing: 0.2 }}>{displayTime}</div>
+                            <div
+                style={{
+                  fontSize: 12,
+                  fontWeight: 950,
+                  letterSpacing: 0.2,
+                  paddingLeft: showHistoryIcon ? 22 : 0,
+                }}
+              >
+                {displayTime}
+              </div>
+
               <div
                 style={{
                   fontSize: 13,
@@ -2227,6 +2369,7 @@ return (
                   whiteSpace: "nowrap",
                   overflow: "hidden",
                   textOverflow: "ellipsis",
+                  paddingLeft: showHistoryIcon ? 22 : 0,
                 }}
               >
                 {displayCaregiver}

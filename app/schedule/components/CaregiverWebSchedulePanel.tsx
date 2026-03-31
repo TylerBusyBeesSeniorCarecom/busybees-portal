@@ -1,7 +1,6 @@
-// app/schedule/components/CaregiverWebSchedulePanel.tsx
 "use client";
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /** Local util */
 function norm(v: any) {
@@ -21,6 +20,17 @@ function parseMaybeNumber(v: any): number | null {
 }
 function clampNum(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
+}
+
+function isOpenLikeCaregiverName(value: any) {
+  const cleaned = norm(value)
+    .replace(/^["'(]+/, "")
+    .replace(/["')]+$/, "")
+    .replace(/,$/, "")
+    .trim()
+    .toLowerCase();
+
+  return cleaned === "open" || cleaned === "";
 }
 
 /** Robust header matching (same idea as Applicants page normalization) */
@@ -69,6 +79,7 @@ export type ScheduleItem = {
   status: string;
   flagged: boolean;
   hours: number;
+  isDraft?: boolean;
 };
 
 export type CaregiverProfile = {
@@ -130,43 +141,60 @@ type ApplicantMini = {
   reliability?: any;
   firstImpression?: any;
 
-  // ✅ prefer Age directly from sheet (Applicants page writes Age)
   age?: number | null;
-
-  // optional (if present in sheet)
   birthYear?: number | null;
 };
 
+type PanelSnap = "floating" | "left" | "right" | "top" | "bottom";
+
+type FloatingRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
 const UI = {
-  panelBg: "#ffffff",
-  headerBg: "#f9fafb",
-  border: "#d1d5db",
-  borderSoft: "#e5e7eb",
-  text: "#111827",
+  panelBg: "#fffdf7",
+  headerBg: "#fff7db",
+  border: "#d6b24c",
+  borderSoft: "#ecd98e",
+  text: "#1f2937",
   textDim: "#6b7280",
 
-  // tab backgrounds
-  bgCaregivers: "#fef3c7", // yellow
-  bgApplicants: "#dbeafe", // light blue
+  bgCaregivers: "linear-gradient(180deg, #ffe08a 0%, #ffd24d 100%)",
+  bgApplicants: "linear-gradient(180deg, #fff3bf 0%, #ffe08a 100%)",
 
-  chipBg: "#f1f5f9",
-  chipBorder: "#e2e8f0",
-  chipText: "#0f172a",
+  chipBg: "#fff8db",
+  chipBorder: "#e6c75a",
+  chipText: "#4b3b00",
 
-  amberBg: "#fffbeb",
-  amberBorder: "#fde68a",
-  amberText: "#92400e",
+  amberBg: "#fff4cc",
+  amberBorder: "#f4c542",
+  amberText: "#7a5600",
 
-  greenBg: "#ecfdf5",
-  greenBorder: "#a7f3d0",
-  greenText: "#065f46",
+  greenBg: "#e9f9ee",
+  greenBorder: "#7ccf95",
+  greenText: "#166534",
 
   roseBg: "#fff1f2",
-  roseBorder: "#fecdd3",
+  roseBorder: "#f4a7b9",
   roseText: "#9f1239",
+
+  navy: "#16253f",
+  beeGold: "#f4c542",
+  beeGoldDark: "#c79200",
+  sky: "#2f6fed",
+  danger: "#dc2626",
 };
 
 const DOW_LABELS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+const MIN_FLOATING_WIDTH = 320;
+const MAX_FLOATING_WIDTH = 760;
+const MIN_FLOATING_HEIGHT = 360;
+const DEFAULT_FLOATING_HEIGHT = 760;
+const EDGE_GAP = 14;
 
 /** -------- Caregiver schedule color helpers -------- */
 function scheduleStatusKeyFromRowStatus(raw: string): "filled" | "offered" | "considering" | "pending" | "other" {
@@ -192,7 +220,7 @@ function scheduleStatusColor(raw: string): string {
   return SHEET_COLORS[k] || UI.text;
 }
 
-/** -------- Date helpers (match Applicants page behavior) -------- */
+/** -------- Date helpers -------- */
 function parseSheetDate(v: any): Date | null {
   const s = norm(v);
   if (!s) return null;
@@ -217,7 +245,7 @@ function startOfDay(d: Date) {
 }
 function startOfWeekSunday(d: Date) {
   const x = startOfDay(d);
-  const dow = x.getDay(); // 0=Sun
+  const dow = x.getDay();
   x.setDate(x.getDate() - dow);
   return x;
 }
@@ -247,6 +275,47 @@ function formatAgoFromDays(days: number) {
   }
   const m = Math.round((days / 30) * 10) / 10;
   return `${m} month${m === 1 ? "" : "s"} ago`;
+}
+
+function clampRectToViewport(rect: FloatingRect): FloatingRect {
+  if (typeof window === "undefined") return rect;
+
+  const maxWidth = Math.max(MIN_FLOATING_WIDTH, window.innerWidth - EDGE_GAP * 2);
+  const maxHeight = Math.max(MIN_FLOATING_HEIGHT, window.innerHeight - EDGE_GAP * 2);
+
+  const width = clampNum(rect.width, MIN_FLOATING_WIDTH, Math.min(MAX_FLOATING_WIDTH, maxWidth));
+  const height = clampNum(rect.height, MIN_FLOATING_HEIGHT, maxHeight);
+
+  const maxX = Math.max(EDGE_GAP, window.innerWidth - width - EDGE_GAP);
+  const maxY = Math.max(EDGE_GAP, window.innerHeight - height - EDGE_GAP);
+
+  return {
+    x: clampNum(rect.x, EDGE_GAP, maxX),
+    y: clampNum(rect.y, EDGE_GAP, maxY),
+    width,
+    height,
+  };
+}
+
+function getDefaultFloatingRect(width: number): FloatingRect {
+  if (typeof window === "undefined") {
+    return {
+      x: 100,
+      y: 80,
+      width: clampNum(width || 420, MIN_FLOATING_WIDTH, MAX_FLOATING_WIDTH),
+      height: DEFAULT_FLOATING_HEIGHT,
+    };
+  }
+
+  const w = clampNum(width || 420, MIN_FLOATING_WIDTH, Math.min(MAX_FLOATING_WIDTH, window.innerWidth - EDGE_GAP * 2));
+  const h = clampNum(DEFAULT_FLOATING_HEIGHT, MIN_FLOATING_HEIGHT, window.innerHeight - EDGE_GAP * 2);
+
+  return clampRectToViewport({
+    x: window.innerWidth - w - EDGE_GAP,
+    y: EDGE_GAP,
+    width: w,
+    height: h,
+  });
 }
 
 /** -------- Simple chips -------- */
@@ -400,15 +469,16 @@ function DayChip({ label, active, onClick }: { label: string; active: boolean; o
       type="button"
       onClick={onClick}
       style={{
-        border: `1px solid ${active ? "#111827" : UI.border}`,
-        background: active ? "#111827" : UI.panelBg,
+        border: `1px solid ${active ? UI.navy : UI.border}`,
+        background: active ? UI.navy : "rgba(255,255,255,0.92)",
         color: active ? "#fff" : UI.text,
         borderRadius: 999,
-        padding: "6px 10px",
+        padding: "6px 11px",
         fontSize: 12,
         cursor: "pointer",
         fontWeight: 900,
         whiteSpace: "nowrap",
+        boxShadow: active ? "0 4px 10px rgba(22,37,63,0.18)" : "none",
       }}
     >
       {label}
@@ -422,15 +492,16 @@ function TabButton({ label, active, onClick }: { label: string; active: boolean;
       type="button"
       onClick={onClick}
       style={{
-        border: `1px solid ${active ? "#111827" : UI.border}`,
-        background: active ? "#111827" : "#fff",
-        color: active ? "#fff" : UI.text,
+        border: `1px solid ${active ? UI.beeGoldDark : UI.border}`,
+        background: active ? UI.beeGold : "rgba(255,255,255,0.95)",
+        color: active ? UI.navy : UI.text,
         borderRadius: 999,
-        padding: "6px 10px",
+        padding: "7px 12px",
         fontSize: 12,
         cursor: "pointer",
         fontWeight: 950,
         whiteSpace: "nowrap",
+        boxShadow: active ? "0 4px 12px rgba(244,197,66,0.30)" : "none",
       }}
     >
       {label}
@@ -438,7 +509,7 @@ function TabButton({ label, active, onClick }: { label: string; active: boolean;
   );
 }
 
-/** -------- Applicants helpers (prefer normalized keys, but compute score if missing) -------- */
+/** -------- Applicants helpers -------- */
 function pickApplicantMini(r: ApplicantRow): ApplicantMini {
   return {
     id: norm(r.id) || norm(r.__key) || (typeof r.__rowNumber === "number" ? `row_${r.__rowNumber}` : undefined),
@@ -455,7 +526,6 @@ function pickApplicantMini(r: ApplicantRow): ApplicantMini {
 
     availability: norm(r.availability) || norm(r["Availability"]) || undefined,
 
-    // IMPORTANT: avoid "" -> 0. Use parseMaybeNumber with robust key lookup.
     score10: parseMaybeNumber(getRawField(r, "score10", "Score 10", "Score")),
 
     dateInterviewed: norm(r.dateInterviewed) || norm(r["Date Interviewed"]) || norm(r["Interview Date"]) || undefined,
@@ -463,13 +533,9 @@ function pickApplicantMini(r: ApplicantRow): ApplicantMini {
     status: norm(r.status) || norm(r["Status"]) || undefined,
     onboardingStage: norm(r.onboardingStage) || norm(r["Onboarding Stage"]) || undefined,
 
-    // ✅ pull Age directly (this is what your Applicants page writes/saves)
     age: parseMaybeNumber(getRawField(r, "age", "Age")),
-
-    // optional birth year (if sheet has it)
     birthYear: parseMaybeNumber(getRawField(r, "birthYear", "Birth Year")),
 
-    // keep raw score columns (in case API didn’t normalize them)
     presentation: r.presentation ?? getRawField(r, "Presentation", "presentation"),
     experience: r.experience ?? getRawField(r, "Experience", "experience"),
     personality: r.personality ?? getRawField(r, "Personality", "personality"),
@@ -486,7 +552,6 @@ function applicantDisplayName(a: ApplicantMini) {
 }
 
 function computeScorePartsFromRaw(mini: ApplicantMini, raw: ApplicantRow) {
-  // Prefer whatever fields exist (mini first, then raw, then normalized-header search)
   const p = parseMaybeNumber(mini.presentation ?? getRawField(raw, "Presentation", "presentation"));
   const e = parseMaybeNumber(mini.experience ?? getRawField(raw, "Experience", "experience"));
   const pe = parseMaybeNumber(mini.personality ?? getRawField(raw, "Personality", "personality"));
@@ -503,7 +568,7 @@ function computeScorePartsFromRaw(mini: ApplicantMini, raw: ApplicantRow) {
 
   if (present.length > 0) {
     const avg = present.reduce((a, b) => a + b.val, 0) / present.length;
-    const rounded = Math.round(avg * 4) / 4; // .25 increments
+    const rounded = Math.round(avg * 4) / 4;
     return {
       score10: clampNum(rounded, 0, 10),
       breakdown: nums,
@@ -546,9 +611,8 @@ function ageFromBirthYear(birthYear: number | null | undefined): number | null {
   return age < 0 || age > 120 ? null : age;
 }
 
-/** Applicants filter presets (match Applicants page) */
+/** Applicants filter presets */
 type DatePreset = "Last week" | "This month" | "Last month" | "Last 3 months" | "This year" | "All";
-// Score min in 0.5 steps (null = All)
 type ScoreMin = number | null;
 
 function clampHalf(n: number) {
@@ -598,13 +662,12 @@ function dateRangeFromPreset(preset: DatePreset) {
     return { min, maxExcl };
   }
 
-  // This year
   const min = new Date(today.getFullYear(), 0, 1);
   const maxExcl = new Date(today.getFullYear() + 1, 0, 1);
   return { min, maxExcl };
 }
 
-/** -------- Availability preset picker (panel) -------- */
+/** -------- Availability preset picker -------- */
 type AvailPreset =
   | "All"
   | "Mornings"
@@ -626,10 +689,7 @@ function matchesAvailPreset(availText: string, preset: AvailPreset): boolean {
   const a = normLower(availText);
   if (!preset || preset === "All") return true;
 
-  // Open overrides all other filters: if applicant is Open, they pass any preset.
   if (isOpenAvailability(a)) return true;
-
-  // If the FILTER is explicitly Open, only show Open.
   if (preset === "Open") return false;
 
   const keywords: Record<Exclude<AvailPreset, "All" | "Open">, string[]> = {
@@ -647,56 +707,34 @@ function matchesAvailPreset(availText: string, preset: AvailPreset): boolean {
   return ks.some((k) => a.includes(k));
 }
 
-function filterRequiresOpen(preset: AvailPreset) {
-  return preset === "Open";
-}
-
 function toggleAvailPreset(cur: AvailPreset[], next: AvailPreset): AvailPreset[] {
   const set = new Set(cur);
-
-  // "All" behaves like a reset
   if (next === "All") return ["All"];
-
-  // If selecting anything else, drop "All"
   set.delete("All");
-
   if (set.has(next)) set.delete(next);
   else set.add(next);
-
-  // If nothing selected, fall back to All
   const out = Array.from(set);
   return out.length ? out : ["All"];
 }
 
-/**
- * Multi-select logic:
- * - If "All" selected: pass
- * - If "Open" selected: ONLY open applicants pass
- * - Otherwise:
- *    - Open applicants pass ANY filter (your rule)
- *    - Non-open applicants pass if they match ANY selected preset
- */
 function matchesAvailPresets(availText: string, presets: AvailPreset[]): boolean {
   const selected: AvailPreset[] = presets.length ? presets : ["All"];
-
   if (selected.includes("All")) return true;
 
   const open = isOpenAvailability(availText);
 
-  // If Open is selected among filters, make it restrictive:
-  // ONLY open applicants should show.
   if (selected.includes("Open")) return open;
-
-  // Otherwise Open applicants always pass
   if (open) return true;
 
-  // Non-open must match ANY selected preset
   return selected.some((p) => matchesAvailPreset(availText, p));
 }
+
 /** -------- Main component -------- */
 export default function CaregiverWebSchedulePanel({
   open,
   onClose,
+  width,
+  onResize,
 
   caregiversError,
   availLoading,
@@ -709,15 +747,18 @@ export default function CaregiverWebSchedulePanel({
   panelSelectedDow,
   setPanelSelectedDow,
 
-  // Applicants
+  draftMode,
+
   applicants,
   applicantsLoading,
   applicantsError,
-  applicantSearch, // legacy / still supported (we’ll treat as "search")
+  applicantSearch,
   setApplicantSearch,
 }: {
   open: boolean;
   onClose: () => void;
+  width: number;
+  onResize: (nextWidth: number) => void;
 
   caregiversError: string | null;
   availLoading: boolean;
@@ -730,6 +771,8 @@ export default function CaregiverWebSchedulePanel({
   panelSelectedDow: number | null;
   setPanelSelectedDow: (v: number | null) => void;
 
+  draftMode: boolean;
+
   applicants: ApplicantRow[];
   applicantsLoading: boolean;
   applicantsError: string | null;
@@ -737,13 +780,220 @@ export default function CaregiverWebSchedulePanel({
   setApplicantSearch: (v: string) => void;
 }) {
   const [tab, setTab] = useState<"caregivers" | "applicants">("caregivers");
+  const [snap, setSnap] = useState<PanelSnap>("right");
+  const [peekMode, setPeekMode] = useState(false);
+  const [floatingRect, setFloatingRect] = useState<FloatingRect>(() => getDefaultFloatingRect(width));
 
-  // Applicants filters
+  const dragRef = useRef<null | {
+    startX: number;
+    startY: number;
+    startRect: FloatingRect;
+  }>(null);
+
+  const resizeRef = useRef<
+    | null
+    | {
+        startX: number;
+        startY: number;
+        startRect: FloatingRect;
+        mode: "left" | "right" | "bottom" | "bottom-right";
+      }
+  >(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setFloatingRect((prev) => {
+      const next = prev?.width ? prev : getDefaultFloatingRect(width);
+      return clampRectToViewport({
+        ...next,
+        width: clampNum(width || next.width, MIN_FLOATING_WIDTH, MAX_FLOATING_WIDTH),
+      });
+    });
+  }, [open, width]);
+
+  useEffect(() => {
+    function handleWindowResize() {
+      setFloatingRect((prev) => clampRectToViewport(prev));
+    }
+
+    window.addEventListener("resize", handleWindowResize);
+    return () => window.removeEventListener("resize", handleWindowResize);
+  }, []);
+
+  function handleCaregiverDragStart(
+    e: React.DragEvent<HTMLElement>,
+    args: {
+      caregiverId: string;
+      caregiverName: string;
+      nameOnSchedule: string;
+    }
+  ) {
+    const payload = {
+      type: "caregiver-panel-drag",
+      caregiverId: args.caregiverId || "",
+      caregiverName: args.caregiverName || "",
+      nameOnSchedule: args.nameOnSchedule || args.caregiverName || "",
+    };
+
+    e.dataTransfer.effectAllowed = "copyMove";
+    e.dataTransfer.setData("application/json", JSON.stringify(payload));
+    e.dataTransfer.setData("text/plain", args.nameOnSchedule || args.caregiverName || "");
+
+    const dragEl = document.createElement("div");
+    dragEl.innerText = args.nameOnSchedule || args.caregiverName || "Caregiver";
+    dragEl.style.position = "absolute";
+    dragEl.style.top = "-9999px";
+    dragEl.style.left = "-9999px";
+    dragEl.style.padding = "7px 11px";
+    dragEl.style.background = "#f4c542";
+    dragEl.style.color = "#16253f";
+    dragEl.style.border = "1px solid #c79200";
+    dragEl.style.borderRadius = "999px";
+    dragEl.style.fontWeight = "900";
+    dragEl.style.fontSize = "12px";
+    dragEl.style.boxShadow = "0 8px 20px rgba(22,37,63,0.22)";
+
+    document.body.appendChild(dragEl);
+    e.dataTransfer.setDragImage(dragEl, 10, 10);
+
+    setTimeout(() => {
+      if (document.body.contains(dragEl)) document.body.removeChild(dragEl);
+    }, 0);
+  }
+
+  function snapTo(nextSnap: PanelSnap) {
+    if (nextSnap === "floating") {
+      setSnap("floating");
+      setFloatingRect((prev) => clampRectToViewport(prev));
+      return;
+    }
+
+    if (snap === "floating") {
+      setFloatingRect((prev) => clampRectToViewport(prev));
+    }
+
+    setSnap(nextSnap);
+  }
+
+  function startPanelDrag(e: React.MouseEvent<HTMLDivElement>) {
+    if (snap !== "floating") return;
+    if ((e.target as HTMLElement)?.closest("[data-no-panel-drag='true']")) return;
+
+    e.preventDefault();
+    dragRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      startRect: floatingRect,
+    };
+
+    function onMove(ev: MouseEvent) {
+      if (!dragRef.current) return;
+      const dx = ev.clientX - dragRef.current.startX;
+      const dy = ev.clientY - dragRef.current.startY;
+
+      setFloatingRect(
+        clampRectToViewport({
+          ...dragRef.current.startRect,
+          x: dragRef.current.startRect.x + dx,
+          y: dragRef.current.startRect.y + dy,
+        })
+      );
+    }
+
+    function onUp() {
+      dragRef.current = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    }
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  function startResize(
+    e: React.MouseEvent<HTMLDivElement>,
+    mode: "left" | "right" | "bottom" | "bottom-right"
+  ) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (snap !== "floating") {
+      if (snap === "right" || snap === "left") {
+        const startX = e.clientX;
+        const startWidth = width;
+
+        function handleMove(ev: MouseEvent) {
+          const delta = snap === "right" ? startX - ev.clientX : ev.clientX - startX;
+          onResize(clampNum(startWidth + delta, MIN_FLOATING_WIDTH, Math.min(MAX_FLOATING_WIDTH, window.innerWidth - 40)));
+        }
+
+        function handleUp() {
+          window.removeEventListener("mousemove", handleMove);
+          window.removeEventListener("mouseup", handleUp);
+        }
+
+        window.addEventListener("mousemove", handleMove);
+        window.addEventListener("mouseup", handleUp);
+      }
+
+      return;
+    }
+
+    resizeRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      startRect: floatingRect,
+      mode,
+    };
+
+    function onMove(ev: MouseEvent) {
+      if (!resizeRef.current) return;
+
+      const { startRect, startX, startY, mode } = resizeRef.current;
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+
+      let next: FloatingRect = { ...startRect };
+
+      if (mode === "left") {
+        const newWidth = clampNum(startRect.width - dx, MIN_FLOATING_WIDTH, MAX_FLOATING_WIDTH);
+        const consumed = startRect.width - newWidth;
+        next.width = newWidth;
+        next.x = startRect.x + consumed;
+      }
+
+      if (mode === "right") {
+        next.width = clampNum(startRect.width + dx, MIN_FLOATING_WIDTH, MAX_FLOATING_WIDTH);
+      }
+
+      if (mode === "bottom") {
+        next.height = clampNum(startRect.height + dy, MIN_FLOATING_HEIGHT, window.innerHeight - EDGE_GAP * 2);
+      }
+
+      if (mode === "bottom-right") {
+        next.width = clampNum(startRect.width + dx, MIN_FLOATING_WIDTH, MAX_FLOATING_WIDTH);
+        next.height = clampNum(startRect.height + dy, MIN_FLOATING_HEIGHT, window.innerHeight - EDGE_GAP * 2);
+      }
+
+      setFloatingRect(clampRectToViewport(next));
+      onResize(next.width);
+    }
+
+    function onUp() {
+      resizeRef.current = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    }
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
   const [appLocationQ, setAppLocationQ] = useState("");
   const [appAvailPresets, setAppAvailPresets] = useState<AvailPreset[]>(["All"]);
   const [appDatePreset, setAppDatePreset] = useState<DatePreset>("All");
   const [appStatusFilter, setAppStatusFilter] = useState<string>("All");
- const [appMinScore, setAppMinScore] = useState<ScoreMin>(null);
+  const [appMinScore, setAppMinScore] = useState<ScoreMin>(null);
   const [expandedAppId, setExpandedAppId] = useState<string | null>(null);
 
   const applicantStatusOptions = useMemo(() => {
@@ -765,7 +1015,6 @@ export default function CaregiverWebSchedulePanel({
       const mini = pickApplicantMini(raw);
       const scoreInfo = computeScorePartsFromRaw(mini, raw);
 
-      // Prefer computed score if available. Only fall back to mini.score10.
       const score10 =
         scoreInfo.score10 != null
           ? scoreInfo.score10
@@ -779,7 +1028,6 @@ export default function CaregiverWebSchedulePanel({
       return { raw, mini, scoreInfo, score10, dateObj };
     });
 
-    // Drop totally empty rows
     const nonEmpty = views.filter((v) => {
       const a = v.mini;
       const name = applicantDisplayName(a);
@@ -798,36 +1046,28 @@ export default function CaregiverWebSchedulePanel({
     const afterFilters = nonEmpty.filter((v) => {
       const a = v.mini;
 
-      // status
       const status = norm(a.status);
       if (appStatusFilter !== "All" && status !== appStatusFilter) return false;
 
-      // date range (uses Date Interviewed)
       if (min && maxExcl) {
         if (!v.dateObj) return false;
         const x = startOfDay(v.dateObj);
         if (x < min || x >= maxExcl) return false;
       }
 
-      // score min
       if (minScore10 !== null) {
         if (v.score10 == null) return false;
         if (v.score10 < minScore10) return false;
       }
 
-      // location filter
       if (locNeedle) {
         const locHay = norm(a.address);
         if (!includesCI(locHay, locNeedle)) return false;
       }
 
-      // availability preset filter:
-      // - If filter is Open: only show Open applicants
-      // - Otherwise: Open applicants show in ALL filters, and others must match the preset keywords.
       const availHay = norm(a.availability);
-if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
+      if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
 
-      // text search
       if (!q) return true;
 
       const hay = [
@@ -842,7 +1082,6 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
         a.vaccinated,
         v.score10 != null ? String(v.score10) : "",
         notesFromRaw(v.raw),
-        // age (computed)
         a.birthYear != null ? String(ageFromBirthYear(a.birthYear) ?? "") : "",
       ]
         .map(norm)
@@ -852,7 +1091,6 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
       return hay.includes(q);
     });
 
-    // Sort: most recent interview date at the top (nulls last)
     afterFilters.sort((A, B) => {
       const at = A.dateObj ? A.dateObj.getTime() : -Infinity;
       const bt = B.dateObj ? B.dateObj.getTime() : -Infinity;
@@ -864,60 +1102,338 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
 
     return afterFilters;
   }, [applicants, applicantSearch, appLocationQ, appAvailPresets, appDatePreset, appStatusFilter, appMinScore]);
+
+  const visibleCaregiverPanelRows = useMemo(() => {
+    return (caregiverPanelRows || []).filter((cg) => {
+      const p = cg.profile;
+
+      const displayName =
+        norm(p?.name) ||
+        norm(cg.nameOnSchedule) ||
+        norm(p?.nameOnSchedule) ||
+        norm(cg.caregiverId) ||
+        "";
+
+      return !isOpenLikeCaregiverName(displayName);
+    });
+  }, [caregiverPanelRows]);
+
   if (!open) return null;
 
-  const caregiverCount = caregiverPanelRows.length;
-  const applicantCount = applicants?.length || 0;
-  const shellBg = tab === "applicants" ? UI.bgApplicants : UI.bgCaregivers;
+  const caregiverCount = visibleCaregiverPanelRows.length;
+const applicantCount = applicants?.length || 0;
+const shellBg = tab === "applicants" ? UI.bgApplicants : UI.bgCaregivers;
+
+const isGhost = peekMode;
+
+const bodyBg = isGhost
+  ? tab === "applicants"
+    ? "linear-gradient(180deg, rgba(255,243,191,0.22) 0%, rgba(255,224,138,0.16) 100%)"
+    : "linear-gradient(180deg, rgba(255,224,138,0.20) 0%, rgba(255,210,77,0.14) 100%)"
+  : shellBg;
+
+const panelGlassBg = isGhost ? "rgba(255, 248, 219, 0.18)" : bodyBg;
+const panelHeaderBg = isGhost
+  ? "linear-gradient(180deg, rgba(255,255,255,0.24) 0%, rgba(255,248,219,0.18) 100%)"
+  : "linear-gradient(180deg, rgba(255,255,255,0.78) 0%, rgba(255,248,219,0.95) 100%)";
+
+const panelSoftBoxBg = isGhost ? "rgba(255,255,255,0.16)" : "rgba(255,255,255,0.92)";
+const panelCardBg = isGhost ? "rgba(255,255,255,0.14)" : "rgba(255,255,255,0.82)";
+const panelCardHeaderBg = isGhost
+  ? "linear-gradient(180deg, rgba(255,255,255,0.20) 0%, rgba(255,249,230,0.14) 100%)"
+  : "linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(255,249,230,0.96) 100%)";
+
+const panelInlineRowBg = isGhost ? "rgba(255,255,255,0.12)" : "#fff";
+const panelBlur = "none";
+const panelBorderSoft = isGhost ? "rgba(214,178,76,0.38)" : "rgba(214,178,76,0.65)";
+const panelDivider = isGhost ? "rgba(22,37,63,0.12)" : "rgba(22,37,63,0.12)";
+
+  const panelStyle: React.CSSProperties =
+    snap === "floating"
+      ? {
+          position: "fixed",
+          left: floatingRect.x,
+          top: floatingRect.y,
+          width: floatingRect.width,
+          height: floatingRect.height,
+        }
+      : snap === "right"
+        ? {
+            position: "fixed",
+            top: EDGE_GAP,
+            right: EDGE_GAP,
+            bottom: EDGE_GAP,
+            width,
+            maxWidth: `calc(100vw - ${EDGE_GAP * 2}px)`,
+          }
+        : snap === "left"
+          ? {
+              position: "fixed",
+              top: EDGE_GAP,
+              left: EDGE_GAP,
+              bottom: EDGE_GAP,
+              width,
+              maxWidth: `calc(100vw - ${EDGE_GAP * 2}px)`,
+            }
+          : snap === "top"
+            ? {
+                position: "fixed",
+                top: EDGE_GAP,
+                left: EDGE_GAP,
+                right: EDGE_GAP,
+                height: 360,
+                maxHeight: "42vh",
+              }
+            : {
+                position: "fixed",
+                left: EDGE_GAP,
+                right: EDGE_GAP,
+                bottom: EDGE_GAP,
+                height: 360,
+                maxHeight: "42vh",
+              };
+
+  const canDrag = snap === "floating";
+  const showSideResizeHandle = snap === "right" || snap === "left";
+  const showFloatingResizeHandles = snap === "floating";
 
   return (
-    <aside className="caregiverAside" style={{ width: 460, position: "sticky", top: 90, alignSelf: "flex-start" }}>
-      <div
-        style={{
-          border: `1px solid ${UI.border}`,
-          background: shellBg,
-          borderRadius: 12,
-          overflow: "hidden",
-        }}
-      >
-        <div style={{ maxHeight: "calc(100vh - 190px)", overflow: "auto" }}>
-          {/* Header */}
+  <aside
+  className="caregiverAside"
+  style={{
+    ...panelStyle,
+    zIndex: 3001,
+    display: "flex",
+    flexDirection: "column",
+    border: `2px solid ${UI.beeGoldDark}`,
+    background: panelGlassBg,
+    borderRadius: 20,
+    overflow: "hidden",
+    boxShadow: isGhost
+      ? "0 20px 60px rgba(22,37,63,0.20)"
+      : "0 24px 80px rgba(22,37,63,0.28)",
+    pointerEvents: "auto",
+  }}
+>
+      {showSideResizeHandle ? (
+        <div
+          onMouseDown={(e) => startResize(e, snap === "right" ? "left" : "right")}
+          title="Drag to resize"
+          style={{
+            position: "absolute",
+            [snap === "right" ? "left" : "right"]: 0,
+            top: 0,
+            bottom: 0,
+            width: 12,
+            cursor: "ew-resize",
+            zIndex: 20,
+            background: "transparent",
+            userSelect: "none",
+          }}
+        >
           <div
             style={{
-              padding: 12,
-              borderBottom: `1px solid rgba(0,0,0,0.08)`,
-              background: "rgba(255,255,255,0.55)",
+              position: "absolute",
+              [snap === "right" ? "left" : "right"]: 3,
+              top: "50%",
+              transform: "translateY(-50%)",
+              width: 4,
+              height: 64,
+              borderRadius: 999,
+              background: "rgba(22,37,63,0.16)",
             }}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
-              <div>
+          />
+        </div>
+      ) : null}
+
+      {showFloatingResizeHandles ? (
+        <>
+          <div
+            onMouseDown={(e) => startResize(e, "left")}
+            title="Resize"
+            style={{
+              position: "absolute",
+              left: 0,
+              top: 0,
+              bottom: 0,
+              width: 10,
+              cursor: "ew-resize",
+              zIndex: 20,
+            }}
+          />
+          <div
+            onMouseDown={(e) => startResize(e, "right")}
+            title="Resize"
+            style={{
+              position: "absolute",
+              right: 0,
+              top: 0,
+              bottom: 0,
+              width: 10,
+              cursor: "ew-resize",
+              zIndex: 20,
+            }}
+          />
+          <div
+            onMouseDown={(e) => startResize(e, "bottom")}
+            title="Resize"
+            style={{
+              position: "absolute",
+              left: 0,
+              right: 0,
+              bottom: 0,
+              height: 10,
+              cursor: "ns-resize",
+              zIndex: 20,
+            }}
+          />
+          <div
+            onMouseDown={(e) => startResize(e, "bottom-right")}
+            title="Resize"
+            style={{
+              position: "absolute",
+              right: 0,
+              bottom: 0,
+              width: 18,
+              height: 18,
+              cursor: "nwse-resize",
+              zIndex: 21,
+            }}
+          />
+        </>
+      ) : null}
+
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          minHeight: 0,
+          height: "100%",
+        }}
+      >
+        <div
+          style={{
+            flex: 1,
+            minHeight: 0,
+            overflow: "auto",
+          }}
+        >
+          <div
+  onMouseDown={startPanelDrag}
+  style={{
+    padding: 14,
+    borderBottom: `2px solid ${panelDivider}`,
+    background: panelHeaderBg,
+    cursor: canDrag ? "grab" : "default",
+    userSelect: "none",
+  }}
+>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+              <div style={{ minWidth: 0 }}>
                 <div style={{ fontWeight: 950, fontSize: 14 }}>Caregiver Panel</div>
                 <div style={{ marginTop: 4, fontSize: 12, color: UI.textDim, fontWeight: 800 }}>
                   {tab === "caregivers"
                     ? `Showing ${caregiverCount} caregivers`
                     : `Showing ${filteredApplicants.length} of ${applicantCount} applicants`}
                 </div>
+
+                {tab === "caregivers" ? (
+                 <div
+  style={{
+    marginTop: 8,
+    fontSize: 11.5,
+    color: UI.navy,
+    fontWeight: 900,
+    background: isGhost ? "rgba(255,255,255,0.14)" : "rgba(255,255,255,0.55)",
+    border: `1px solid ${isGhost ? "rgba(22,37,63,0.08)" : "rgba(22,37,63,0.10)"}`,
+    borderRadius: 10,
+    padding: "7px 9px",
+    backdropFilter: isGhost ? "blur(.5px)" : "none",
+    WebkitBackdropFilter: isGhost ? "blur(.5px)" : "none",
+  }}
+>
+                    {draftMode
+                      ? "Draft Mode: drag a caregiver onto a shift to replace it as considering."
+                      : "Drag a caregiver onto a shift to save it directly to the schedule as considering."}
+                  </div>
+                ) : null}
               </div>
 
-              <button
-                type="button"
-                onClick={onClose}
+              <div
+                data-no-panel-drag="true"
                 style={{
-                  border: `1px solid ${UI.border}`,
-                  background: UI.panelBg,
-                  borderRadius: 10,
-                  padding: "6px 10px",
-                  cursor: "pointer",
-                  fontWeight: 900,
-                  fontSize: 13,
+                  display: "flex",
+                  gap: 8,
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  justifyContent: "flex-end",
                 }}
               >
-                Close
-              </button>
+                <button
+                  type="button"
+                  onClick={() => setPeekMode((v) => !v)}
+                  style={{
+                    border: `1px solid ${peekMode ? UI.beeGoldDark : UI.border}`,
+                    background: peekMode ? UI.beeGold : "#fff",
+                    color: UI.navy,
+                    borderRadius: 999,
+                    padding: "7px 10px",
+                    cursor: "pointer",
+                    fontWeight: 900,
+                    fontSize: 12,
+                  }}
+                >
+                  {peekMode ? "Solid" : "Ghost"}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => snapTo("floating")}
+                  style={{
+                    border: `1px solid ${snap === "floating" ? UI.navy : UI.border}`,
+                    background: snap === "floating" ? UI.navy : "#fff",
+                    color: snap === "floating" ? "#fff" : UI.text,
+                    borderRadius: 999,
+                    padding: "7px 10px",
+                    cursor: "pointer",
+                    fontWeight: 900,
+                    fontSize: 12,
+                  }}
+                  title="Floating mode"
+                >
+                  Float
+                </button>
+
+                <button
+                  type="button"
+                  onClick={onClose}
+                  style={{
+                    border: `1px solid ${UI.navy}`,
+                    background: UI.navy,
+                    color: "#fff",
+                    borderRadius: 999,
+                    padding: "7px 12px",
+                    cursor: "pointer",
+                    fontWeight: 950,
+                    fontSize: 13,
+                    boxShadow: "0 4px 12px rgba(22,37,63,0.18)",
+                  }}
+                >
+                  Close
+                </button>
+              </div>
             </div>
 
-            {/* Tabs */}
-            <div style={{ marginTop: 10, display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <div
+              data-no-panel-drag="true"
+              style={{
+                marginTop: 10,
+                display: "flex",
+                gap: 8,
+                flexWrap: "wrap",
+                alignItems: "center",
+              }}
+            >
               <TabButton
                 label={`Caregivers (${caregiverCount})`}
                 active={tab === "caregivers"}
@@ -928,26 +1444,58 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                 active={tab === "applicants"}
                 onClick={() => setTab("applicants")}
               />
+
+              <div style={{ width: 1, height: 22, background: "rgba(22,37,63,0.12)", margin: "0 2px" }} />
+
+              <button
+                type="button"
+                onClick={() => snapTo("left")}
+                style={snapButtonStyle(snap === "left")}
+              >
+                Left
+              </button>
+              <button
+                type="button"
+                onClick={() => snapTo("right")}
+                style={snapButtonStyle(snap === "right")}
+              >
+                Right
+              </button>
+              <button
+                type="button"
+                onClick={() => snapTo("top")}
+                style={snapButtonStyle(snap === "top")}
+              >
+                Top
+              </button>
+              <button
+                type="button"
+                onClick={() => snapTo("bottom")}
+                style={snapButtonStyle(snap === "bottom")}
+              >
+                Bottom
+              </button>
             </div>
 
-            {/* Tab content controls */}
             {tab === "caregivers" ? (
               <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
                 <input
                   value={panelSearch ?? ""}
                   onChange={(e) => setPanelSearch(e.target.value)}
                   placeholder="Search caregivers…"
-                  style={{
-                    border: `1px solid ${UI.border}`,
-                    borderRadius: 12,
-                    padding: "8px 10px",
-                    fontSize: 13,
-                    outline: "none",
-                    background: UI.panelBg,
-                  }}
+                 style={{
+  border: `1px solid ${UI.border}`,
+  borderRadius: 14,
+  padding: "10px 12px",
+  fontSize: 13,
+  outline: "none",
+  background: panelSoftBoxBg,
+  boxShadow: isGhost ? "none" : "inset 0 1px 2px rgba(0,0,0,0.04)",
+  backdropFilter: isGhost ? "blur(.5px)" : "none",
+  WebkitBackdropFilter: isGhost ? "blur(.5px)" : "none",
+}}
                 />
 
-                {/* DOW chips */}
                 <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
                   <DayChip label="All" active={panelSelectedDow == null} onClick={() => setPanelSelectedDow(null)} />
                   {DOW_LABELS.map((d, idx) => (
@@ -968,7 +1516,6 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
               </div>
             ) : (
               <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
-                {/* Search */}
                 <input
                   value={applicantSearch ?? ""}
                   onChange={(e) => setApplicantSearch(e.target.value)}
@@ -983,7 +1530,6 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                   }}
                 />
 
-                {/* Filters */}
                 <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8 }}>
                   <input
                     value={appLocationQ}
@@ -995,81 +1541,73 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                       padding: "8px 10px",
                       fontSize: 13,
                       outline: "none",
-                      background: UI.panelBg,
+                      background: "rgba(255,255,255,0.95)",
+                      boxShadow: "inset 0 1px 2px rgba(0,0,0,0.04)",
                     }}
                   />
 
-                  {/* Availability MULTI-SELECT chips */}
-<div
-  style={{
-    border: `1px solid ${UI.border}`,
-    borderRadius: 12,
-    padding: "8px 10px",
-    background: UI.panelBg,
-  }}
->
-  <div style={{ fontSize: 12, fontWeight: 950, color: UI.textDim, marginBottom: 6 }}>
-    Availability (multi-select)
-  </div>
-
-  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-    {(
-      [
-        "All",
-        "Mornings",
-        "Afternoon",
-        "Evening",
-        "Overnight",
-        "Weekend",
-        "Flexible",
-        "Limited",
-        "Can't Start Right Away",
-        "Open",
-      ] as AvailPreset[]
-    ).map((p) => {
-      const active = appAvailPresets.includes(p);
-      return (
-        <button
-          key={`avail_${p}`}
-          type="button"
-          onClick={() => setAppAvailPresets((cur) => toggleAvailPreset(cur, p))}
-          style={{
-            border: `1px solid ${active ? "#111827" : UI.border}`,
-            background: active ? "#111827" : "#fff",
-            color: active ? "#fff" : UI.text,
-            borderRadius: 999,
-            padding: "6px 10px",
-            fontSize: 12,
-            cursor: "pointer",
-            fontWeight: 950,
-            whiteSpace: "nowrap",
-          }}
-          title={p === "Open" ? "If selected, ONLY Open applicants show" : undefined}
-        >
-          {p}
-        </button>
-      );
-    })}
-  </div>
-
-  {/* Small helper line */}
-  <div style={{ marginTop: 6, fontSize: 11.5, color: UI.textDim, fontWeight: 800 }}>
-    Tip: Open applicants show in all filters unless you select “Open” (then it becomes exclusive).
-  </div>
-</div>
-                  <select
-                    value={appDatePreset}
-                    onChange={(e) => setAppDatePreset(e.target.value as DatePreset)}
+                  <div
                     style={{
                       border: `1px solid ${UI.border}`,
                       borderRadius: 12,
                       padding: "8px 10px",
-                      fontSize: 13,
-                      fontWeight: 900,
-                      outline: "none",
                       background: UI.panelBg,
-                      cursor: "pointer",
                     }}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 950, color: UI.textDim, marginBottom: 6 }}>
+                      Availability (multi-select)
+                    </div>
+
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                      {(
+                        [
+                          "All",
+                          "Mornings",
+                          "Afternoon",
+                          "Evening",
+                          "Overnight",
+                          "Weekend",
+                          "Flexible",
+                          "Limited",
+                          "Can't Start Right Away",
+                          "Open",
+                        ] as AvailPreset[]
+                      ).map((p) => {
+                        const active = appAvailPresets.includes(p);
+                        return (
+                          <button
+                            key={`avail_${p}`}
+                            type="button"
+                            onClick={() => setAppAvailPresets((cur) => toggleAvailPreset(cur, p))}
+                            style={{
+                              border: `1px solid ${active ? UI.beeGoldDark : UI.border}`,
+                              background: active ? UI.beeGold : "#fff",
+                              color: active ? UI.navy : UI.text,
+                              borderRadius: 999,
+                              padding: "6px 10px",
+                              fontSize: 12,
+                              cursor: "pointer",
+                              fontWeight: 950,
+                              whiteSpace: "nowrap",
+                              boxShadow: active ? "0 3px 10px rgba(244,197,66,0.22)" : "none",
+                            }}
+                            title={p === "Open" ? "If selected, ONLY Open applicants show" : undefined}
+                          >
+                            {p}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div style={{ marginTop: 6, fontSize: 11.5, color: UI.textDim, fontWeight: 800 }}>
+                      Tip: Open applicants show in all filters unless you select “Open” (then it becomes exclusive).
+                    </div>
+                  </div>
+
+                  <select
+                    value={appDatePreset}
+                    onChange={(e) => setAppDatePreset(e.target.value as DatePreset)}
+                    style={selectStyle()}
                   >
                     {(["Last week", "This month", "Last month", "Last 3 months", "This year", "All"] as DatePreset[]).map(
                       (p) => (
@@ -1083,16 +1621,7 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                   <select
                     value={appStatusFilter}
                     onChange={(e) => setAppStatusFilter(e.target.value)}
-                    style={{
-                      border: `1px solid ${UI.border}`,
-                      borderRadius: 12,
-                      padding: "8px 10px",
-                      fontSize: 13,
-                      fontWeight: 900,
-                      outline: "none",
-                      background: UI.panelBg,
-                      cursor: "pointer",
-                    }}
+                    style={selectStyle()}
                   >
                     {applicantStatusOptions.map((s) => (
                       <option key={s} value={s}>
@@ -1102,28 +1631,19 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                   </select>
 
                   <select
-  value={appMinScore == null ? "All" : String(appMinScore)}
-  onChange={(e) => {
-    const v = e.target.value;
-    setAppMinScore(v === "All" ? null : clampHalf(Number(v)));
-  }}
-  style={{
-    border: `1px solid ${UI.border}`,
-    borderRadius: 12,
-    padding: "8px 10px",
-    fontSize: 13,
-    fontWeight: 900,
-    outline: "none",
-    background: UI.panelBg,
-    cursor: "pointer",
-  }}
->
-  {buildScoreOptionsHalf().map((opt) => (
-    <option key={opt.label} value={opt.value == null ? "All" : String(opt.value)}>
-      Score: {opt.label}
-    </option>
-  ))}
-</select>
+                    value={appMinScore == null ? "All" : String(appMinScore)}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setAppMinScore(v === "All" ? null : clampHalf(Number(v)));
+                    }}
+                    style={selectStyle()}
+                  >
+                    {buildScoreOptionsHalf().map((opt) => (
+                      <option key={opt.label} value={opt.value == null ? "All" : String(opt.value)}>
+                        Score: {opt.label}
+                      </option>
+                    ))}
+                  </select>
                 </div>
 
                 {applicantsError ? (
@@ -1135,17 +1655,16 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
             )}
           </div>
 
-          {/* Body */}
           {tab === "caregivers" ? (
             availLoading ? (
               <div style={{ padding: 12, fontSize: 13, color: UI.textDim }}>Loading caregiver panel…</div>
             ) : availError ? (
               <div style={{ padding: 12, fontSize: 13, color: "salmon" }}>{availError}</div>
-            ) : caregiverPanelRows.length === 0 ? (
+            ) : visibleCaregiverPanelRows.length === 0 ? (
               <div style={{ padding: 12, fontSize: 13, color: UI.textDim }}>No caregivers match this filter.</div>
             ) : (
               <div style={{ display: "grid", gap: 10, padding: 12 }}>
-                {caregiverPanelRows.map((cg, idx) => {
+                {visibleCaregiverPanelRows.map((cg, idx) => {
                   const p = cg.profile;
 
                   const displayName =
@@ -1172,41 +1691,69 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                   }
 
                   return (
-                    <div
-                      key={`${cg.kind}:${cg.caregiverId || displayName}:${idx}`}
-                      style={{
-                        border: `1px solid rgba(0,0,0,0.10)`,
-                        borderRadius: 12,
-                        padding: 10,
-                        background: "rgba(255,255,255,0.70)",
-                      }}
-                    >
-                      <div
-                        style={{
-                          position: "sticky",
-                          top: 0,
-                          zIndex: 2,
-                          background: "rgba(255,255,255,0.92)",
-                          borderRadius: 10,
-                          padding: "8px 8px",
-                          border: "1px solid rgba(0,0,0,0.06)",
-                          boxShadow: "0 1px 0 rgba(0,0,0,0.04)",
-                        }}
-                      >
+                   <div
+  key={`${cg.kind}:${cg.caregiverId || displayName}:${idx}`}
+  style={{
+    border: `1px solid ${panelBorderSoft}`,
+    borderRadius: 16,
+    padding: 10,
+    background: panelCardBg,
+    boxShadow: isGhost ? "none" : "0 8px 18px rgba(22,37,63,0.06)",
+    backdropFilter: isGhost ? "blur(.5px)" : "none",
+    WebkitBackdropFilter: isGhost ? "blur(.5px)" : "none",
+  }}
+>
+                     <div
+  style={{
+    position: "sticky",
+    top: 0,
+    zIndex: 12,
+    background: panelCardHeaderBg,
+    borderRadius: 12,
+    padding: "10px 10px",
+    border: `1px solid ${isGhost ? "rgba(214,178,76,0.30)" : "rgba(214,178,76,0.55)"}`,
+    boxShadow: isGhost ? "none" : "0 2px 8px rgba(22,37,63,0.05)",
+  }}
+>
                         <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
-                          <div style={{ fontWeight: 950, fontSize: 16, lineHeight: 1.15 }}>
-                            {displayName}
+                          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+                            <div style={{ fontWeight: 950, fontSize: 16, lineHeight: 1.15 }}>{displayName}</div>
+
+                            <button
+                              type="button"
+                              draggable
+                              onDragStart={(e) =>
+                                handleCaregiverDragStart(e, {
+                                  caregiverId: cg.caregiverId,
+                                  caregiverName: displayName,
+                                  nameOnSchedule: cg.nameOnSchedule || displayName,
+                                })
+                              }
+                              style={{
+                                border: `1px solid ${UI.beeGoldDark}`,
+                                background: UI.beeGold,
+                                color: UI.navy,
+                                borderRadius: 999,
+                                padding: "4px 10px",
+                                fontSize: 11,
+                                fontWeight: 1000,
+                                cursor: "grab",
+                                whiteSpace: "nowrap",
+                                boxShadow: "0 3px 8px rgba(244,197,66,0.24)",
+                              }}
+                            >
+                              Drag to Shift
+                            </button>
 
                             {hasCert && (
                               <span
                                 style={{
-                                  marginLeft: 8,
                                   fontSize: 11,
                                   fontWeight: 900,
                                   padding: "2px 8px",
                                   borderRadius: 999,
                                   border: `1px solid ${UI.borderSoft}`,
-                                  background: "#f8fafc",
+                                  background: isGhost ? "rgba(248,250,252,0.16)" : "#f8fafc",
                                   color: UI.textDim,
                                   whiteSpace: "nowrap",
                                 }}
@@ -1218,13 +1765,12 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
 
                             <span
                               style={{
-                                marginLeft: 8,
                                 fontSize: 11,
                                 fontWeight: 950,
                                 padding: "2px 8px",
                                 borderRadius: 999,
                                 border: `1px solid ${UI.borderSoft}`,
-                                background: "#fff",
+                               background: isGhost ? "rgba(255,255,255,0.14)" : "#fff",
                                 color: UI.text,
                                 whiteSpace: "nowrap",
                               }}
@@ -1242,7 +1788,7 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                         )}
                       </div>
 
-                      <div style={{ marginTop: 10 }}>
+                     <div style={{ marginTop: 12 }}>
                         {showDows.map((dow, ix) => {
                           const daySchedule = schedByDow[dow] || [];
                           const dayAvail = availability?.byDow?.[dow] ?? "—";
@@ -1294,21 +1840,47 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                                               border: `1px solid rgba(0,0,0,0.08)`,
                                               borderRadius: 10,
                                               padding: "6px 8px",
-                                              background: "#fff",
+                                             background: panelInlineRowBg,
                                             }}
                                             title={s.status ? `Status: ${s.status}` : undefined}
                                           >
                                             <div
                                               style={{
-                                                fontWeight: 950,
-                                                fontSize: 11.5,
-                                                overflow: "hidden",
-                                                textOverflow: "ellipsis",
-                                                whiteSpace: "nowrap",
-                                                color,
+                                                display: "flex",
+                                                alignItems: "center",
+                                                gap: 6,
+                                                minWidth: 0,
                                               }}
                                             >
-                                              {s.client || "Client"}
+                                              <div
+                                                style={{
+                                                  fontWeight: 950,
+                                                  fontSize: 11.5,
+                                                  overflow: "hidden",
+                                                  textOverflow: "ellipsis",
+                                                  whiteSpace: "nowrap",
+                                                  color,
+                                                }}
+                                              >
+                                                {s.client || "Client"}
+                                              </div>
+
+                                              {s.isDraft ? (
+                                                <span
+                                                  style={{
+                                                    fontSize: 10,
+                                                    fontWeight: 1000,
+                                                    color: "#1d4ed8",
+                                                    background: "#dbeafe",
+                                                    border: "1px solid #93c5fd",
+                                                    borderRadius: 999,
+                                                    padding: "1px 6px",
+                                                    whiteSpace: "nowrap",
+                                                  }}
+                                                >
+                                                  Draft
+                                                </span>
+                                              ) : null}
                                             </div>
 
                                             <div style={{ fontSize: 11.5, fontWeight: 950, whiteSpace: "nowrap", color, opacity: 0.95 }}>
@@ -1360,14 +1932,13 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                 const vaccinated = norm(a.vaccinated);
 
                 const age =
-  typeof a.age === "number" && Number.isFinite(a.age)
-    ? a.age
-    : ageFromBirthYear(a.birthYear ?? null);
+                  typeof a.age === "number" && Number.isFinite(a.age)
+                    ? a.age
+                    : ageFromBirthYear(a.birthYear ?? null);
 
                 const notes = notesFromRaw(raw);
                 const notesTooltip = notes || "No interview notes";
 
-                // score breakdown tooltip / details (no "Source:" line)
                 const scoreInfo = v.scoreInfo;
                 const score10 = v.score10;
                 const scoreTooltip =
@@ -1377,7 +1948,6 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                   `Reliability: ${scoreInfo.breakdown[3].val ?? "—"}\n` +
                   (score10 !== null ? `\nDisplayed: ${score10.toFixed(1)} / 10` : "");
 
-                // date label under score + status
                 const diStr = norm(a.dateInterviewed);
                 const di = diStr ? parseSheetDate(diStr) : null;
                 const diLabel = di ? `${formatMDY(di)} (${formatAgoFromDays(diffDaysFromToday(di))})` : diStr || "—";
@@ -1385,19 +1955,21 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                 return (
                   <div
                     key={`app:${id}:${idx}`}
-                    title={notesTooltip} // ✅ hover shows notes
+                    title={notesTooltip}
                     onClick={() => setExpandedAppId((cur) => (cur === id ? null : id))}
                     style={{
                       border: `1px solid rgba(0,0,0,0.10)`,
                       borderRadius: 12,
-                      padding: 10,
-                      background: "rgba(255,255,255,0.80)",
+                     padding: 10,
+scrollMarginTop: 80,
+                      background: panelCardBg,
+backdropFilter: isGhost ? "blur(.5px)" : "none",
+WebkitBackdropFilter: isGhost ? "blur(.5px)" : "none",
                       cursor: "pointer",
                       boxShadow: expanded ? "0 6px 18px rgba(30,58,138,0.10)" : "none",
                       transition: "box-shadow 140ms ease",
                     }}
                   >
-                    {/* Header row */}
                     <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
                       <div style={{ minWidth: 0 }}>
                         <div
@@ -1414,7 +1986,6 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                           {name}
                         </div>
 
-                        {/* Date interviewed */}
                         <div style={{ marginTop: 6, fontSize: 12, fontWeight: 850, color: UI.textDim }}>
                           Date interviewed: <span style={{ color: UI.text }}>{diLabel}</span>
                         </div>
@@ -1431,7 +2002,6 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                       </div>
                     </div>
 
-                    {/* Compact summary */}
                     <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
                       <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 900 }}>
                         {phone ? `📞 ${phone}` : "📞 —"}
@@ -1445,10 +2015,8 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                       </div>
                     </div>
 
-                    {/* Expanded details */}
                     {expanded ? (
                       <div style={{ marginTop: 12, borderTop: `1px solid rgba(0,0,0,0.08)`, paddingTop: 12 }}>
-                        {/* Score breakdown */}
                         <div style={{ fontSize: 12, fontWeight: 950, color: UI.textDim }}>Score breakdown</div>
                         <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
                           {scoreInfo.breakdown.map((b) => (
@@ -1469,7 +2037,6 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                           ))}
                         </div>
 
-                        {/* Key fields (cleaned) */}
                         <div style={{ marginTop: 12, fontSize: 12, fontWeight: 950, color: UI.textDim }}>Applicant details</div>
 
                         <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
@@ -1488,14 +2055,12 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                             <div style={{ marginTop: 2, color: UI.text, fontWeight: 900 }}>{stage || "—"}</div>
                           </div>
 
-                          {/* ✅ Age moved up to where Interview ID was */}
                           <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>
                             Age
                             <div style={{ marginTop: 2, color: UI.text, fontWeight: 900 }}>{age == null ? "—" : String(age)}</div>
                           </div>
                         </div>
 
-                        {/* Notes */}
                         <div style={{ marginTop: 12 }}>
                           <div style={{ fontSize: 12, fontWeight: 950, color: UI.textDim }}>Notes</div>
                           <div style={{ marginTop: 6, fontSize: 12, fontWeight: 850, color: UI.text, whiteSpace: "pre-wrap" }}>
@@ -1503,7 +2068,6 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
                           </div>
                         </div>
 
-                        {/* ✅ Cleaned "All fields" -> just Age */}
                         <div style={{ marginTop: 12 }}>
                           <div style={{ fontSize: 12, fontWeight: 950, color: UI.textDim }}>Age</div>
                           <div style={{ marginTop: 6, fontSize: 12, fontWeight: 850, color: UI.text }}>
@@ -1523,4 +2087,32 @@ if (!matchesAvailPresets(availHay, appAvailPresets)) return false;
       </div>
     </aside>
   );
+}
+
+function snapButtonStyle(active: boolean): React.CSSProperties {
+  return {
+    border: `1px solid ${active ? UI.navy : UI.border}`,
+    background: active ? UI.navy : "#fff",
+    color: active ? "#fff" : UI.text,
+    borderRadius: 999,
+    padding: "6px 10px",
+    cursor: "pointer",
+    fontWeight: 900,
+    fontSize: 12,
+    whiteSpace: "nowrap",
+  };
+}
+
+function selectStyle(): React.CSSProperties {
+  return {
+    border: `1px solid ${UI.border}`,
+    borderRadius: 12,
+    padding: "8px 10px",
+    fontSize: 13,
+    fontWeight: 900,
+    outline: "none",
+    background: "rgba(255,255,255,0.95)",
+    boxShadow: "inset 0 1px 2px rgba(0,0,0,0.04)",
+    cursor: "pointer",
+  };
 }

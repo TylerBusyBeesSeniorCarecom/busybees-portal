@@ -1,13 +1,15 @@
 import { NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 
 function getBase() {
-  console.log("NEXT_WEEK_API_URL =", process.env.NEXT_WEEK_API_URL);
+  console.log("DEBUG NEXT_WEEK_API_URL =", process.env.NEXT_WEEK_API_URL);
   const base = process.env.NEXT_WEEK_API_URL;
   if (!base) throw new Error("Missing NEXT_WEEK_API_URL");
   return base;
 }
+
 
 
 export async function GET(req: Request) {

@@ -1,22 +1,52 @@
 // app/api/freshbooks/connect/route.ts
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
+import crypto from "crypto";
 
 export const dynamic = "force-dynamic";
 
-export async function GET(req: Request) {
-  const clientId = process.env.FRESHBOOKS_CLIENT_ID!;
-  const redirectUri = process.env.FRESHBOOKS_REDIRECT_URI!;
-  const scopes = process.env.FRESHBOOKS_SCOPES || "user:profile:read user:invoices:read";
+function mustEnv(name: string) {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Missing env var: ${name}`);
+  }
+  return value;
+}
 
-  // FreshBooks authorization URL format is documented here :contentReference[oaicite:3]{index=3}
-  const authUrl = new URL("https://auth.freshbooks.com/oauth/authorize/");
-  authUrl.searchParams.set("response_type", "code");
-  authUrl.searchParams.set("client_id", clientId);
-  authUrl.searchParams.set("redirect_uri", redirectUri);
-  authUrl.searchParams.set("scope", scopes);
+export async function GET(req: NextRequest) {
+  try {
+    const clientId = mustEnv("FRESHBOOKS_CLIENT_ID");
+    const redirectUri = mustEnv("FRESHBOOKS_REDIRECT_URI");
+    const scopes =
+      process.env.FRESHBOOKS_SCOPES ||
+      "user:profile:read user:invoices:read user:clients:read";
 
-  // Optional but recommended: state param to prevent CSRF
-  authUrl.searchParams.set("state", crypto.randomUUID());
+    const state = crypto.randomBytes(24).toString("hex");
 
-  return NextResponse.redirect(authUrl.toString());
+    const authUrl = new URL("https://auth.freshbooks.com/oauth/authorize/");
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("client_id", clientId);
+    authUrl.searchParams.set("redirect_uri", redirectUri);
+    authUrl.searchParams.set("scope", scopes);
+    authUrl.searchParams.set("state", state);
+
+    const response = NextResponse.redirect(authUrl.toString());
+
+    response.cookies.set("fb_oauth_state", state, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+      maxAge: 60 * 10, // 10 minutes
+    });
+
+    return response;
+  } catch (error: any) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: error?.message || "Failed to start FreshBooks OAuth",
+      },
+      { status: 500 }
+    );
+  }
 }

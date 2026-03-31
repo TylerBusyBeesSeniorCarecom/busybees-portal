@@ -31,10 +31,9 @@ export default function FloatingPanel({
   initial,
   minW = 360,
   minH = 240,
+  children,
   zIndex = 9999,
   rightActions,
-  leftActions, // ✅ NEW
-  children,
 }: {
   open: boolean;
   onClose: () => void;
@@ -45,7 +44,6 @@ export default function FloatingPanel({
   minH?: number;
   zIndex?: number;
   rightActions?: React.ReactNode;
-  leftActions?: React.ReactNode; // ✅ NEW
   children: React.ReactNode;
 }) {
   const defaultRect: Rect = useMemo(() => {
@@ -72,6 +70,7 @@ export default function FloatingPanel({
     oy: number;
   } | null>(null);
 
+  // Load saved position/size when opened
   useEffect(() => {
     if (!open) return;
 
@@ -92,11 +91,13 @@ export default function FloatingPanel({
     }
   }, [open, storageKey, defaultRect, minW, minH]);
 
+  // Save when rect changes (while open)
   useEffect(() => {
     if (!open) return;
     localStorage.setItem(storageKey, JSON.stringify(rect));
   }, [open, storageKey, rect]);
 
+  // Keep rect clamped on viewport resize (so it never drifts off-screen)
   useEffect(() => {
     if (!open) return;
 
@@ -117,6 +118,7 @@ export default function FloatingPanel({
     return () => window.removeEventListener("resize", onResize);
   }, [open, minW, minH]);
 
+  // ESC closes
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -126,6 +128,12 @@ export default function FloatingPanel({
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
+  /**
+   * ✅ FIX: Stop "panel keeps expanding"
+   * - Use border-box sizing so borders don't change measured width/height.
+   * - Measure with getBoundingClientRect() (matches the rendered box).
+   * - Ignore tiny 1px jitters to prevent feedback loops.
+   */
   useEffect(() => {
     if (!open) return;
     const el = panelRef.current;
@@ -164,8 +172,12 @@ export default function FloatingPanel({
     };
   }, [open, minW, minH]);
 
+  // Drag handlers
   function onHeaderPointerDown(e: React.PointerEvent) {
+    // Only left click / primary pointer
     if (e.button !== 0) return;
+
+    // ✅ Don't start dragging if the user is interacting with a control in the header.
     if (isInteractiveTarget(e.target)) return;
 
     e.preventDefault();
@@ -216,17 +228,25 @@ export default function FloatingPanel({
         boxShadow: "0 18px 60px rgba(0,0,0,0.28)",
         border: "1px solid rgba(15,23,42,0.14)",
         background: "white",
+
+        // ✅ CRITICAL: prevents border/scrollbar from causing ResizeObserver feedback growth
         boxSizing: "border-box",
+
+        // Native resizing applies to the outer panel so it truly changes size
         resize: "both",
         minWidth: minW,
         minHeight: minH,
+
+        // keeps resize handle visible on mac/chrome
         maxWidth: "calc(100vw - 24px)",
         maxHeight: "calc(100vh - 24px)",
       }}
+      // stop accidental clicks behind it (and prevent click leak-through)
       onMouseDown={(e) => e.stopPropagation()}
       onPointerDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
     >
+      {/* Header (drag handle) */}
       <div
         onPointerDown={onHeaderPointerDown}
         onPointerMove={onHeaderPointerMove}
@@ -245,32 +265,31 @@ export default function FloatingPanel({
         }}
         title="Drag to move • Resize from bottom-right corner"
       >
-        {/* ✅ Left side: title + optional leftActions */}
-        <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-          <div
-            style={{
-              fontWeight: 950,
-              fontSize: 13,
-              minWidth: 0,
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-            }}
-          >
-            {title}
-          </div>
-
-          {/* ✅ NEW: leftActions (marked no-drag) */}
-          {leftActions ? <div data-no-drag style={{ display: "flex", gap: 8 }}>{leftActions}</div> : null}
+        <div
+          style={{
+            fontWeight: 950,
+            fontSize: 13,
+            minWidth: 0,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {title}
         </div>
 
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          {/* If you render buttons in rightActions, they won't trigger drag because of isInteractiveTarget() */}
           {rightActions ?? null}
 
+          {/* Close */}
           <button
             type="button"
             data-no-drag
-            onPointerDown={(e) => e.stopPropagation()}
+            onPointerDown={(e) => {
+              // ✅ Prevent the header from capturing pointer on press
+              e.stopPropagation();
+            }}
             onClick={(e) => {
               e.preventDefault();
               e.stopPropagation();
@@ -293,6 +312,7 @@ export default function FloatingPanel({
         </div>
       </div>
 
+      {/* Body (scroll area) */}
       <div
         style={{
           height: `calc(100% - 44px)`,
@@ -303,6 +323,7 @@ export default function FloatingPanel({
         {children}
       </div>
 
+      {/* Resize handle hint (visual) */}
       <div
         style={{
           position: "absolute",
