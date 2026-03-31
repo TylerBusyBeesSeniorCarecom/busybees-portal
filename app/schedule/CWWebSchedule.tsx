@@ -4,7 +4,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation"; // ✅ NEW
 import { useSession } from "next-auth/react";
-import ShiftCard from "./components/ShiftCard";
+import ShiftCard, { type ShiftStatus as ShiftCardStatus } from "./components/ShiftCard";
 import { useShiftInfo } from "./components/useShiftInfo";
 import { useMessagesUI } from "@/app/api/messages/MessagesContext";
 import TopNav from "./components/TopNav";
@@ -459,7 +459,17 @@ type EditHistoryModalTarget = {
   endTime: string;
   status: ShiftStatus;
 };
-
+type EditHistoryOpenPayload = {
+  a1Key: string;
+  clientName: string;
+  dateStr: string;
+  week: WeekKind;
+  shiftId: string;
+  caregiverName: string;
+  startTime: string;
+  endTime: string;
+  status: ShiftStatus;
+};
 type ShiftRateRecord = {
   shiftId: string;
   rate: number | string | null;
@@ -2194,12 +2204,14 @@ const [insertRowSaving, setInsertRowSaving] = useState(false);
       [week]: new Set(),
     }));
 
-    setInsertRowModal({
-      open: false,
-      insertAtRow: null,
-      clientName: "",
-      anchorClientName: "",
-    });
+   setInsertRowModal({
+  open: false,
+  anchorRow: null,
+  insertAtRow: null,
+  position: "below",
+  clientName: "",
+  anchorClientName: "",
+});
   }, [week]);
 
       // inline cell editing
@@ -3627,19 +3639,29 @@ function resetBulkSearchUi(mode: "caregiver" | "client" | "status" | "manual") {
       return next;
     });
   }
-  function openEditHistoryForCell(args: {
-    a1: string;
-    clientName: string;
-    dateStr: string;
-    dayLabel: string;
-  }) {
-    setEditHistoryModalTarget({
-      a1: args.a1,
-      clientName: args.clientName,
-      dateStr: args.dateStr,
-      dayLabel: args.dayLabel,
-      week,
-    });
+ function openEditHistoryForCell(args: {
+  a1: string;
+  clientName: string;
+  dateStr: string;
+  dayLabel: string;
+  shiftId: string;
+  caregiverName: string;
+  startTime: string;
+  endTime: string;
+  status: ShiftStatus;
+}) {
+   setEditHistoryModalTarget({
+  a1: args.a1,
+  clientName: args.clientName,
+  dateStr: args.dateStr,
+  dayLabel: args.dayLabel,
+  week,
+  shiftId: args.shiftId,
+  caregiverName: args.caregiverName,
+  startTime: args.startTime,
+  endTime: args.endTime,
+  status: args.status,
+});
   }
 
       function cellHasEditHistory(args: {
