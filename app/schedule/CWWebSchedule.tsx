@@ -11,6 +11,7 @@ import TopNav from "./components/TopNav";
 import CaregiverWebSchedulePanel from "./components/CaregiverWebSchedulePanel";
 import ServiceRequestsPanel from "./components/AppServiceRequests";
 import OnboardingPanel from "./components/OnboardingPanel";
+import SupraesophagealGanglionPanel from "./components/SupraesophagealGanglionPanel";
 import useDraftSchedule from "./hooks/useDraftSchedule";
 import {
   buildShiftSaveToast,
@@ -1412,6 +1413,7 @@ async function fetchShiftRateByShiftId(shiftId: string): Promise<ShiftRateRecord
 async function saveShiftRate(args: {
   shiftId: string;
   newRate: number;
+  shiftTotal?: number | null;
   updatedBy: string;
   reason?: string;
 }): Promise<ShiftRateRecord | null> {
@@ -1424,6 +1426,7 @@ async function saveShiftRate(args: {
       action: "updateShiftRate",
       shiftId: args.shiftId,
       newRate: args.newRate,
+      shiftTotal: args.shiftTotal ?? null,
       updatedBy: args.updatedBy,
       reason: args.reason || "",
     }),
@@ -1444,6 +1447,8 @@ async function saveShiftRate(args: {
 
   return j?.rate ?? null;
 }
+
+
 
 async function logAndSaveScheduleEdit(args: {
   timestamp: string;
@@ -1838,6 +1843,16 @@ function Modal({
 
 /** ---------- Caregiver panel helpers ---------- */
 
+const SHIFT_RATE_REASON_OPTIONS = [
+  "Incentive pay",
+  "Meet & Greet",
+  "Holiday Pay",
+  "Manual Correction",
+  "Other",
+] as const;
+
+type ShiftRateReasonOption = (typeof SHIFT_RATE_REASON_OPTIONS)[number];
+
 function durationHoursFromStartEnd(start: string, end: string): number {
   const s = parseTimeToMinutes(start);
   const e0 = parseTimeToMinutes(end);
@@ -1847,6 +1862,19 @@ function durationHoursFromStartEnd(start: string, end: string): number {
   return Math.max(0, (e - s) / 60);
 }
 
+function formatMoneyInput(value: number | string | null | undefined): string {
+  if (value == null) return "";
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "";
+  return n.toFixed(2);
+}
+
+function parseMoneyInput(value: string): number | null {
+  const cleaned = norm(value).replace(/[$,\s]/g, "");
+  if (!cleaned) return null;
+  const parsed = Number(cleaned);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 function isActiveStatus(status: string) {
   const s = norm(status).toLowerCase();
   if (!s) return true;
@@ -2008,6 +2036,7 @@ const [week, setWeek] = useState<WeekKind>("cw");
 
 const [panelOpen, setPanelOpen] = useState(false);
 const [panelWidth, setPanelWidth] = useState(470);
+const [ganglionOpen, setGanglionOpen] = useState(false);
 
 function handlePanelResize(nextWidth: number) {
   const clamped = Math.max(360, Math.min(760, Math.round(nextWidth)));
@@ -2131,14 +2160,21 @@ const STICKY_DATE_ROW_TOP = STICKY_DAY_ROW_HEIGHT;
   const [ghostError, setGhostError] = useState<string | null>(null);
   const [ghostShifts, setGhostShifts] = useState<GhostShift[]>([]);
 
-  // clients
+   // clients
   const [clientsLoading, setClientsLoading] = useState(false);
   const [clientsError, setClientsError] = useState<string | null>(null);
   const [clientsByName, setClientsByName] = useState<Record<string, ClientProfile>>({});
 
-    // client profile modal
+  // client profile modal
   const [clientProfileOpen, setClientProfileOpen] = useState(false);
-const [clientProfileName, setClientProfileName] = useState<string>("");
+  const [clientProfileName, setClientProfileName] = useState<string>("");
+
+  // client description edit state
+  const [clientProfileEditMode, setClientProfileEditMode] = useState(false);
+  const [clientDescriptionDraft, setClientDescriptionDraft] = useState<string>("");
+  const [clientDescriptionSaving, setClientDescriptionSaving] = useState(false);
+  const [clientDescriptionError, setClientDescriptionError] = useState<string | null>(null);
+  const [clientDescriptionSavedAt, setClientDescriptionSavedAt] = useState<string>("");
 
 // edit history modal
 const [editHistoryModalTarget, setEditHistoryModalTarget] =
@@ -2150,12 +2186,57 @@ const [scheduleEditLogRows, setScheduleEditLogRows] = useState<ScheduleEditLogRo
 // shift rate state
 const [shiftRateLoading, setShiftRateLoading] = useState(false);
 const [shiftRateError, setShiftRateError] = useState<string | null>(null);
+
+// hourly rate
 const [shiftRateValue, setShiftRateValue] = useState<string>("");
 const [shiftRateOriginalValue, setShiftRateOriginalValue] = useState<string>("");
+
+// total shift pay
+const [shiftRateTotalValue, setShiftRateTotalValue] = useState<string>("");
+const [shiftRateOriginalTotalValue, setShiftRateOriginalTotalValue] = useState<string>("");
+
+// reason dropdown
 const [shiftRateReason, setShiftRateReason] = useState<string>("");
+const [shiftRateCustomReason, setShiftRateCustomReason] = useState<string>("");
+// saved metadata
 const [shiftRateUpdatedAt, setShiftRateUpdatedAt] = useState<string>("");
 const [shiftRateUpdatedBy, setShiftRateUpdatedBy] = useState<string>("");
+
 const [shiftRateSaving, setShiftRateSaving] = useState(false);
+const shiftRateHours = useMemo(() => {
+  if (!editHistoryModalTarget) return 0;
+  return durationHoursFromStartEnd(
+    editHistoryModalTarget.startTime,
+    editHistoryModalTarget.endTime
+  );
+}, [editHistoryModalTarget]);
+
+const shiftRateParsedTotal = useMemo(() => {
+  return parseMoneyInput(shiftRateTotalValue);
+}, [shiftRateTotalValue]);
+
+const shiftRateParsedHourly = useMemo(() => {
+  return parseMoneyInput(shiftRateValue);
+}, [shiftRateValue]);
+
+const shiftRateCalculatedHourly = useMemo(() => {
+  if (!shiftRateHours || shiftRateHours <= 0) return null;
+  if (shiftRateParsedTotal == null) return null;
+  return shiftRateParsedTotal / shiftRateHours;
+}, [shiftRateParsedTotal, shiftRateHours]);
+
+const shiftRateCalculatedTotal = useMemo(() => {
+  if (!shiftRateHours || shiftRateHours <= 0) return null;
+  if (shiftRateParsedHourly == null) return null;
+  return shiftRateParsedHourly * shiftRateHours;
+}, [shiftRateParsedHourly, shiftRateHours]);
+
+const finalShiftRateReason = useMemo(() => {
+  if (shiftRateReason === "Other") {
+    return norm(shiftRateCustomReason);
+  }
+  return norm(shiftRateReason);
+}, [shiftRateReason, shiftRateCustomReason]);
 
 // ✅ Onboarding panel
 const [onboardingOpen, setOnboardingOpen] = useState(false);
@@ -2357,20 +2438,49 @@ async function loadShiftRateForTarget(target: EditHistoryModalTarget) {
   try {
     setShiftRateLoading(true);
     setShiftRateError(null);
+
     setShiftRateValue("");
     setShiftRateOriginalValue("");
+
+    setShiftRateTotalValue("");
+    setShiftRateOriginalTotalValue("");
+
     setShiftRateReason("");
-    setShiftRateUpdatedAt("");
-    setShiftRateUpdatedBy("");
+setShiftRateCustomReason("");
+setShiftRateUpdatedAt("");
+setShiftRateUpdatedBy("");
 
-    const rateRow = await fetchShiftRateByShiftId(target.shiftId);
-    const nextRate = rateRow?.rate == null ? "" : String(rateRow.rate);
+const rateRow = await fetchShiftRateByShiftId(target.shiftId);
+const nextRate = rateRow?.rate == null ? "" : String(rateRow.rate);
 
-    setShiftRateValue(nextRate);
-    setShiftRateOriginalValue(nextRate);
-    setShiftRateUpdatedAt(norm(rateRow?.updatedAt));
-    setShiftRateUpdatedBy(norm(rateRow?.updatedBy));
-    setShiftRateReason(norm(rateRow?.reason));
+const hours = durationHoursFromStartEnd(target.startTime, target.endTime);
+const parsedRate = parseMoneyInput(nextRate);
+const derivedTotal =
+  parsedRate != null && hours > 0 ? (parsedRate * hours).toFixed(2) : "";
+
+setShiftRateValue(nextRate);
+setShiftRateOriginalValue(nextRate);
+
+setShiftRateTotalValue(derivedTotal);
+setShiftRateOriginalTotalValue(derivedTotal);
+
+setShiftRateUpdatedAt(norm(rateRow?.updatedAt));
+setShiftRateUpdatedBy(norm(rateRow?.updatedBy));
+
+const loadedReason = norm(rateRow?.reason);
+
+if (!loadedReason) {
+  setShiftRateReason("");
+  setShiftRateCustomReason("");
+} else if (
+  SHIFT_RATE_REASON_OPTIONS.includes(loadedReason as ShiftRateReasonOption)
+) {
+  setShiftRateReason(loadedReason);
+  setShiftRateCustomReason("");
+} else {
+  setShiftRateReason("Other");
+  setShiftRateCustomReason(loadedReason);
+}
   } catch (err: any) {
     setShiftRateError(err?.message || "Failed to load shift rate.");
   } finally {
@@ -2625,7 +2735,7 @@ const [availTabName, setAvailTabName] = useState<string>("");
     }
   }
 
-  async function refreshClients() {
+    async function refreshClients() {
     try {
       setClientsLoading(true);
       setClientsError(null);
@@ -2640,7 +2750,65 @@ const [availTabName, setAvailTabName] = useState<string>("");
       setClientsLoading(false);
     }
   }
+async function handleSaveClientDescription() {
+  const clientName = norm(clientProfileName);
+  if (!clientName) {
+    setClientDescriptionError("Missing client name");
+    return;
+  }
 
+  try {
+    setClientDescriptionSaving(true);
+    setClientDescriptionError(null);
+    setClientDescriptionSavedAt("");
+
+    const res = await fetch("/api/clients", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        action: "updateClientDescription",
+        clientName,
+        description: clientDescriptionDraft,
+        updatedBy: currentUserName,
+        updatedByEmail: currentUserEmail,
+      }),
+    });
+
+    const text = await res.text();
+    let j: any = null;
+
+    try {
+      j = text ? JSON.parse(text.trim()) : null;
+    } catch {
+      throw new Error(`Client description save failed (${res.status})`);
+    }
+
+    if (!res.ok || !j?.ok) {
+      throw new Error(j?.error || `Client description save failed (${res.status})`);
+    }
+
+    await refreshClients();
+    setClientProfileEditMode(false);
+    setClientDescriptionSavedAt(new Date().toISOString());
+  } catch (e: any) {
+    setClientDescriptionError(e?.message ?? "Unknown save error");
+  } finally {
+    setClientDescriptionSaving(false);
+  }
+}
+  useEffect(() => {
+    if (!clientProfileOpen) return;
+
+    const key = normalizeKey(clientProfileName);
+    const p = key ? clientsByName[key] : undefined;
+
+    setClientDescriptionDraft(norm(p?.description));
+    setClientProfileEditMode(false);
+    setClientDescriptionError(null);
+    setClientDescriptionSavedAt("");
+  }, [clientProfileOpen, clientProfileName, clientsByName]);
   // initial load
   useEffect(() => {
     let alive = true;
@@ -3139,80 +3307,93 @@ function resetBulkSearchUi(mode: "caregiver" | "client" | "status" | "manual") {
   }, [rows, draftMode, getDraftValue, week]);
 
     const totals = useMemo(() => {
-    let totalHours = 0;
-    const clientSet = new Set<string>();
+  let totalHours = 0;
+  const clientSet = new Set<string>();
+  const caregiverSet = new Set<string>();
 
-    for (const r of rows) {
-      const cn = norm(r.clientName);
-      if (cn) clientSet.add(cn);
+  for (const r of rows) {
+    const cn = norm(r.clientName);
+    if (cn) clientSet.add(cn);
 
-      for (let dow = 0; dow < 7; dow++) {
-        if (selectedDow != null && dow !== selectedDow) continue;
+    for (let dow = 0; dow < 7; dow++) {
+      if (selectedDow != null && dow !== selectedDow) continue;
 
-        const c = r.cells[dow];
-        const originalValue = norm(c?.value);
-        const v =
-          draftMode && c?.a1
-            ? norm(
-                getDraftValue({
-                  a1: c.a1,
-                  week,
-                  originalValue,
-                })
-              )
-            : originalValue;
+      const c = r.cells[dow];
+      const originalValue = norm(c?.value);
+      const v =
+        draftMode && c?.a1
+          ? norm(
+              getDraftValue({
+                a1: c.a1,
+                week,
+                originalValue,
+              })
+            )
+          : originalValue;
 
-        if (!v) continue;
+      if (!v) continue;
 
-        const tr = parseFirstTimeRange(v);
-        if (!tr) continue;
+      const status = statusFromCellValue(v);
+      if (status !== "filled") continue;
 
-        totalHours += durationHoursFromStartEnd(tr.start, tr.end);
-      }
+      const tr = parseFirstTimeRange(v);
+      if (!tr) continue;
+
+      totalHours += durationHoursFromStartEnd(tr.start, tr.end);
+
+      const caregiverName = parseCaregiverFromCell(v);
+      if (caregiverName) caregiverSet.add(caregiverName);
+    }
+  }
+
+  return {
+    clientCount: clientSet.size,
+    caregiverCount: caregiverSet.size,
+    totalHours,
+  };
+}, [rows, selectedDow, draftMode, getDraftValue, week]);
+
+   const hoursByClient = useMemo(() => {
+  const map = new Map<string, number>();
+
+  for (const r of rows) {
+    const cn = norm(r.clientName);
+    if (!cn) continue;
+
+    let sum = map.get(cn) ?? 0;
+
+    for (let dow = 0; dow < 7; dow++) {
+      if (selectedDow != null && dow !== selectedDow) continue;
+
+      const cell = r.cells?.[dow];
+      const originalValue = norm(cell?.value);
+      const v =
+        draftMode && cell?.a1
+          ? norm(
+              getDraftValue({
+                a1: cell.a1,
+                week,
+                originalValue,
+              })
+            )
+          : originalValue;
+
+      if (!v) continue;
+
+      const status = statusFromCellValue(v);
+      if (status !== "filled") continue;
+
+      const tr = parseFirstTimeRange(v);
+      if (!tr) continue;
+
+      sum += durationHoursFromStartEnd(tr.start, tr.end);
     }
 
-    return { clientCount: clientSet.size, totalHours };
-  }, [rows, selectedDow, draftMode, getDraftValue, week]);
+    map.set(cn, sum);
+  }
 
-    const hoursByClient = useMemo(() => {
-    const map = new Map<string, number>();
-
-    for (const r of rows) {
-      const cn = norm(r.clientName);
-      if (!cn) continue;
-
-      let sum = map.get(cn) ?? 0;
-
-      for (let dow = 0; dow < 7; dow++) {
-        if (selectedDow != null && dow !== selectedDow) continue;
-
-        const cell = r.cells?.[dow];
-        const originalValue = norm(cell?.value);
-        const v =
-          draftMode && cell?.a1
-            ? norm(
-                getDraftValue({
-                  a1: cell.a1,
-                  week,
-                  originalValue,
-                })
-              )
-            : originalValue;
-
-        if (!v) continue;
-
-        const tr = parseFirstTimeRange(v);
-        if (!tr) continue;
-
-        sum += durationHoursFromStartEnd(tr.start, tr.end);
-      }
-
-      map.set(cn, sum);
-    }
-
-    return map;
-  }, [rows, selectedDow, draftMode, getDraftValue, week]);
-
+  return map;
+}, [rows, selectedDow, draftMode, getDraftValue, week]);
   /** ---------- Availability parsing -> maps ---------- */
 
   const availHeaders = useMemo(() => (availValues?.[0] ?? []).map((h) => norm(h)), [availValues]);
@@ -4218,18 +4399,34 @@ async function handleOpenEditHistory(payload: EditHistoryOpenPayload) {
   ]);
 }
 
-async function handleSaveShiftRate() {
+
+    async function handleSaveShiftRate() {
   if (!editHistoryModalTarget?.shiftId) return;
 
-  const trimmed = norm(shiftRateValue);
-  if (!trimmed) {
-    setShiftRateError("Please enter a shift rate.");
+  if (!finalShiftRateReason) {
+  setShiftRateError("Please select or enter a reason.");
+  return;
+}
+
+  if (!shiftRateHours || shiftRateHours <= 0) {
+    setShiftRateError("This shift does not have valid hours for rate calculation.");
     return;
   }
 
-  const parsed = Number(trimmed);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    setShiftRateError("Shift rate must be a valid number.");
+  const parsedTotal = parseMoneyInput(shiftRateTotalValue);
+  if (parsedTotal == null) {
+    setShiftRateError("Please enter the total pay for the entire shift.");
+    return;
+  }
+
+  if (parsedTotal < 0) {
+    setShiftRateError("Total shift pay must be a valid positive number.");
+    return;
+  }
+
+  const calculatedRate = parsedTotal / shiftRateHours;
+  if (!Number.isFinite(calculatedRate) || calculatedRate < 0) {
+    setShiftRateError("Calculated hourly rate is invalid.");
     return;
   }
 
@@ -4238,11 +4435,12 @@ async function handleSaveShiftRate() {
     setShiftRateError(null);
 
     await saveShiftRate({
-      shiftId: editHistoryModalTarget.shiftId,
-      newRate: parsed,
-      updatedBy: currentUserName,
-      reason: shiftRateReason,
-    });
+  shiftId: editHistoryModalTarget.shiftId,
+  newRate: calculatedRate,
+  shiftTotal: parsedTotal,
+  updatedBy: currentUserName,
+  reason: finalShiftRateReason,
+});
 
     await loadShiftRateForTarget(editHistoryModalTarget);
     await refreshScheduleEditLogForWeek(editHistoryModalTarget.week);
@@ -4256,7 +4454,9 @@ async function handleSaveShiftRate() {
           editHistoryModalTarget.startTime,
           editHistoryModalTarget.endTime
         )}`,
-        `New rate: $${parsed.toFixed(2)}`,
+        `Shift total: $${parsedTotal.toFixed(2)}`,
+        `Hourly rate: $${calculatedRate.toFixed(2)}`,
+     `Reason: ${finalShiftRateReason}`,
       ],
     });
   } catch (err: any) {
@@ -4456,13 +4656,31 @@ async function handleCaregiverDropToShift(args: {
         zIndex: TOPNAV_Z,
       }}
     >
-           <TopNav
-        week={week}
-        currentUserName={currentUserName}
-        currentUserEmail={currentUserEmail}
-        portalUsersOnline={portalUsersOnline}
-        right={
-          <>
+          <TopNav
+  week={week}
+  currentUserName={currentUserName}
+  currentUserEmail={currentUserEmail}
+  portalUsersOnline={portalUsersOnline}
+  right={
+    <>
+      <button
+        type="button"
+        onClick={() => setGanglionOpen(true)}
+        style={{
+          border: `1px solid ${UI.border}`,
+          background: UI.panelBg,
+          color: UI.text,
+          borderRadius: 10,
+          padding: "8px 12px",
+          fontWeight: 900,
+          cursor: "pointer",
+          whiteSpace: "nowrap",
+        }}
+        title="Open Supraesophageal Ganglion workpad"
+      >
+        🧠 Workpad
+      </button>
+
             <div
               style={{
                 display: "inline-flex",
@@ -4857,73 +5075,85 @@ async function handleCaregiverDropToShift(args: {
         alignItems: "center",
       }}
     >
-      <div
-        style={{
-          background: UI.panelBg,
-          border: `1px solid ${UI.border}`,
-          borderRadius: 12,
-          padding: "8px 10px",
-        }}
-      >
-        <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Total Hours (approx)</div>
-        <div style={{ fontSize: 16, fontWeight: 900 }}>{totals.totalHours.toFixed(1)}</div>
-      </div>
+     <div
+  style={{
+    background: UI.panelBg,
+    border: `1px solid ${UI.border}`,
+    borderRadius: 12,
+    padding: "8px 10px",
+  }}
+>
+  <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Filled Hours</div>
+  <div style={{ fontSize: 16, fontWeight: 900 }}>{totals.totalHours.toFixed(1)}</div>
+</div>
 
-      <div
-        style={{
-          background: UI.panelBg,
-          border: `1px solid ${UI.border}`,
-          borderRadius: 12,
-          padding: "8px 10px",
-        }}
-      >
-        <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Clients</div>
-        <div style={{ fontSize: 16, fontWeight: 900 }}>{totals.clientCount}</div>
-      </div>
+<div
+  style={{
+    background: UI.panelBg,
+    border: `1px solid ${UI.border}`,
+    borderRadius: 12,
+    padding: "8px 10px",
+  }}
+>
+  <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Clients</div>
+  <div style={{ fontSize: 16, fontWeight: 900 }}>{totals.clientCount}</div>
+</div>
 
-      <div
-        style={{
-          background: UI.panelBg,
-          border: `1px solid ${UI.border}`,
-          borderRadius: 12,
-          padding: "8px 10px",
-        }}
-      >
-        <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Flagged Shifts</div>
-        <div style={{ fontSize: 16, fontWeight: 900 }}>{flaggedShiftsTotal}</div>
-      </div>
+<div
+  style={{
+    background: UI.panelBg,
+    border: `1px solid ${UI.border}`,
+    borderRadius: 12,
+    padding: "8px 10px",
+  }}
+>
+  <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Caregivers</div>
+  <div style={{ fontSize: 16, fontWeight: 900 }}>{totals.caregiverCount}</div>
+</div>
 
-      <div
-        style={{
-          marginLeft: "auto",
-          display: "flex",
-          gap: 10,
-          alignItems: "center",
-          flexWrap: "wrap",
-        }}
-      >
-        <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>Panel filter</div>
-        <select
-          value={panelFilter}
-          onChange={(e) => setPanelFilter(e.target.value as any)}
-          style={{
-            border: `1px solid ${UI.border}`,
-            borderRadius: 12,
-            padding: "8px 10px",
-            fontSize: 13,
-            outline: "none",
-            background: UI.panelBg,
-            minWidth: 280,
-            fontWeight: 800,
-          }}
-          title="Filter the caregiver panel"
-        >
-          <option value="all">Caregivers on schedule (active)</option>
-          <option value="certifiedActive">Caregivers with certification (active)</option>
-          <option value="missingProfile">On schedule, missing caregiver profile</option>
-        </select>
-      </div>
-    </div>
+<div
+  style={{
+    background: UI.panelBg,
+    border: `1px solid ${UI.border}`,
+    borderRadius: 12,
+    padding: "8px 10px",
+  }}
+>
+  <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Flagged Shifts</div>
+  <div style={{ fontSize: 16, fontWeight: 900 }}>{flaggedShiftsTotal}</div>
+</div>
+
+<div
+  style={{
+    marginLeft: "auto",
+    display: "flex",
+    gap: 10,
+    alignItems: "center",
+    flexWrap: "wrap",
+  }}
+>
+  <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>Panel filter</div>
+  <select
+    value={panelFilter}
+    onChange={(e) => setPanelFilter(e.target.value as any)}
+    style={{
+      border: `1px solid ${UI.border}`,
+      borderRadius: 12,
+      padding: "8px 10px",
+      fontSize: 13,
+      outline: "none",
+      background: UI.panelBg,
+      minWidth: 280,
+      fontWeight: 800,
+    }}
+    title="Filter the caregiver panel"
+  >
+    <option value="all">Caregivers on schedule (active)</option>
+    <option value="certifiedActive">Caregivers with certification (active)</option>
+    <option value="missingProfile">On schedule, missing caregiver profile</option>
+  </select>
+</div>
+</div>
 
     {draftMode ? (
       <div
@@ -5699,229 +5929,413 @@ async function handleCaregiverDropToShift(args: {
     </div>
   </div>
 </Modal>
-    <Modal
-      open={clientProfileOpen}
-      title={`Client Profile • ${clientProfileName || "Client"}`}
-      onClose={() => {
-        setClientProfileOpen(false);
-        setClientProfileName("");
-      }}
-    >
-      {(() => {
-        const key = normalizeKey(clientProfileName);
-        const p = key ? clientsByName[key] : undefined;
+  <Modal
+  open={clientProfileOpen}
+  title={`Client Profile • ${clientProfileName || "Client"}`}
+  onClose={() => {
+    setClientProfileOpen(false);
+    setClientProfileName("");
+    setClientProfileEditMode(false);
+    setClientDescriptionDraft("");
+    setClientDescriptionError(null);
+    setClientDescriptionSavedAt("");
+  }}
+>
+  {(() => {
+    const key = normalizeKey(clientProfileName);
+    const p = key ? clientsByName[key] : undefined;
 
-        const name = p?.name || clientProfileName || "Client";
-        const location = norm(p?.location);
-        const description = norm(p?.description);
-        const rate = norm(p?.rate);
+    const name = p?.name || clientProfileName || "Client";
+    const location = norm(p?.location);
+    const description = norm(p?.description);
+    const rate = norm(p?.rate);
 
-        return (
-          <div style={{ maxHeight: "70vh", overflowY: "auto", paddingRight: 6 }}>
-            <div style={{ display: "grid", gap: 14 }}>
-              <div
-                style={{
-                  border: `1px solid ${UI.borderSoft}`,
-                  borderRadius: 14,
-                  padding: 12,
-                  background: "rgba(255,255,255,0.9)",
-                }}
-              >
+    const clientHistory = buildClientHistoryList({
+      clientName: name,
+      historicalRows: histRows,
+      caregiversById,
+      idByNameOnSchedule,
+    });
+
+    return (
+      <div style={{ maxHeight: "70vh", overflowY: "auto", paddingRight: 6 }}>
+        <div style={{ display: "grid", gap: 14 }}>
+          <div
+            style={{
+              border: `1px solid ${UI.borderSoft}`,
+              borderRadius: 14,
+              padding: 12,
+              background: "rgba(255,255,255,0.9)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: 10,
+                alignItems: "baseline",
+                flexWrap: "wrap",
+              }}
+            >
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 12, fontWeight: 950, color: UI.textDim }}>
+                  Client
+                </div>
                 <div
                   style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    gap: 10,
-                    alignItems: "baseline",
+                    marginTop: 2,
+                    fontSize: 18,
+                    fontWeight: 1000,
+                    letterSpacing: 0.2,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                  title={name}
+                >
+                  {name}
+                </div>
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                {rate ? (
+                  <div
+                    style={{
+                      fontSize: 12,
+                      fontWeight: 950,
+                      padding: "6px 10px",
+                      borderRadius: 999,
+                      border: `1px solid ${UI.borderSoft}`,
+                      background: "#f8fafc",
+                      color: UI.text,
+                      whiteSpace: "nowrap",
+                    }}
+                    title="Hourly rate"
+                  >
+                    Rate: {rate}
+                  </div>
+                ) : null}
+
+                {!clientProfileEditMode ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setClientProfileEditMode(true);
+                      setClientDescriptionDraft(description);
+                      setClientDescriptionError(null);
+                      setClientDescriptionSavedAt("");
+                    }}
+                    style={{
+                      border: `1px solid ${UI.border}`,
+                      background: UI.panelBg,
+                      borderRadius: 10,
+                      padding: "6px 10px",
+                      cursor: "pointer",
+                      fontWeight: 900,
+                      fontSize: 12,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    Edit Description
+                  </button>
+                ) : null}
+              </div>
+            </div>
+
+            {location ? (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ fontSize: 11.5, fontWeight: 950, color: UI.textDim }}>
+                  Location
+                </div>
+                <div
+                  style={{
+                    marginTop: 3,
+                    fontSize: 13,
+                    color: UI.text,
+                    whiteSpace: "pre-wrap",
+                    lineHeight: 1.35,
                   }}
                 >
-                  <div style={{ minWidth: 0 }}>
-                    <div style={{ fontSize: 12, fontWeight: 950, color: UI.textDim }}>Client</div>
-                    <div
-                      style={{
-                        marginTop: 2,
-                        fontSize: 18,
-                        fontWeight: 1000,
-                        letterSpacing: 0.2,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                      title={name}
-                    >
-                      {name}
-                    </div>
-                  </div>
+                  {location}
+                </div>
+              </div>
+            ) : null}
 
-                  {rate ? (
+            <div style={{ marginTop: 10 }}>
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: 8,
+                }}
+              >
+                <div style={{ fontSize: 11.5, fontWeight: 950, color: UI.textDim }}>
+                  Description
+                </div>
+
+                {clientDescriptionSavedAt ? (
+                  <div
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 900,
+                      color: "#065f46",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    Saved
+                  </div>
+                ) : null}
+              </div>
+
+              {!clientProfileEditMode ? (
+                <div
+                  style={{
+                    marginTop: 3,
+                    fontSize: 13,
+                    color: UI.text,
+                    whiteSpace: "pre-wrap",
+                    lineHeight: 1.35,
+                  }}
+                >
+                  {description || "—"}
+                </div>
+              ) : (
+                <div style={{ marginTop: 8, display: "grid", gap: 8 }}>
+                  <textarea
+                    value={clientDescriptionDraft}
+                    onChange={(e) => setClientDescriptionDraft(e.target.value)}
+                    rows={8}
+                    style={{
+                      width: "100%",
+                      resize: "vertical",
+                      border: `1px solid ${UI.border}`,
+                      borderRadius: 12,
+                      padding: 10,
+                      fontSize: 13,
+                      color: UI.text,
+                      background: "#fff",
+                      lineHeight: 1.4,
+                    }}
+                  />
+
+                  {clientDescriptionError ? (
                     <div
                       style={{
                         fontSize: 12,
-                        fontWeight: 950,
-                        padding: "6px 10px",
-                        borderRadius: 999,
-                        border: `1px solid ${UI.borderSoft}`,
-                        background: "#f8fafc",
-                        color: UI.text,
-                        whiteSpace: "nowrap",
+                        fontWeight: 900,
+                        color: "#b91c1c",
                       }}
-                      title="Hourly rate"
                     >
-                      Rate: {rate}
+                      {clientDescriptionError}
                     </div>
                   ) : null}
-                </div>
 
-                <div style={{ marginTop: 10, display: "grid", gap: 10 }}>
-                  <div>
-                    <div style={{ fontSize: 11.5, fontWeight: 950, color: UI.textDim }}>Location</div>
-                    {location ? (
-                      <div
-                        style={{
-                          marginTop: 3,
-                          fontSize: 13,
-                          fontWeight: 850,
-                          color: UI.text,
-                          whiteSpace: "pre-wrap",
-                        }}
-                      >
-                        {location}
-                      </div>
-                    ) : (
-                      <div style={{ marginTop: 3, fontSize: 13, color: "#9ca3af", fontWeight: 850 }}>—</div>
-                    )}
-                  </div>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "flex-end",
+                      gap: 8,
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setClientProfileEditMode(false);
+                        setClientDescriptionDraft(description);
+                        setClientDescriptionError(null);
+                        setClientDescriptionSavedAt("");
+                      }}
+                      disabled={clientDescriptionSaving}
+                      style={{
+                        border: `1px solid ${UI.border}`,
+                        background: UI.panelBg,
+                        color: UI.text,
+                        borderRadius: 10,
+                        padding: "8px 12px",
+                        fontSize: 12,
+                        fontWeight: 900,
+                        cursor: clientDescriptionSaving ? "default" : "pointer",
+                      }}
+                    >
+                      Cancel
+                    </button>
 
-                  <div>
-                    <div style={{ fontSize: 11.5, fontWeight: 950, color: UI.textDim }}>Description</div>
-                    {description ? (
-                      <div
-                        style={{
-                          marginTop: 3,
-                          fontSize: 13,
-                          color: UI.text,
-                          whiteSpace: "pre-wrap",
-                          lineHeight: 1.35,
-                        }}
-                      >
-                        {description}
-                      </div>
-                    ) : (
-                      <div style={{ marginTop: 3, fontSize: 13, color: "#9ca3af", fontWeight: 850 }}>—</div>
-                    )}
-                  </div>
-
-                  <div style={{ marginTop: 2, fontSize: 11.5, color: UI.textDim, lineHeight: 1.3 }}>
-                    {clientsLoading ? (
-                      <span>Client details: loading…</span>
-                    ) : clientsError ? (
-                      <span style={{ color: "salmon", fontWeight: 900 }}>
-                        Client details error: {clientsError}
-                      </span>
-                    ) : p ? (
-                      <span>Client details: loaded from Clients sheet.</span>
-                    ) : (
-                      <span style={{ color: "salmon", fontWeight: 900 }}>
-                        Client details not found in Clients sheet for: <strong>{clientProfileName}</strong>
-                      </span>
-                    )}
+                    <button
+                      type="button"
+                      onClick={handleSaveClientDescription}
+                      disabled={clientDescriptionSaving}
+                      style={{
+                        border: `1px solid ${UI.border}`,
+                        background: "#111827",
+                        color: "#fff",
+                        borderRadius: 10,
+                        padding: "8px 12px",
+                        fontSize: 12,
+                        fontWeight: 900,
+                        cursor: clientDescriptionSaving ? "default" : "pointer",
+                      }}
+                    >
+                      {clientDescriptionSaving ? "Saving..." : "Save Description"}
+                    </button>
                   </div>
                 </div>
+              )}
+            </div>
+
+            <div style={{ marginTop: 14 }}>
+              <div
+                style={{
+                  fontSize: 11.5,
+                  fontWeight: 950,
+                  color: UI.textDim,
+                }}
+              >
+                Caregiver History
               </div>
 
-              <div style={{ display: "grid", gap: 6 }}>
-                <div style={{ fontSize: 12, fontWeight: 950, color: UI.textDim }}>
-                  Caregivers who have been here
+              {histLoading ? (
+                <div style={{ marginTop: 6, fontSize: 12, color: UI.textDim }}>
+                  Loading caregiver history...
                 </div>
+              ) : histError ? (
+                <div
+                  style={{
+                    marginTop: 6,
+                    fontSize: 12,
+                    fontWeight: 900,
+                    color: "salmon",
+                  }}
+                >
+                  Historical data error: {histError}
+                </div>
+              ) : clientHistory.length === 0 ? (
+                <div style={{ marginTop: 6, fontSize: 12, color: UI.textDim }}>
+                  No caregiver history found.
+                </div>
+              ) : (
+                <div
+                  style={{
+                    marginTop: 8,
+                    display: "grid",
+                    gap: 8,
+                  }}
+                >
+                 {clientHistory.map((item) => {
+  const caregiverId = norm(item.caregiverId);
+  const caregiverNameKey = normalizeKey(item.caregiverName);
 
-                {histLoading ? (
-                  <div style={{ fontSize: 13, color: UI.textDim }}>Loading history…</div>
-                ) : histError ? (
-                  <div style={{ fontSize: 13, color: "salmon", fontWeight: 800 }}>{histError}</div>
-                ) : clientCaregiverHistory.length === 0 ? (
-                  <div style={{ fontSize: 13, color: UI.textDim }}>
-                    No historical visits found in the loaded window.
-                  </div>
-                ) : (
-                  <div style={{ display: "grid", gap: 8 }}>
-                    {clientCaregiverHistory.slice(0, 20).map((h) => {
-                      const prof = h.caregiverId ? caregiversById[h.caregiverId] : undefined;
-                      const cert = norm(prof?.certification);
-                      const certOk = cert && cert.toLowerCase() !== "none";
+  const isScheduledActive = scheduleRows.some((s) => {
+    if (norm(s.status).toLowerCase().includes("cancel")) return false;
 
-                      return (
-                        <div
-                          key={(h.caregiverId || h.caregiverName) + "::" + h.lastDate}
-                          style={{
-                            border: `1px solid ${UI.borderSoft}`,
-                            borderRadius: 12,
-                            padding: "8px 10px",
-                            background: "rgba(255,255,255,0.85)",
-                            display: "flex",
-                            justifyContent: "space-between",
-                            gap: 10,
-                            alignItems: "baseline",
-                          }}
-                        >
-                          <div style={{ minWidth: 0 }}>
-                            <div
-                              style={{
-                                fontWeight: 950,
-                                fontSize: 13,
-                                overflow: "hidden",
-                                textOverflow: "ellipsis",
-                                whiteSpace: "nowrap",
-                              }}
-                            >
-                              {h.caregiverName}
-                              {certOk ? (
-                                <span
-                                  style={{
-                                    marginLeft: 8,
-                                    fontSize: 11,
-                                    fontWeight: 900,
-                                    padding: "2px 8px",
-                                    borderRadius: 999,
-                                    border: `1px solid ${UI.borderSoft}`,
-                                    background: "#f8fafc",
-                                    color: UI.textDim,
-                                    whiteSpace: "nowrap",
-                                  }}
-                                  title="Certification"
-                                >
-                                  {cert}
-                                </span>
-                              ) : null}
-                            </div>
+    const rowCaregiverId = norm(s.caregiverId);
+    const rowCaregiverNameKey = normalizeKey(s.caregiver);
 
-                            <div style={{ marginTop: 2, fontSize: 11.5, color: UI.textDim }}>
-                              Last visit: <strong>{h.lastDate || "—"}</strong>
-                              {h.caregiverId ? <span style={{ marginLeft: 8 }}>ID: {h.caregiverId}</span> : null}
-                            </div>
-                          </div>
+    if (caregiverId && rowCaregiverId) {
+      return caregiverId === rowCaregiverId;
+    }
 
-                          <div style={{ fontSize: 12, fontWeight: 950, whiteSpace: "nowrap" }}>
-                            {h.visitCount} visit{h.visitCount === 1 ? "" : "s"}
-                          </div>
-                        </div>
-                      );
-                    })}
+    return caregiverNameKey && caregiverNameKey === rowCaregiverNameKey;
+  });
 
-                    {clientCaregiverHistory.length > 20 ? (
-                      <div style={{ fontSize: 12, color: UI.textDim }}>
-                        Showing top 20 (of {clientCaregiverHistory.length}) by visits/recentness.
-                      </div>
-                    ) : null}
-                  </div>
-                )}
-              </div>
+  return (
+    <div
+      key={`${item.caregiverId || item.caregiverName}__${item.lastDate}`}
+      style={{
+        border: `1px solid ${UI.borderSoft}`,
+        borderRadius: 12,
+        padding: "10px 12px",
+        background: "#f8fafc",
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        gap: 12,
+      }}
+    >
+      <div style={{ minWidth: 0 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            flexWrap: "wrap",
+            minWidth: 0,
+          }}
+        >
+          <div
+            style={{
+              fontSize: 13,
+              fontWeight: 900,
+              color: UI.text,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+            title={item.caregiverName}
+          >
+            {item.caregiverName}
+          </div>
+
+          <div
+            style={{
+              fontSize: 10.5,
+              fontWeight: 950,
+              padding: "4px 8px",
+              borderRadius: 999,
+              border: `1px solid ${
+                isScheduledActive ? "rgba(16,185,129,0.35)" : "rgba(239,68,68,0.35)"
+              }`,
+              background: isScheduledActive
+                ? "rgba(16,185,129,0.12)"
+                : "rgba(239,68,68,0.12)",
+              color: isScheduledActive ? "#065f46" : "#b91c1c",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {isScheduledActive ? "Active" : "Inactive"}
+          </div>
+        </div>
+
+        <div
+          style={{
+            marginTop: 2,
+            fontSize: 11.5,
+            color: UI.textDim,
+          }}
+        >
+          Last worked: {item.lastDate || "—"}
+        </div>
+      </div>
+
+      <div
+        style={{
+          flex: "0 0 auto",
+          fontSize: 12,
+          fontWeight: 950,
+          padding: "6px 10px",
+          borderRadius: 999,
+          border: `1px solid ${UI.borderSoft}`,
+          background: "#fff",
+          color: UI.text,
+          whiteSpace: "nowrap",
+        }}
+      >
+        {item.visitCount} visit{item.visitCount === 1 ? "" : "s"}
+      </div>
+    </div>
+  );
+})}
+                </div>
+              )}
             </div>
           </div>
-        );
-      })()}
-    </Modal>
+        </div>
+      </div>
+    );
+  })()}
+</Modal>
 
-    <Modal
+   <Modal
   open={Boolean(editHistoryModalTarget)}
   title={
     editHistoryModalTarget
@@ -5932,6 +6346,7 @@ async function handleCaregiverDropToShift(args: {
     setEditHistoryModalTarget(null);
     setShiftRateError(null);
     setShiftRateReason("");
+    setShiftRateCustomReason("");
   }}
 >
   {editHistoryModalTarget ? (
@@ -6022,107 +6437,246 @@ async function handleCaregiverDropToShift(args: {
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: "minmax(160px, 220px) 1fr",
-                gap: 10,
-                alignItems: "end",
-              }}
-            >
-              <label style={{ display: "grid", gap: 6 }}>
-                <span style={{ fontSize: 11, fontWeight: 950, color: UI.textDim }}>
-                  Rate
-                </span>
-                <input
-                  value={shiftRateValue}
-                  onChange={(e) => setShiftRateValue(e.target.value)}
-                  placeholder="18"
-                  inputMode="decimal"
-                  style={{
-                    border: `1px solid ${UI.border}`,
-                    borderRadius: 10,
-                    padding: "9px 10px",
-                    fontSize: 14,
-                    fontWeight: 800,
-                    outline: "none",
-                  }}
-                />
-              </label>
-
-              <label style={{ display: "grid", gap: 6 }}>
-                <span style={{ fontSize: 11, fontWeight: 950, color: UI.textDim }}>
-                  Reason (optional)
-                </span>
-                <input
-                  value={shiftRateReason}
-                  onChange={(e) => setShiftRateReason(e.target.value)}
-                  placeholder="Manual override"
-                  style={{
-                    border: `1px solid ${UI.border}`,
-                    borderRadius: 10,
-                    padding: "9px 10px",
-                    fontSize: 14,
-                    fontWeight: 700,
-                    outline: "none",
-                  }}
-                />
-              </label>
-            </div>
-
-            <div
-              style={{
-                display: "flex",
-                flexWrap: "wrap",
                 gap: 12,
-                alignItems: "center",
-                justifyContent: "space-between",
               }}
             >
-              <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 700 }}>
-  {shiftRateOriginalValue
-    ? (
-        shiftRateUpdatedAt || shiftRateUpdatedBy
-          ? `Last updated${shiftRateUpdatedBy ? ` by ${shiftRateUpdatedBy}` : ""}${
-              shiftRateUpdatedAt ? ` • ${formatIsoTimestampForDisplay(shiftRateUpdatedAt)}` : ""
-            }`
-          : "Saved shift rate found."
-      )
-    : "No saved shift rate found yet."}
-</div>
-
-              <button
-                type="button"
-                onClick={handleSaveShiftRate}
-                disabled={shiftRateSaving || shiftRateLoading}
-                style={{
-                  border: `1px solid ${UI.border}`,
-                  background: "#111827",
-                  color: "#fff",
-                  borderRadius: 10,
-                  padding: "8px 12px",
-                  cursor: shiftRateSaving || shiftRateLoading ? "default" : "pointer",
-                  fontWeight: 900,
-                  fontSize: 13,
-                  opacity: shiftRateSaving || shiftRateLoading ? 0.7 : 1,
-                }}
-              >
-                {shiftRateSaving ? "Saving..." : "Save Rate"}
-              </button>
-            </div>
-
-            {shiftRateError ? (
               <div
                 style={{
-                  border: `1px dashed #fca5a5`,
-                  borderRadius: 10,
-                  padding: 10,
-                  color: "#991b1b",
-                  background: "#fef2f2",
-                  fontSize: 12.5,
-                  fontWeight: 800,
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                  gap: 10,
                 }}
               >
-                {shiftRateError}
+                <div
+                  style={{
+                    border: `1px solid ${UI.borderSoft}`,
+                    borderRadius: 10,
+                    padding: 10,
+                    background: "rgba(248,250,252,0.9)",
+                  }}
+                >
+                  <div style={{ fontSize: 11, fontWeight: 800, color: UI.textDim }}>
+                    Shift Time
+                  </div>
+                  <div style={{ fontSize: 14, fontWeight: 900, color: UI.text }}>
+                    {formatTimeRangeForDisplay(
+                      editHistoryModalTarget.startTime,
+                      editHistoryModalTarget.endTime
+                    )}
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    border: `1px solid ${UI.borderSoft}`,
+                    borderRadius: 10,
+                    padding: 10,
+                    background: "rgba(248,250,252,0.9)",
+                  }}
+                >
+                  <div style={{ fontSize: 11, fontWeight: 800, color: UI.textDim }}>
+                    Total Hours
+                  </div>
+                  <div style={{ fontSize: 14, fontWeight: 900, color: UI.text }}>
+                    {shiftRateHours > 0 ? shiftRateHours.toFixed(2) : "—"}
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    border: `1px solid ${UI.borderSoft}`,
+                    borderRadius: 10,
+                    padding: 10,
+                    background: "rgba(248,250,252,0.9)",
+                  }}
+                >
+                  <div style={{ fontSize: 11, fontWeight: 800, color: UI.textDim }}>
+                    Calculated Hourly Rate
+                  </div>
+                  <div style={{ fontSize: 14, fontWeight: 900, color: UI.text }}>
+                    {shiftRateCalculatedHourly != null
+                      ? `$${shiftRateCalculatedHourly.toFixed(2)}`
+                      : shiftRateParsedHourly != null
+                      ? `$${shiftRateParsedHourly.toFixed(2)}`
+                      : "—"}
+                  </div>
+                </div>
               </div>
-            ) : null}
+
+              <div
+                style={{
+                  display: "grid",
+                  gap: 8,
+                }}
+              >
+                <div style={{ fontSize: 12, fontWeight: 800, color: UI.textDim }}>
+                  Reason
+                </div>
+
+                <select
+                  value={shiftRateReason}
+                  onChange={(e) => {
+                    const next = e.target.value;
+                    setShiftRateReason(next);
+                    if (next !== "Other") {
+                      setShiftRateCustomReason("");
+                    }
+                  }}
+                  style={{
+                    width: "100%",
+                    border: `1px solid ${UI.border}`,
+                    borderRadius: 10,
+                    padding: "10px 12px",
+                    fontSize: 14,
+                    fontWeight: 700,
+                    color: UI.text,
+                    background: "#fff",
+                  }}
+                >
+                  <option value="">Select a reason</option>
+                  {SHIFT_RATE_REASON_OPTIONS.map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+
+                {shiftRateReason === "Other" ? (
+                  <input
+                    value={shiftRateCustomReason}
+                    onChange={(e) => setShiftRateCustomReason(e.target.value)}
+                    placeholder="Type custom reason"
+                    style={{
+                      width: "100%",
+                      border: `1px solid ${UI.border}`,
+                      borderRadius: 10,
+                      padding: "10px 12px",
+                      fontSize: 14,
+                      fontWeight: 700,
+                      color: UI.text,
+                      background: "#fff",
+                    }}
+                  />
+                ) : null}
+              </div>
+
+              <div
+                style={{
+                  display: "grid",
+                  gap: 6,
+                }}
+              >
+                <div style={{ fontSize: 12, fontWeight: 800, color: UI.textDim }}>
+                  Hourly Rate
+                </div>
+                <input
+                  value={
+                    shiftRateCalculatedHourly != null
+                      ? shiftRateCalculatedHourly.toFixed(2)
+                      : shiftRateValue
+                  }
+                  readOnly
+                  placeholder="Calculated automatically"
+                  style={{
+                    width: "100%",
+                    border: `1px solid ${UI.border}`,
+                    borderRadius: 10,
+                    padding: "10px 12px",
+                    fontSize: 14,
+                    fontWeight: 800,
+                    color: UI.text,
+                    background: "#f9fafb",
+                  }}
+                />
+              </div>
+
+              <div
+                style={{
+                  display: "grid",
+                  gap: 6,
+                }}
+              >
+                <div style={{ fontSize: 12, fontWeight: 800, color: UI.textDim }}>
+                  Total Pay for Entire Shift
+                </div>
+                <input
+                  value={shiftRateTotalValue}
+                  onChange={(e) => setShiftRateTotalValue(e.target.value)}
+                  placeholder="Enter total shift pay"
+                  inputMode="decimal"
+                  style={{
+                    width: "100%",
+                    border: `1px solid ${UI.border}`,
+                    borderRadius: 10,
+                    padding: "10px 12px",
+                    fontSize: 14,
+                    fontWeight: 800,
+                    color: UI.text,
+                    background: "#fff",
+                  }}
+                />
+                <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 700 }}>
+                  The hourly rate will be calculated automatically from the total and shift hours.
+                </div>
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  gap: 12,
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                }}
+              >
+                <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 700 }}>
+                  {shiftRateOriginalValue
+                    ? (
+                        shiftRateUpdatedAt || shiftRateUpdatedBy
+                          ? `Last updated${shiftRateUpdatedBy ? ` by ${shiftRateUpdatedBy}` : ""}${
+                              shiftRateUpdatedAt ? ` • ${formatIsoTimestampForDisplay(shiftRateUpdatedAt)}` : ""
+                            }`
+                          : "Saved shift rate found."
+                      )
+                    : "No saved shift rate found yet."}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={handleSaveShiftRate}
+                  disabled={shiftRateSaving || shiftRateLoading}
+                  style={{
+                    border: `1px solid ${UI.border}`,
+                    background: "#111827",
+                    color: "#fff",
+                    borderRadius: 10,
+                    padding: "8px 12px",
+                    cursor: shiftRateSaving || shiftRateLoading ? "default" : "pointer",
+                    fontWeight: 900,
+                    fontSize: 13,
+                    opacity: shiftRateSaving || shiftRateLoading ? 0.7 : 1,
+                  }}
+                >
+                  {shiftRateSaving ? "Saving..." : "Save Rate"}
+                </button>
+              </div>
+
+              {shiftRateError ? (
+                <div
+                  style={{
+                    border: `1px dashed #fca5a5`,
+                    borderRadius: 10,
+                    padding: 10,
+                    color: "#991b1b",
+                    background: "#fef2f2",
+                    fontSize: 12.5,
+                    fontWeight: 800,
+                  }}
+                >
+                  {shiftRateError}
+                </div>
+              ) : null}
+            </div>
           </>
         )}
       </div>
@@ -6939,6 +7493,12 @@ async function handleCaregiverDropToShift(args: {
       weekStartYmd={weekStartYmd}
       weekKind={week}
     />
+     <SupraesophagealGanglionPanel
+        open={ganglionOpen}
+        onClose={() => setGanglionOpen(false)}
+        week={week}
+        onWeekChange={setWeekAndUrl}
+      />
   </main>
 );
 }

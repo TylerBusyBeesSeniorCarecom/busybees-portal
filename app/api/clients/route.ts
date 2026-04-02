@@ -25,6 +25,14 @@ async function getSheetsClient() {
   return google.sheets({ version: "v4", auth });
 }
 
+function getClientsAppsScriptUrl() {
+  const url = process.env.CLIENTS_APPS_SCRIPT_URL;
+  if (!url) {
+    throw new Error("Missing CLIENTS_APPS_SCRIPT_URL");
+  }
+  return url;
+}
+
 function normalizeHeaders(row: any[]) {
   return (row || []).map((h) => (h ?? "").toString().trim());
 }
@@ -83,6 +91,86 @@ export async function GET(_req: Request) {
     });
   } catch (err: any) {
     return NextResponse.json<ClientsPayload>(
+      { ok: false, error: err?.message || String(err) || "Unknown error" },
+      { status: 500 }
+    );
+  }
+}
+
+export async function POST(req: Request) {
+  try {
+    const body = await req.json();
+    const action = String(body?.action || "").trim();
+
+    if (!action) {
+      return NextResponse.json(
+        { ok: false, error: "Missing action" },
+        { status: 400 }
+      );
+    }
+
+    if (action === "updateClientDescription") {
+      const clientName = String(body?.clientName || "").trim();
+      const description =
+        body?.description == null ? "" : String(body.description);
+      const updatedBy = String(body?.updatedBy || "").trim();
+      const updatedByEmail = String(body?.updatedByEmail || "").trim();
+
+      if (!clientName) {
+        return NextResponse.json(
+          { ok: false, error: "Missing clientName" },
+          { status: 400 }
+        );
+      }
+
+      const scriptUrl = getClientsAppsScriptUrl();
+
+      const scriptRes = await fetch(scriptUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          action: "updateClientDescription",
+          clientName,
+          description,
+          updatedBy,
+          updatedByEmail,
+        }),
+        cache: "no-store",
+      });
+
+      const text = await scriptRes.text();
+
+      let data: any = null;
+      try {
+        data = text ? JSON.parse(text.trim()) : null;
+      } catch {
+        throw new Error(
+          `Non-JSON Apps Script response (${scriptRes.status}): ${text.slice(0, 200)}`
+        );
+      }
+
+      if (!scriptRes.ok) {
+        throw new Error(data?.error || `Apps Script failed (${scriptRes.status})`);
+      }
+
+      if (!data?.ok) {
+        throw new Error(data?.error || "Apps Script returned not ok");
+      }
+
+      return NextResponse.json({
+        ok: true,
+        result: data,
+      });
+    }
+
+    return NextResponse.json(
+      { ok: false, error: `Unknown action: ${action}` },
+      { status: 400 }
+    );
+  } catch (err: any) {
+    return NextResponse.json(
       { ok: false, error: err?.message || String(err) || "Unknown error" },
       { status: 500 }
     );

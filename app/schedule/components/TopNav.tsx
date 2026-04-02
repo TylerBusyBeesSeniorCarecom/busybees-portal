@@ -466,35 +466,40 @@ export default function TopNav({
   }, []);
 
   const pageItems: NavItem[] = useMemo(
-    () => [
-      {
-        label: "Schedule",
-        href: (w) => buildHrefWithWeek("/schedule", w),
-        match: (p) => p === "/schedule",
-      },
-      {
-        label: "Availability",
-        href: (w) => buildHrefWithWeek("/availability", w),
-        match: (p) => p.startsWith("/availability"),
-      },
-      {
-        label: "Billing & Payroll",
-        href: (w) => buildHrefWithWeek("/billing-payroll", w),
-        match: (p) => p.startsWith("/billing-payroll"),
-      },
-      {
-        label: "History",
-        href: (w) => buildHrefWithWeek("/history", w),
-        match: (p) => p.startsWith("/history"),
-      },
-      {
-        label: "Applicants",
-        href: (_w) => "/schedule/applicants",
-        match: (p) => p.startsWith("/schedule/applicants"),
-      },
-    ],
-    []
-  );
+  () => [
+    {
+      label: "Schedule",
+      href: (w) => buildHrefWithWeek("/schedule", w),
+      match: (p) => p === "/schedule",
+    },
+    {
+      label: "Supraesophageal Ganglion",
+      href: (_w) => "/supraesophageal-ganglion",
+      match: (p) => p.startsWith("/supraesophageal-ganglion"),
+    },
+    {
+      label: "Availability",
+      href: (w) => buildHrefWithWeek("/availability", w),
+      match: (p) => p.startsWith("/availability"),
+    },
+    {
+      label: "Billing & Payroll",
+      href: (w) => buildHrefWithWeek("/billing-payroll", w),
+      match: (p) => p.startsWith("/billing-payroll"),
+    },
+    {
+      label: "History",
+      href: (w) => buildHrefWithWeek("/history", w),
+      match: (p) => p.startsWith("/history"),
+    },
+    {
+      label: "Applicants",
+      href: (_w) => "/schedule/applicants",
+      match: (p) => p.startsWith("/schedule/applicants"),
+    },
+  ],
+  []
+);
 
   const tools: NavItem[] = useMemo(
     () => [
