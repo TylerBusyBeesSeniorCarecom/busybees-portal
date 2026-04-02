@@ -4,8 +4,13 @@ import { NextRequest, NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 
 type FreshBooksMembership = {
-  business?: { id?: number | string };
   account_id?: number | string;
+  accountId?: number | string;
+  business?: {
+    id?: number | string;
+    account_id?: number | string;
+    accountId?: number | string;
+  };
 };
 
 function getAccessToken(req: NextRequest) {
@@ -51,19 +56,28 @@ function pickPrimaryMembership(meJson: any): FreshBooksMembership | null {
   return memberships[0] ?? null;
 }
 
-function extractAccountId(membership: FreshBooksMembership | null): string | null {
-  if (!membership) return null;
+function extractAccountId(
+  membership: FreshBooksMembership | null,
+  meJson?: any
+): string | null {
+  const candidates = [
+    membership?.account_id,
+    membership?.accountId,
+    membership?.business?.account_id,
+    membership?.business?.accountId,
+    meJson?.response?.account_id,
+    meJson?.response?.accountId,
+    meJson?.response?.roles?.[0]?.accountid,
+    meJson?.response?.roles?.[0]?.accountId,
+  ];
 
-  // FreshBooks accounting endpoints need accountId.
-  const accountId =
-    membership.account_id ??
-    null;
-
-  if (accountId === null || accountId === undefined) {
-    return null;
+  for (const value of candidates) {
+    if (value !== null && value !== undefined && String(value).trim() !== "") {
+      return String(value);
+    }
   }
 
-  return String(accountId);
+  return null;
 }
 
 function extractBusinessId(membership: FreshBooksMembership | null): string | null {
@@ -92,7 +106,6 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // 1) Identity / me endpoint to discover memberships, businessId, and accountId
     const meResult = await fetchFreshBooksJson(
       "https://api.freshbooks.com/auth/api/v1/users/me",
       accessToken
@@ -118,7 +131,7 @@ export async function GET(req: NextRequest) {
     }
 
     const membership = pickPrimaryMembership(meResult.json);
-    const accountId = extractAccountId(membership);
+    const accountId = extractAccountId(membership, meResult.json);
     const businessId = extractBusinessId(membership);
 
     if (!membership || !accountId) {
@@ -136,9 +149,7 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // 2) Clients endpoint
-    const clientsUrl =
-      `https://api.freshbooks.com/accounting/account/${accountId}/users/clients`;
+    const clientsUrl = `https://api.freshbooks.com/accounting/account/${accountId}/users/clients`;
 
     const clientsResult = await fetchFreshBooksJson(clientsUrl, accessToken);
 

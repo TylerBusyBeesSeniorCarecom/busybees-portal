@@ -12,13 +12,21 @@ function mustEnv(name: string) {
   return value;
 }
 
+const DEFAULT_SCOPES = [
+  "user:profile:read",
+  "user:clients:read",
+  "user:invoices:read",
+].join(" ");
+
 export async function GET(req: NextRequest) {
   try {
     const clientId = mustEnv("FRESHBOOKS_CLIENT_ID");
     const redirectUri = mustEnv("FRESHBOOKS_REDIRECT_URI");
-    const scopes =
-      process.env.FRESHBOOKS_SCOPES ||
-      "user:profile:read user:invoices:read user:clients:read";
+
+    const scopes = (process.env.FRESHBOOKS_SCOPES || DEFAULT_SCOPES)
+      .split(/\s+/)
+      .filter(Boolean)
+      .join(" ");
 
     const state = crypto.randomBytes(24).toString("hex");
 
@@ -36,7 +44,7 @@ export async function GET(req: NextRequest) {
       secure: process.env.NODE_ENV === "production",
       sameSite: "lax",
       path: "/",
-      maxAge: 60 * 10, // 10 minutes
+      maxAge: 60 * 10,
     });
 
     return response;
