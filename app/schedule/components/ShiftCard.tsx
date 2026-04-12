@@ -612,14 +612,76 @@ function safeNumber(n: any): number {
 
 /** ---------- Desired Hours handling ---------- */
 function isAsManyAsPossible(raw: string): boolean {
-  const v = (raw || "").trim().toLowerCase();
-  return v === "as many as possible" || v.includes("as many as possible") || v.includes("as much as possible") || v.includes("as many as");
+  const v = norm(raw).toLowerCase();
+  return (
+    v === "as many as possible" ||
+    v.includes("as many as possible") ||
+    v.includes("as much as possible") ||
+    v.includes("as many as")
+  );
 }
-function desiredHoursSortValue(raw: string): { wantsMax: boolean; hours: number } {
+
+type DesiredHoursMeta = {
+  raw: string;
+  wantsMax: boolean;
+  min: number | null;
+  max: number | null;
+};
+
+function parseDesiredHours(raw: string): DesiredHoursMeta {
   const v = norm(raw);
-  const wantsMax = isAsManyAsPossible(v);
-  if (wantsMax) return { wantsMax: true, hours: 0 };
-  return { wantsMax: false, hours: safeNumber(v) };
+
+  if (!v) {
+    return { raw: v, wantsMax: false, min: null, max: null };
+  }
+
+  if (isAsManyAsPossible(v)) {
+    return { raw: v, wantsMax: true, min: null, max: null };
+  }
+
+  const range = v.match(/(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)/);
+  if (range) {
+    const min = safeNumber(range[1]);
+    const max = safeNumber(range[2]);
+    return {
+      raw: v,
+      wantsMax: false,
+      min: Number.isFinite(min) ? min : null,
+      max: Number.isFinite(max) ? max : null,
+    };
+  }
+
+  const single = safeNumber(v);
+  if (Number.isFinite(single) && single > 0) {
+    return { raw: v, wantsMax: false, min: 0, max: single };
+  }
+
+  return { raw: v, wantsMax: false, min: null, max: null };
+}
+
+function desiredHoursFitScore(meta: DesiredHoursMeta, weeklyBefore: number, shiftHours: number): number {
+  if (meta.wantsMax) return 10;
+  if (meta.max == null) return 0;
+
+  const weeklyAfter = weeklyBefore + shiftHours;
+
+  // under desired max
+  if (weeklyBefore < meta.max) return 10;
+
+  // already within target window
+  if (meta.min != null && weeklyBefore >= meta.min && weeklyBefore <= meta.max) return 10;
+
+  // this shift puts them into the desired range
+  if (meta.min != null && weeklyAfter >= meta.min && weeklyAfter <= meta.max) return 10;
+
+  // already over desired max
+  return 0;
+}
+
+function fortyHourPenalty(weeklyBefore: number, shiftHours: number): number {
+  if (weeklyBefore > 40) return -5;
+  if (weeklyBefore + shiftHours > 40) return -5;
+  return 0;
 }
 
 /** ---------- Availability helpers ---------- */
@@ -653,104 +715,429 @@ function dayHeaderToDow(h: string): number | null {
   return map[firstWord] ?? map[cleaned] ?? null;
 }
 
-function availCategory(raw: string): "has_avail" | "no_avail" | "not_avail" {
-  const v = (raw || "").trim();
-  if (!v || v === "—") return "no_avail";
+type AvailabilityMatchType =
+  | "exact"
+  | "strong"
+  | "partial"
+  | "close"
+  | "unclear"
+  | "none";
 
-  const lower = v.toLowerCase();
-  const isOff = lower === "off" || lower.includes("not available") || lower.includes("unavailable") || lower === "none";
-  if (isOff) return "not_avail";
-  return "has_avail";
+type AvailabilityScoreResult = {
+  type: AvailabilityMatchType;
+  score: number;
+  label: string;
+};
+
+function normalizeAvailabilityText(raw: string): string {
+  return norm(raw)
+    .toLowerCase()
+    .replace(/[“”]/g, '"')
+    .replace(/[–—]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isUnavailableAvailability(raw: string): boolean {
+  const v = normalizeAvailabilityText(raw);
+  if (!v) return true;
+
+  return (
+    v === "—" ||
+    v === "off" ||
+    v === "none" ||
+    v === "n/a" ||
+    v === "na" ||
+    v === "no" ||
+    v === "0" ||
+    v === "ns" ||
+    v === "x" ||
+    v.includes("off please") ||
+    v.includes("not available") ||
+    v.includes("unavailable") ||
+    v.includes("no hours")
+  );
+}
+
+function isOpenAvailability(raw: string): boolean {
+  const v = normalizeAvailabilityText(raw);
+  if (!v) return false;
+
+  return (
+    v === "any" ||
+    v === "open" ||
+    v === "available" ||
+    v === "all day" ||
+    v === "any time" ||
+    v === "anytime" ||
+    v.includes("12am to 11:59pm") ||
+    v.includes("12:00am to 11:59pm")
+  );
+}
+
+function shiftCrossesMidnight(startTime: string, endTime: string): boolean {
+  const r = timeRangeToMinutes(startTime, endTime);
+  if (!r) return false;
+  return r.end > 24 * 60;
+}
+
+function getBroadAvailabilityWindow(raw: string): { start: number; end: number } | null {
+  const v = normalizeAvailabilityText(raw);
+
+  if (v.includes("morning")) {
+    return { start: 6 * 60, end: 12 * 60 };
+  }
+  if (v.includes("afternoon") || v.includes("day time") || v.includes("daytime")) {
+    return { start: 12 * 60, end: 18 * 60 };
+  }
+  if (v.includes("evening")) {
+    return { start: 18 * 60, end: 23 * 60 };
+  }
+
+  return null;
+}
+
+function isOvernightAvailability(raw: string): boolean {
+  const v = normalizeAvailabilityText(raw);
+  return v.includes("overnight");
+}
+
+function parseAvailabilityWindows(raw: string): Array<{ start: number; end: number }> {
+  const text = normalizeAvailabilityText(raw);
+  if (!text) return [];
+
+  const cleaned = text
+    .replace(/\buntil\b/g, "to")
+    .replace(/\btil\b/g, "to")
+    .replace(/\./g, " ")
+    .replace(/,/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const matches = Array.from(
+    cleaned.matchAll(
+      /(\d{1,2}(?::\d{2})?\s*[ap]m?|\d{1,2}(?::\d{2})?)\s*(?:-|to)\s*(\d{1,2}(?::\d{2})?\s*[ap]m?|\d{1,2}(?::\d{2})?)/gi
+    )
+  );
+
+  const windows: Array<{ start: number; end: number }> = [];
+
+  for (const m of matches) {
+    const left = inferMeridiemTime(m[1], m[2], "start");
+    const right = inferMeridiemTime(m[2], m[1], "end");
+    const range = timeRangeToMinutes(left, right);
+    if (range) windows.push(range);
+  }
+
+  return windows;
+}
+
+function inferMeridiemTime(value: string, otherSide?: string, side: "start" | "end" = "start"): string {
+  const v = norm(value).toLowerCase().replace(/\s+/g, "");
+  if (/[ap]m$/.test(v)) return v.toUpperCase();
+
+  const other = norm(otherSide).toLowerCase().replace(/\s+/g, "");
+  const n = safeNumber(v.replace(/[^\d:]/g, "").split(":")[0]);
+
+  if (/[ap]m$/.test(other)) {
+    if (other.endsWith("pm") && n >= 1 && n <= 11) return `${v}PM`.toUpperCase();
+    if (other.endsWith("am") && n >= 1 && n <= 11) return `${v}AM`.toUpperCase();
+  }
+
+  if (n >= 6 && n <= 11) return `${v}AM`.toUpperCase();
+  if (n === 12) return `${v}${side === "start" ? "PM" : "PM"}`.toUpperCase();
+  return `${v}PM`.toUpperCase();
+}
+
+function scorePostedAvailability(raw: string, shiftStart: string, shiftEnd: string): AvailabilityScoreResult {
+  const v = normalizeAvailabilityText(raw);
+  const shiftRange = timeRangeToMinutes(shiftStart, shiftEnd);
+
+  if (!shiftRange) {
+    return { type: "none", score: 0, label: "No match" };
+  }
+
+  if (isUnavailableAvailability(v)) {
+    return { type: "none", score: 0, label: "No match" };
+  }
+
+  if (isOpenAvailability(v)) {
+    return { type: "exact", score: 40, label: "Exact match" };
+  }
+
+  const windows = parseAvailabilityWindows(v);
+  for (const w of windows) {
+    if (w.start <= shiftRange.start && w.end >= shiftRange.end) {
+      return { type: "exact", score: 40, label: "Exact match" };
+    }
+  }
+
+  const broad = getBroadAvailabilityWindow(v);
+  if (broad && broad.start <= shiftRange.start && broad.end >= shiftRange.end) {
+    return { type: "strong", score: 30, label: "Strong match" };
+  }
+
+  if (isOvernightAvailability(v) && shiftCrossesMidnight(shiftStart, shiftEnd)) {
+    return { type: "strong", score: 30, label: "Strong match" };
+  }
+
+  let bestOverlap = 0;
+  for (const w of windows) {
+    bestOverlap = Math.max(bestOverlap, overlapMinutes(shiftRange, w));
+  }
+
+  if (bestOverlap > 0) {
+    if (bestOverlap >= shiftRange.end - shiftRange.start) {
+      return { type: "exact", score: 40, label: "Exact match" };
+    }
+    return { type: "partial", score: 20, label: "Partial match" };
+  }
+
+  if (
+  v.includes("after ") ||
+  v.includes("before ") ||
+  v.includes("leave by") ||
+  v.includes("until ") ||
+  v.includes("til ")
+) {
+  return { type: "unclear", score: 10, label: "Needs review" };
+}
+
+  return { type: "none", score: 0, label: "No match" };
+}
+function desiredHoursTarget(meta: DesiredHoursMeta): number | null {
+  if (meta.wantsMax) return 40;
+  if (meta.max != null) return meta.max;
+  if (meta.min != null) return meta.min;
+  return null;
+}
+function needsAvailabilityReview(matchType: AvailabilityMatchType, raw: string): boolean {
+  if (matchType === "unclear") return true;
+
+  const v = normalizeAvailabilityText(raw);
+  return (
+    v.includes("after ") ||
+    v.includes("before ") ||
+    v.includes("leave by") ||
+    v.includes("until ") ||
+    v.includes("til ")
+  );
 }
 function isAvailabilityFilled(raw: string): boolean {
-  const v = (raw || "").trim();
-  return Boolean(v) && v !== "—";
+  const v = normalizeAvailabilityText(raw);
+  if (!v) return false;
+  if (isUnavailableAvailability(v)) return false;
+  return true;
 }
 
+function availCategory(raw: string): "has_avail" | "no_avail" | "not_avail" {
+  const v = normalizeAvailabilityText(raw);
+  if (!v) return "no_avail";
+  if (isUnavailableAvailability(v)) return "not_avail";
+  return "has_avail";
+}
 function AvailabilityCell({ value }: { value: string }) {
   const v = (value || "").trim();
-  if (!v || v === "—") return <span style={{ color: "#9ca3af" }}>—</span>;
+  if (!v || v === "—") {
+    return <span style={{ color: "#94a3b8", fontWeight: 800 }}>—</span>;
+  }
 
   const lower = v.toLowerCase();
   const isOff = lower === "off" || lower.includes("not available") || lower.includes("unavailable");
   const isOpen = lower === "open" || lower.includes("anytime") || lower.includes("available all day");
 
-  const chipStyle: React.CSSProperties = {
-    display: "inline-block",
-    padding: "4px 8px",
-    borderRadius: 999,
-    fontSize: 12,
-    fontWeight: 900,
-    border: "1px solid",
-    lineHeight: 1.1,
-    whiteSpace: "nowrap",
-  };
+  let color = "#111827";
+  let text = v;
 
   if (isOff) {
-    return (
-      <span style={{ ...chipStyle, background: "#f3f4f6", color: "#6b7280", borderColor: "#e5e7eb" }}>
-        Not available
-      </span>
-    );
-  }
-  if (isOpen) {
-    return (
-      <span style={{ ...chipStyle, background: "#ecfdf5", color: "#065f46", borderColor: "#a7f3d0" }}>
-        Open
-      </span>
-    );
+    color = "#991b1b";
+    text = "Not available";
+  } else if (isOpen) {
+    color = "#166534";
+    text = "Open";
   }
 
-  return <span style={{ fontWeight: 750, color: "#111827", whiteSpace: "pre-wrap" }}>{v}</span>;
+  return (
+    <span
+      style={{
+        fontSize: 12,
+        fontWeight: 850,
+        color,
+        whiteSpace: "pre-wrap",
+        lineHeight: 1.25,
+      }}
+    >
+      {text}
+    </span>
+  );
 }
 
 function AvailabilityPill({ label, source }: { label: string; source?: string }) {
-  const has = Boolean(norm(label));
-  const text = has ? label : "No availability submitted";
+  const hasLabel = Boolean(norm(label));
+  const hasSource = Boolean(norm(source));
+
+  if (!hasLabel && !hasSource) return null;
 
   return (
-    <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-      <span
-        style={{
-          display: "inline-flex",
-          alignItems: "center",
-          borderRadius: 999,
-          padding: "5px 10px",
-          fontSize: 12,
-          fontWeight: 950,
-          background: has ? "rgba(59,130,246,0.14)" : "rgba(148,163,184,0.18)",
-          border: has ? "1px solid rgba(59,130,246,0.30)" : "1px solid rgba(148,163,184,0.30)",
-          color: "#0b1220",
-          whiteSpace: "nowrap",
-        }}
-        title={has ? label : "Missing availability submission"}
-      >
-        {text}
-      </span>
+    <div
+      style={{
+        display: "flex",
+        flexWrap: "wrap",
+        gap: 10,
+        marginTop: 4,
+        fontSize: 11,
+        fontWeight: 800,
+        color: "#64748b",
+        lineHeight: 1.25,
+      }}
+    >
+      {hasLabel ? (
+        <span>
+          <span style={{ color: "#475569", fontWeight: 950 }}>Match:</span> {label}
+        </span>
+      ) : null}
 
-      {norm(source) ? (
-        <span
-          style={{
-            display: "inline-flex",
-            alignItems: "center",
-            borderRadius: 999,
-            padding: "5px 10px",
-            fontSize: 12,
-            fontWeight: 900,
-            background: "rgba(2,132,199,0.12)",
-            border: "1px solid rgba(2,132,199,0.22)",
-            color: "#0b1220",
-            whiteSpace: "nowrap",
-          }}
-          title="Availability source"
-        >
-          Source: {source}
+      {hasSource ? (
+        <span>
+          <span style={{ color: "#475569", fontWeight: 950 }}>Source:</span> {source}
         </span>
       ) : null}
     </div>
   );
 }
+function ScoreChip({
+  label,
+  tone = "neutral",
+  title,
+}: {
+  label: string;
+  tone?: "good" | "warn" | "bad" | "neutral";
+  title?: string;
+}) {
+  let background = "rgba(248,250,252,0.96)";
+  let border = "1px solid rgba(148,163,184,0.18)";
+  let color = "#475569";
 
+  if (tone === "good") {
+    background = "rgba(240,253,244,0.96)";
+    border = "1px solid rgba(34,197,94,0.18)";
+    color = "#166534";
+  } else if (tone === "warn") {
+    background = "rgba(255,251,235,0.96)";
+    border = "1px solid rgba(245,158,11,0.18)";
+    color = "#92400e";
+  } else if (tone === "bad") {
+    background = "rgba(254,242,242,0.96)";
+    border = "1px solid rgba(239,68,68,0.18)";
+    color = "#991b1b";
+  }
+
+  return (
+    <div
+      title={title}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        minHeight: 32,
+        padding: "6px 10px",
+        borderRadius: 999,
+        fontSize: 11,
+        fontWeight: 900,
+        lineHeight: 1.1,
+        whiteSpace: "nowrap",
+        background,
+        border,
+        color,
+      }}
+    >
+      {label}
+    </div>
+  );
+}
+function buildScoreTooltip(cg: {
+  availabilityMatchLabel: string;
+  scoreBreakdown: {
+    availability: number;
+    conflict: number;
+    history: number;
+    drive_time: number;
+    desired_hours: number;
+    hours_penalty: number;
+  };
+  historyCount: number;
+  driveTimeMinutes: number | null;
+  driveTimeText?: string | null;
+  totalHours: number;
+}) {
+  const driveText =
+    cg.driveTimeMinutes != null
+      ? `${Math.round(cg.driveTimeMinutes)} min`
+      : norm(cg.driveTimeText) || "—";
+
+  return [
+    `Availability: ${cg.availabilityMatchLabel} (${cg.scoreBreakdown.availability})`,
+    `Conflict: ${cg.scoreBreakdown.conflict}`,
+    `History: ${cg.historyCount} visit(s) (${cg.scoreBreakdown.history})`,
+    `Drive time: ${driveText} (${cg.scoreBreakdown.drive_time})`,
+    `Desired hours: ${cg.scoreBreakdown.desired_hours}`,
+    `40+ hours penalty: ${cg.scoreBreakdown.hours_penalty}`,
+    `Current total hours: ${cg.totalHours.toFixed(1)}h`,
+  ].join(" • ");
+}
+function MetaField({
+  label,
+  value,
+  clearMode,
+  multiline = false,
+}: {
+  label: string;
+  value: React.ReactNode;
+  clearMode: boolean;
+  multiline?: boolean;
+}) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: multiline ? "flex-start" : "center",
+        justifyContent: "space-between",
+        gap: 8,
+        minHeight: multiline ? 44 : 36,
+        padding: "7px 10px",
+        borderRadius: 10,
+        border: "1px solid rgba(17,24,39,0.08)",
+        background: clearMode ? "rgba(255,255,255,0.03)" : "rgba(255,255,255,0.62)",
+        backdropFilter: clearMode ? "blur(1px)" : "none",
+        WebkitBackdropFilter: clearMode ? "blur(1px)" : "none",
+      }}
+    >
+      <span
+        style={{
+          fontSize: 11,
+          fontWeight: 950,
+          color: "#64748b",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {label}
+      </span>
+
+      <div
+        style={{
+          minWidth: 0,
+          flex: "1 1 auto",
+          textAlign: "right",
+          fontSize: 12,
+          fontWeight: 850,
+          color: "#111827",
+          lineHeight: 1.25,
+        }}
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
 /** ---------- Overlap + scoring helpers ---------- */
 function timeRangeToMinutes(startTime: string, endTime: string): { start: number; end: number } | null {
   const s = parseTimeToMinutes(startTime);
@@ -766,36 +1153,25 @@ function overlapMinutes(a: { start: number; end: number }, b: { start: number; e
   return Math.max(0, earliestEnd - latestStart);
 }
 function historyScore(historyCount: number): number {
-  if (historyCount >= 5) return 30;
-  if (historyCount >= 3) return 20;
-  if (historyCount >= 1) return 10;
+  if (historyCount >= 5) return 15;
+  if (historyCount >= 3) return 10;
+  if (historyCount >= 1) return 5;
   return 0;
 }
-function availabilityScoreFromConflictMinutes(mins: number): number {
-  if (mins === 0) return 30;
-  if (mins <= 30) return 20;
-  if (mins <= 60) return 10;
+
+function conflictScoreFromMinutes(mins: number): number {
+  if (mins === 0) return 20;
+  if (mins < 30) return 10;
+  if (mins < 60) return 5;
   return 0;
 }
+
 function driveScoreFromMinutes(mins: number | null): number {
   if (mins == null || !Number.isFinite(mins)) return 0;
-  if (mins <= 10) return 20;
-  if (mins <= 20) return 15;
-  if (mins <= 30) return 10;
+  if (mins <= 10) return 15;
+  if (mins <= 20) return 10;
+  if (mins <= 30) return 5;
   return 0;
-}
-function weeklyHoursScore(weeklyBefore: number, shiftHours: number): number {
-  if (weeklyBefore > 40) return -5;
-  if (weeklyBefore + shiftHours > 40) return 0;
-  return 10;
-}
-function certScore(certs: string[] | string | null | undefined): number {
-  if (!certs) return 0;
-  const arr = Array.isArray(certs) ? certs : [certs];
-  const first = norm(arr[0]);
-  if (!first) return 0;
-  if (first.toLowerCase() === "none") return 0;
-  return 5;
 }
 
 /** ---------- Drive time helpers ---------- */
@@ -1151,8 +1527,9 @@ const showHistoryIcon =
   const showCombinedNoClock = !isEmpty && !isCancelled && tState === "past" && !clockEval.clockIn && !clockEval.clockOut;
 
   /** ---------- Shift Menu (FloatingPanel) state ---------- */
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [showDesc, setShowDesc] = useState(false);
+ const [menuOpen, setMenuOpen] = useState(false);
+const [showDesc, setShowDesc] = useState(false);
+const [clearMode, setClearMode] = useState(false);
 
   // Client history
   const [histLoading, setHistLoading] = useState(false);
@@ -1770,37 +2147,40 @@ clientHistoryCache.set(key, { ts: Date.now(), data: cleaned });
 
   /** ---------- Caregiver rows (ONE LIST, always ACTIVE) ---------- */
   type CaregiverRow = {
-    key: string; // caregiverId || caregiverName (from schedule)
-    name: string;
-    id: string;
+  key: string; // caregiverId || caregiverName (from schedule)
+  name: string;
+  id: string;
 
-    desiredMeta: { wantsMax: boolean; hours: number };
-    availRaw: string;
-    availLabel: string;
-    availSource: string;
+  desiredMeta: DesiredHoursMeta;
+  availRaw: string;
+  availLabel: string;
+  availSource: string;
 
-    dayShifts: ScheduleShiftRow[];
-    totalHours: number;
+  availabilityMatchType: AvailabilityMatchType;
+  availabilityMatchLabel: string;
 
-    historyCount: number;
-    historyLast: string | null;
+  dayShifts: ScheduleShiftRow[];
+  totalHours: number;
 
-    driveTimeText: string;
-    driveTimeMinutes: number | null;
+  historyCount: number;
+  historyLast: string | null;
 
-    conflictMinutes: number;
-    hasConflict: boolean;
+  driveTimeText: string;
+  driveTimeMinutes: number | null;
 
-    scoreTotal: number;
-    scoreBreakdown: {
-      history: number;
-      availability: number;
-      drive_time: number;
-      weekly_hours: number;
-      tenure: number;
-      certification: number;
-    };
+  conflictMinutes: number;
+  hasConflict: boolean;
+
+  scoreTotal: number;
+  scoreBreakdown: {
+    availability: number;
+    conflict: number;
+    history: number;
+    drive_time: number;
+    desired_hours: number;
+    hours_penalty: number;
   };
+};
 
   const caregiversBase: CaregiverRow[] = useMemo(() => {
   // ✅ For normal shifts we require parsed time
@@ -1840,48 +2220,56 @@ clientHistoryCache.set(key, { ts: Date.now(), data: cleaned });
         availabilityRowByAnyKey[normalizeKey(key)] ||
         null;
 
-      const availRaw = norm(av?.availRaw);
-      const desiredRaw = norm(av?.desiredRaw);
-      const desiredMeta = desiredHoursSortValue(desiredRaw);
+     const availRaw = norm(av?.availRaw);
+const desiredRaw = norm(av?.desiredRaw);
+const desiredMeta = parseDesiredHours(desiredRaw);
 
-      const certs = prof?.certifications ?? null;
+const dayShifts = scheduleMap[key]?.[selectedDow] ?? [];
+const totalHours = scheduleHoursByCaregiverKey[key] ?? 0;
 
-      const dayShifts = scheduleMap[key]?.[selectedDow] ?? [];
-      const totalHours = scheduleHoursByCaregiverKey[key] ?? 0;
+const h =
+  (id ? histByIdKey.get(normalizeKey(id)) : null) ||
+  histByNameKey.get(normalizeKey(name)) ||
+  null;
 
-      const h = (id ? histByIdKey.get(normalizeKey(id)) : null) || histByNameKey.get(normalizeKey(name)) || null;
+let conflictMins = 0;
+if (reqRange) {
+  for (const s of dayShifts) {
+    const sr = timeRangeToMinutes(s.startTime, s.endTime);
+    if (!sr) continue;
+    conflictMins += overlapMinutes(reqRange, sr);
+  }
+}
 
-      let conflictMins = 0;
-      if (reqRange) {
-        for (const s of dayShifts) {
-          const sr = timeRangeToMinutes(s.startTime, s.endTime);
-          if (!sr) continue;
-          conflictMins += overlapMinutes(reqRange, sr);
-        }
-      }
+const keyNorm = normalizeKey(key);
+const idNorm = id ? normalizeKey(id) : "";
+const nameNorm = name ? normalizeKey(name) : "";
 
-      const keyNorm = normalizeKey(key);
-      const idNorm = id ? normalizeKey(id) : "";
-      const nameNorm = name ? normalizeKey(name) : "";
+const dt =
+  driveByCaregiverKey[key] ||
+  (keyNorm ? driveByCaregiverKey[keyNorm] : undefined) ||
+  (idNorm ? driveByCaregiverKey[idNorm] : undefined) ||
+  (nameNorm ? driveByCaregiverKey[nameNorm] : undefined);
 
-      const dt =
-        driveByCaregiverKey[key] ||
-        (keyNorm ? driveByCaregiverKey[keyNorm] : undefined) ||
-        (idNorm ? driveByCaregiverKey[idNorm] : undefined) ||
-        (nameNorm ? driveByCaregiverKey[nameNorm] : undefined);
+const dtMin = dt?.minutes ?? null;
+const dtText = norm(dt?.text);
 
-      const dtMin = dt?.minutes ?? null;
-      const dtText = norm(dt?.text);
+const availabilityResult = scorePostedAvailability(availRaw, start, end);
 
-      const histScorePts = historyScore(h?.count || 0);
-      const availScorePts = availabilityScoreFromConflictMinutes(conflictMins);
-      const dtScorePts = driveScoreFromMinutes(dtMin);
-      const weeklyScorePts = weeklyHoursScore(totalHours, reqShiftHours);
-      const tenureScorePts = 0;
-      const certPts = certScore(certs);
+const availabilityScorePts = availabilityResult.score;
+const conflictScorePts = conflictScoreFromMinutes(conflictMins);
+const histScorePts = historyScore(h?.count || 0);
+const dtScorePts = driveScoreFromMinutes(dtMin);
+const desiredHoursScorePts = desiredHoursFitScore(desiredMeta, totalHours, reqShiftHours);
+const hoursPenaltyPts = fortyHourPenalty(totalHours, reqShiftHours);
 
-      const total = histScorePts + availScorePts + dtScorePts + weeklyScorePts + tenureScorePts + certPts;
-
+const total =
+  availabilityScorePts +
+  conflictScorePts +
+  histScorePts +
+  dtScorePts +
+  desiredHoursScorePts +
+  hoursPenaltyPts;
       const i = shiftInfo.getGridShiftInfo({
         clientName,
         dateStr: dateStrForDow,
@@ -1892,38 +2280,41 @@ clientHistoryCache.set(key, { ts: Date.now(), data: cleaned });
         isCancelled: false,
       });
 
-      out.push({
-        key,
-        name,
-        id,
+     out.push({
+  key,
+  name,
+  id,
 
-        desiredMeta,
-        availRaw,
-        availLabel: norm(i?.caregiverAvailabilityLabel),
-        availSource: norm(i?.caregiverAvailabilitySource),
+  desiredMeta,
+  availRaw,
+  availLabel: norm(i?.caregiverAvailabilityLabel) || availabilityResult.label,
+  availSource: norm(i?.caregiverAvailabilitySource),
 
-        dayShifts,
-        totalHours,
+  availabilityMatchType: availabilityResult.type,
+  availabilityMatchLabel: availabilityResult.label,
 
-        historyCount: h?.count || 0,
-        historyLast: h?.lastDate || null,
+  dayShifts,
+  totalHours,
 
-        driveTimeText: dtText,
-        driveTimeMinutes: dtMin,
+  historyCount: h?.count || 0,
+  historyLast: h?.lastDate || null,
 
-        conflictMinutes: conflictMins,
-        hasConflict: conflictMins > 0,
+  driveTimeText: dtText,
+  driveTimeMinutes: dtMin,
 
-        scoreTotal: total,
-        scoreBreakdown: {
-          history: histScorePts,
-          availability: availScorePts,
-          drive_time: dtScorePts,
-          weekly_hours: weeklyScorePts,
-          tenure: tenureScorePts,
-          certification: certPts,
-        },
-      });
+  conflictMinutes: conflictMins,
+  hasConflict: conflictMins > 0,
+
+  scoreTotal: total,
+  scoreBreakdown: {
+    availability: availabilityScorePts,
+    conflict: conflictScorePts,
+    history: histScorePts,
+    drive_time: dtScorePts,
+    desired_hours: desiredHoursScorePts,
+    hours_penalty: hoursPenaltyPts,
+  },
+});
     }
 
    
@@ -2061,9 +2452,10 @@ clientHistoryCache.set(key, { ts: Date.now(), data: cleaned });
     const base = [...caregiversFiltered];
 
     const gap = (c: CaregiverRow) => {
-      if (c.desiredMeta.wantsMax) return Number.POSITIVE_INFINITY;
-      return c.desiredMeta.hours - c.totalHours;
-    };
+  const target = desiredHoursTarget(c.desiredMeta);
+  if (target == null) return Number.NEGATIVE_INFINITY;
+  return target - c.totalHours;
+};
 
     base.sort((a, b) => {
       const nameA = a.name.toLowerCase();
@@ -2094,10 +2486,16 @@ clientHistoryCache.set(key, { ts: Date.now(), data: cleaned });
       }
 
       if (sortMode === "desired_desc") {
-        if (a.desiredMeta.wantsMax !== b.desiredMeta.wantsMax) return a.desiredMeta.wantsMax ? -1 : 1;
-        if (b.desiredMeta.hours !== a.desiredMeta.hours) return b.desiredMeta.hours - a.desiredMeta.hours;
-        return nameA.localeCompare(nameB);
-      }
+  if (a.desiredMeta.wantsMax !== b.desiredMeta.wantsMax) {
+    return a.desiredMeta.wantsMax ? -1 : 1;
+  }
+
+  const aTarget = desiredHoursTarget(a.desiredMeta) ?? -1;
+  const bTarget = desiredHoursTarget(b.desiredMeta) ?? -1;
+
+  if (bTarget !== aTarget) return bTarget - aTarget;
+  return nameA.localeCompare(nameB);
+}
 
       if (sortMode === "total_asc") {
         if (a.totalHours !== b.totalHours) return a.totalHours - b.totalHours;
@@ -2409,677 +2807,821 @@ return (
       </div>
 
       {/* ---------- SHIFT MENU (FloatingPanel) ---------- */}
-      <FloatingPanel
+<FloatingPanel
   open={menuOpen}
   onClose={() => setMenuOpen(false)}
-  title={`Shift Info • ${clientName}`}
+  title={
+    shiftSummary
+      ? `Shift Info • ${clientName} • ${shiftSummary.start}-${shiftSummary.end} • ${shiftSummary.caregiver || "Open"}`
+      : `Shift Info • ${clientName}`
+  }
   storageKey={`shift-menu:${week}:${a1Key}`}
   initial={{ w: 720, h: 520 }}
 >
-  <div style={{ display: "grid", gap: 10 }}>
-          {shiftSummary ? (
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
-              <Pill>{shiftSummary.client}</Pill>
-              <Pill>{shiftSummary.dateStr}</Pill>
-              <Pill>
-                {shiftSummary.start}-{shiftSummary.end}
-              </Pill>
+  <div
+    style={{
+      height: "100%",
+      overflowY: "auto",
+      overflowX: "hidden",
+      padding: 10,
+      background: clearMode ? "rgba(255,255,255,0.02)" : "#f8fbff",
+    }}
+  >
+    <div style={{ display: "grid", gap: 10 }}>
+      {weekSchedError ? <div style={{ fontWeight: 950, color: "#b91c1c" }}>Schedule error: {weekSchedError}</div> : null}
+      {availError ? <div style={{ fontWeight: 950, color: "#b91c1c" }}>Availability error: {availError}</div> : null}
+      {cgError ? <div style={{ fontWeight: 950, color: "#b91c1c" }}>Caregivers error: {cgError}</div> : null}
+      {clientsError ? <div style={{ fontWeight: 950, color: "#b91c1c" }}>Clients error: {clientsError}</div> : null}
+      {driveError ? <div style={{ fontWeight: 950, color: "#b91c1c" }}>Drive-time error: {driveError}</div> : null}
+
+      <div
+        style={{
+          border: "1px solid rgba(17,24,39,0.10)",
+          borderRadius: 14,
+          background: clearMode ? "rgba(224,242,254,0.08)" : "#e0f2fe",
+          color: "#111827",
+          overflow: "hidden",
+          backdropFilter: clearMode ? "blur(2px)" : "none",
+          WebkitBackdropFilter: clearMode ? "blur(2px)" : "none",
+        }}
+      >
+        <div
+          style={{
+            position: "sticky",
+            top: -10,
+            zIndex: 20,
+            display: "grid",
+            gap: 8,
+            padding: 10,
+            borderBottom: "1px solid rgba(17,24,39,0.06)",
+            background: clearMode ? "rgba(224,242,254,0.10)" : "#d7eefc",
+            backdropFilter: clearMode ? "blur(2px)" : "none",
+            WebkitBackdropFilter: clearMode ? "blur(2px)" : "none",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "flex-start",
+              justifyContent: "space-between",
+              gap: 10,
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ minWidth: 0, flex: "1 1 420px" }}>
+              <div style={{ fontSize: 16, fontWeight: 1000, color: "#111827", lineHeight: 1.1 }}>
+                {shiftSummary ? shiftSummary.client : "Shift"}
+              </div>
+
+              {shiftSummary ? (
+                <div
+                  style={{
+                    marginTop: 6,
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(150px, max-content))",
+                    gap: 6,
+                    alignItems: "center",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      minHeight: 32,
+                      padding: "6px 10px",
+                      borderRadius: 10,
+                      border: "1px solid rgba(17,24,39,0.10)",
+                      background: clearMode ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.62)",
+                      color: "#0b1220",
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize: 10.5,
+                        fontWeight: 1000,
+                        color: "#64748b",
+                        textTransform: "uppercase",
+                        letterSpacing: 0.3,
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      Day
+                    </span>
+                    <span
+                      style={{
+                        fontSize: 12,
+                        fontWeight: 950,
+                        color: "#0b1220",
+                        minWidth: 0,
+                      }}
+                    >
+                      {formatFriendlyDate(shiftSummary.dateStr)}
+                    </span>
+                  </div>
+
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      minHeight: 32,
+                      padding: "6px 10px",
+                      borderRadius: 10,
+                      border: "1px solid rgba(17,24,39,0.10)",
+                      background: clearMode ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.62)",
+                      color: "#0b1220",
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize: 10.5,
+                        fontWeight: 1000,
+                        color: "#64748b",
+                        textTransform: "uppercase",
+                        letterSpacing: 0.3,
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      Time
+                    </span>
+                    <span
+                      style={{
+                        fontSize: 12,
+                        fontWeight: 950,
+                        color: "#0b1220",
+                        minWidth: 0,
+                      }}
+                    >
+                      {shiftSummary.start}-{shiftSummary.end}
+                    </span>
+                  </div>
+
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      minHeight: 32,
+                      padding: "6px 10px",
+                      borderRadius: 10,
+                      border: "1px solid rgba(17,24,39,0.10)",
+                      background: clearMode ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.62)",
+                      color: "#0b1220",
+                    }}
+                    title="Currently scheduled caregiver for this shift"
+                  >
+                    <span
+                      style={{
+                        fontSize: 10.5,
+                        fontWeight: 1000,
+                        color: "#64748b",
+                        textTransform: "uppercase",
+                        letterSpacing: 0.3,
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      Scheduled
+                    </span>
+                    <span
+                      style={{
+                        fontSize: 12,
+                        fontWeight: 950,
+                        color: "#0b1220",
+                        minWidth: 0,
+                      }}
+                    >
+                      {shiftSummary.caregiver || "Open"}
+                    </span>
+                  </div>
+                </div>
+              ) : (
+                <div style={{ marginTop: 4, opacity: 0.8, fontWeight: 850, color: "#0b1220" }}>
+                  (No parsed time range for this cell)
+                </div>
+              )}
+
+              <div
+                style={{
+                  marginTop: 8,
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: 6,
+                  minHeight: 34,
+                  padding: "7px 10px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(17,24,39,0.10)",
+                  background: clearMode ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.62)",
+                  color: "#0b1220",
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: 10.5,
+                    fontWeight: 1000,
+                    color: "#64748b",
+                    textTransform: "uppercase",
+                    letterSpacing: 0.3,
+                    whiteSpace: "nowrap",
+                    paddingTop: 1,
+                  }}
+                >
+                  Destination
+                </span>
+
+                <span
+                  style={{
+                    fontSize: 12,
+                    fontWeight: 900,
+                    color: "#0b1220",
+                    minWidth: 0,
+                    whiteSpace: "normal",
+                    lineHeight: 1.35,
+                  }}
+                >
+                  {clientsLoading ? (
+                    <SkeletonLine w="320px" />
+                  ) : clientDestination ? (
+                    clientDestination
+                  ) : (
+                    <span style={{ color: "#b91c1c" }}>Missing client address</span>
+                  )}
+                </span>
+              </div>
+            </div>
+
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                flexWrap: "wrap",
+                justifyContent: "flex-end",
+                flex: "0 0 auto",
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => setClearMode((v) => !v)}
+                style={{
+                  border: "1px solid rgba(15,23,42,0.16)",
+                  background: clearMode ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.82)",
+                  borderRadius: 999,
+                  padding: "7px 11px",
+                  fontWeight: 950,
+                  cursor: "pointer",
+                  color: "#0b1220",
+                  fontSize: 12,
+                  whiteSpace: "nowrap",
+                  backdropFilter: clearMode ? "blur(1px)" : "none",
+                  WebkitBackdropFilter: clearMode ? "blur(1px)" : "none",
+                }}
+                title="Toggle clear mode"
+              >
+                {clearMode ? "Solid mode" : "Clear mode"}
+              </button>
 
               <button
                 type="button"
                 onClick={() => setShowDesc((vv) => !vv)}
                 style={{
-                  border: "1px solid rgba(15,23,42,0.18)",
-                  background: "rgba(255,255,255,0.75)",
+                  border: "1px solid rgba(15,23,42,0.16)",
+                  background: clearMode ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.82)",
                   borderRadius: 999,
-                  padding: "6px 10px",
+                  padding: "7px 11px",
                   fontWeight: 950,
                   cursor: "pointer",
                   color: "#0b1220",
                   fontSize: 12,
+                  whiteSpace: "nowrap",
+                  backdropFilter: clearMode ? "blur(1px)" : "none",
+                  WebkitBackdropFilter: clearMode ? "blur(1px)" : "none",
                 }}
                 title="Toggle description"
               >
-                {showDesc ? "Hide description" : "Show description"}
+                {showDesc ? "Hide description" : "Case description"}
               </button>
 
               {initialMenuLoading ? <TinySpinner label="Loading…" /> : null}
             </div>
-          ) : (
-            <div style={{ opacity: 0.9, fontWeight: 850, color: "#0b1220" }}>(No parsed time range for this cell)</div>
-          )}
+          </div>
 
           {showDesc ? (
             <div
               style={{
-                border: "1px solid rgba(15,23,42,0.14)",
+                border: "1px solid rgba(15,23,42,0.10)",
                 borderRadius: 12,
                 padding: 10,
-                background: "rgba(255,255,255,0.86)",
+                background: clearMode ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.88)",
                 color: "#0b1220",
                 fontWeight: 850,
                 whiteSpace: "pre-wrap",
+                backdropFilter: clearMode ? "blur(2px)" : "none",
+                WebkitBackdropFilter: clearMode ? "blur(2px)" : "none",
               }}
             >
               {norm(clientDescription) ? clientDescription : "No description on file."}
             </div>
           ) : null}
 
-          <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.85 }}>
-            Destination:{" "}
-            {clientsLoading ? (
-              <SkeletonLine w="420px" />
-            ) : clientDestination ? (
-              clientDestination
-            ) : (
-              <span style={{ color: "#b91c1c" }}>Missing client address</span>
-            )}
-          </div>
-
-          {/* Errors */}
-          {weekSchedError ? <div style={{ fontWeight: 950, color: "#b91c1c" }}>Schedule error: {weekSchedError}</div> : null}
-          {availError ? <div style={{ fontWeight: 950, color: "#b91c1c" }}>Availability error: {availError}</div> : null}
-          {cgError ? <div style={{ fontWeight: 950, color: "#b91c1c" }}>Caregivers error: {cgError}</div> : null}
-          {clientsError ? <div style={{ fontWeight: 950, color: "#b91c1c" }}>Clients error: {clientsError}</div> : null}
-          {driveError ? <div style={{ fontWeight: 950, color: "#b91c1c" }}>Drive-time error: {driveError}</div> : null}
-
-          <Section
-            title={<span>Caregivers (Active this week)</span>}
-            right={
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
-                <button
-                  type="button"
-                  onClick={() => loadWeekSchedule()}
-                  style={{
-                    border: "1px solid rgba(17,24,39,0.14)",
-                    background: "rgba(255,255,255,0.9)",
-                    borderRadius: 10,
-                    padding: "6px 10px",
-                    fontWeight: 950,
-                    cursor: "pointer",
-                    color: "#111827",
-                    fontSize: 12,
-                  }}
-                >
-                  Refresh schedule
-                </button>
-                <button
-                  type="button"
-                  onClick={() => loadAvailability()}
-                  style={{
-                    border: "1px solid rgba(17,24,39,0.14)",
-                    background: "rgba(255,255,255,0.9)",
-                    borderRadius: 10,
-                    padding: "6px 10px",
-                    fontWeight: 950,
-                    cursor: "pointer",
-                    color: "#111827",
-                    fontSize: 12,
-                  }}
-                >
-                  Refresh availability
-                </button>
-                <button
-                  type="button"
-                  onClick={() => loadClientHistory()}
-                  style={{
-                    border: "1px solid rgba(17,24,39,0.14)",
-                    background: "rgba(255,255,255,0.9)",
-                    borderRadius: 10,
-                    padding: "6px 10px",
-                    fontWeight: 950,
-                    cursor: "pointer",
-                    color: "#111827",
-                    fontSize: 12,
-                  }}
-                >
-                  Refresh history
-                </button>
-                <button
-                  type="button"
-                  onClick={() => loadCaregivers()}
-                  style={{
-                    border: "1px solid rgba(17,24,39,0.14)",
-                    background: "rgba(255,255,255,0.9)",
-                    borderRadius: 10,
-                    padding: "6px 10px",
-                    fontWeight: 950,
-                    cursor: "pointer",
-                    color: "#111827",
-                    fontSize: 12,
-                  }}
-                >
-                  Refresh caregivers
-                </button>
-                <button
-                  type="button"
-                  onClick={() => loadClients()}
-                  style={{
-                    border: "1px solid rgba(17,24,39,0.14)",
-                    background: "rgba(255,255,255,0.9)",
-                    borderRadius: 10,
-                    padding: "6px 10px",
-                    fontWeight: 950,
-                    cursor: "pointer",
-                    color: "#111827",
-                    fontSize: 12,
-                  }}
-                >
-                  Refresh clients
-                </button>
-              </div>
-            }
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 10,
+              flexWrap: "wrap",
+            }}
           >
-            {(weekSchedLoading || availLoading || cgLoading || clientsLoading) && (
-              <div style={{ fontWeight: 900, opacity: 0.9, color: "#111827", display: "flex", gap: 10, alignItems: "center" }}>
-                <TinySpinner />
-                <span style={{ opacity: 0.85, fontWeight: 800 }}>
-                  {weekSchedLoading ? "schedule" : ""}
-                  {weekSchedLoading && availLoading ? " + " : ""}
-                  {availLoading ? "availability" : ""}
-                  {(weekSchedLoading || availLoading) && (cgLoading || clientsLoading) ? " + " : ""}
-                  {cgLoading ? "caregivers" : ""}
-                  {cgLoading && clientsLoading ? " + " : ""}
-                  {clientsLoading ? "clients" : ""}
-                </span>
-              </div>
-            )}
+            <div style={{ fontSize: 13, fontWeight: 950, color: "#111827" }}>
+              Caregivers (Active this week)
+            </div>
 
-            {/* Search + sort header */}
             <div
               style={{
-                marginTop: 10,
-                border: "1px solid rgba(17,24,39,0.10)",
-                borderRadius: 12,
-                background: "rgba(255,255,255,0.92)",
-                overflow: "hidden",
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                flexWrap: "wrap",
+                justifyContent: "flex-end",
               }}
             >
-              <div style={{ padding: 10, borderBottom: "1px solid rgba(17,24,39,0.08)", background: "rgba(249,250,251,0.92)" }}>
-                <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                  <div style={{ flex: "1 1 320px", minWidth: 260 }}>
-                    <div style={{ fontWeight: 950, color: "#111827", fontSize: 12 }}>Search caregivers</div>
-                    <input
-                      value={caregiverSearch}
-                      onChange={(e) => setCaregiverSearch(e.target.value)}
-                      placeholder="Type a name…"
-                      style={{
-                        marginTop: 8,
-                        width: "100%",
-                        borderRadius: 10,
-                        border: "1px solid rgba(17,24,39,0.14)",
-                        padding: "8px 10px",
-                        fontWeight: 850,
-                        outline: "none",
-                        background: "white",
-                        color: "#111827",
-                      }}
-                    />
-                  </div>
+              <input
+                value={caregiverSearch}
+                onChange={(e) => setCaregiverSearch(e.target.value)}
+                placeholder="Search caregivers..."
+                style={{
+                  width: 170,
+                  maxWidth: "100%",
+                  border: "1px solid rgba(15,23,42,0.12)",
+                  borderRadius: 10,
+                  padding: "7px 10px",
+                  fontSize: 12,
+                  outline: "none",
+                  background: clearMode ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.82)",
+                  fontWeight: 800,
+                  color: "#111827",
+                  backdropFilter: clearMode ? "blur(1px)" : "none",
+                  WebkitBackdropFilter: clearMode ? "blur(1px)" : "none",
+                }}
+              />
 
-                  <div style={{ display: "grid", gap: 6 }}>
-                    <div style={{ fontSize: 12, fontWeight: 950, color: "rgba(17,24,39,0.70)" }}>Sort</div>
-                    <select
-                      value={sortMode}
-                      onChange={(e) => setSortMode(e.target.value as SortMode)}
+              <select
+                value={sortMode}
+                onChange={(e) => setSortMode(e.target.value as SortMode)}
+                style={{
+                  border: "1px solid rgba(15,23,42,0.12)",
+                  borderRadius: 10,
+                  padding: "7px 10px",
+                  fontSize: 12,
+                  outline: "none",
+                  background: clearMode ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.82)",
+                  fontWeight: 850,
+                  color: "#111827",
+                  minWidth: 170,
+                  backdropFilter: clearMode ? "blur(1px)" : "none",
+                  WebkitBackdropFilter: clearMode ? "blur(1px)" : "none",
+                }}
+              >
+                <option value="smart">Smart (score)</option>
+                <option value="history_desc">History (high → low)</option>
+                <option value="drive_asc">Drive time (low → high)</option>
+                <option value="avail_filled_desc">Availability filled (yes → no)</option>
+                <option value="desired_desc">Desired Hours (high → low)</option>
+                <option value="total_asc">Total Hours (low → high)</option>
+                <option value="gap_desc">Desired - Total (high → low)</option>
+                <option value="name_asc">Name (A → Z)</option>
+              </select>
+            </div>
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              gap: 8,
+              alignItems: "center",
+            }}
+          >
+            <Pill>{caregivers.length} shown</Pill>
+            <Pill>Active this week: {stats.total}</Pill>
+            <Pill>Conflicts: {stats.conflicts}</Pill>
+            {availTabName ? <Pill>Source: {availTabName}</Pill> : null}
+
+            {histLoading ? <TinySpinner label="History…" /> : null}
+            {driveLoading ? <TinySpinner label="Drive times…" /> : null}
+            {histError ? <span style={{ fontWeight: 950, color: "#b91c1c" }}>{histError}</span> : null}
+          </div>
+
+          {availValues.length > 0 && (caregiverNameIdx < 0 || dayColIndexForSelectedDow < 0) ? (
+            <div style={{ fontSize: 12, fontWeight: 900, color: "#b45309" }}>
+              Heads up: availability headers didn’t match expected columns (Caregiver Name / day columns). We’ll still show all active caregivers.
+            </div>
+          ) : null}
+        </div>
+
+        <div style={{ padding: 10 }}>
+          {(weekSchedLoading || availLoading || cgLoading || clientsLoading) && (
+            <div
+              style={{
+                fontWeight: 900,
+                opacity: 0.9,
+                color: "#111827",
+                display: "flex",
+                gap: 10,
+                alignItems: "center",
+                marginBottom: 10,
+              }}
+            >
+              <TinySpinner />
+              <span style={{ opacity: 0.85, fontWeight: 800 }}>
+                {weekSchedLoading ? "schedule" : ""}
+                {weekSchedLoading && availLoading ? " + " : ""}
+                {availLoading ? "availability" : ""}
+                {(weekSchedLoading || availLoading) && (cgLoading || clientsLoading) ? " + " : ""}
+                {cgLoading ? "caregivers" : ""}
+                {cgLoading && clientsLoading ? " + " : ""}
+                {clientsLoading ? "clients" : ""}
+              </span>
+            </div>
+          )}
+
+          {initialMenuLoading && caregiversBase.length === 0 ? (
+            <div style={{ display: "grid", gap: 10 }}>
+              {Array.from({ length: 6 }).map((_, i) => (
+                <div
+                  key={i}
+                  style={{
+                    background: clearMode ? "rgba(255,255,255,0.04)" : "#ffffff",
+                    borderRadius: 14,
+                    border: "1px solid rgba(15,23,42,0.10)",
+                    boxShadow: "0 6px 18px rgba(15,23,42,0.06)",
+                    padding: 12,
+                    color: "#111827",
+                    backdropFilter: clearMode ? "blur(1px)" : "none",
+                    WebkitBackdropFilter: clearMode ? "blur(1px)" : "none",
+                  }}
+                >
+                  <SkeletonLine w="40%" />
+                  <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+                    <SkeletonLine w="90px" />
+                    <SkeletonLine w="120px" />
+                    <SkeletonLine w="110px" />
+                  </div>
+                  <div style={{ marginTop: 10 }}>
+                    <SkeletonLine w="70%" />
+                    <div style={{ marginTop: 6 }} />
+                    <SkeletonLine w="55%" />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div style={{ display: "grid", gap: 10 }}>
+              {caregivers.map((cg) => {
+                const desiredTarget = desiredHoursTarget(cg.desiredMeta);
+                const desiredLabel = cg.desiredMeta.wantsMax
+                  ? "As many as possible"
+                  : cg.desiredMeta.min != null && cg.desiredMeta.max != null
+                    ? `${cg.desiredMeta.min}-${cg.desiredMeta.max}h`
+                    : desiredTarget != null
+                      ? `${desiredTarget}h`
+                      : "—";
+
+                const gapValue =
+                  cg.desiredMeta.wantsMax || desiredTarget == null
+                    ? null
+                    : desiredTarget - cg.totalHours;
+
+                const driveLabel =
+                  driveLoading && cg.driveTimeMinutes == null && !cg.driveTimeText
+                    ? "…"
+                    : cg.driveTimeMinutes != null
+                      ? `${Math.round(cg.driveTimeMinutes)}m`
+                      : "—";
+
+                const showAvailabilityReviewBadge = needsAvailabilityReview(
+                  cg.availabilityMatchType,
+                  cg.availRaw ?? ""
+                );
+
+                return (
+                  <div
+                    key={cg.key}
+                    style={{
+                      background: clearMode ? "rgba(255,255,255,0.04)" : "#ffffff",
+                      border: "1px solid rgba(15,23,42,0.10)",
+                      borderRadius: 12,
+                      padding: "10px 12px",
+                      boxShadow: "0 3px 10px rgba(15,23,42,0.04)",
+                      backdropFilter: clearMode ? "blur(1px)" : "none",
+                      WebkitBackdropFilter: clearMode ? "blur(1px)" : "none",
+                    }}
+                  >
+                    <div
                       style={{
-                        border: "1px solid rgba(17,24,39,0.14)",
-                        borderRadius: 10,
-                        padding: "8px 10px",
-                        fontSize: 13,
-                        outline: "none",
-                        background: "white",
-                        fontWeight: 850,
-                        color: "#111827",
-                        minWidth: 260,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 10,
+                        minWidth: 0,
                       }}
                     >
-                      <option value="smart">Smart (score)</option>
-                      <option value="history_desc">History (high → low)</option>
-                      <option value="drive_asc">Drive time (low → high)</option>
-                      <option value="avail_filled_desc">Availability filled (yes → no)</option>
-                      <option value="desired_desc">Desired Hours (high → low)</option>
-                      <option value="total_asc">Total Hours (low → high)</option>
-                      <option value="gap_desc">Desired - Total (high → low)</option>
-                      <option value="name_asc">Name (A → Z)</option>
-                    </select>
-                  </div>
-                </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0, flex: "1 1 auto" }}>
+                        <div
+                          style={{
+                            fontSize: 15,
+                            fontWeight: 1000,
+                            color: "#111827",
+                            minWidth: 0,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                          title={cg.name}
+                        >
+                          {cg.name}
+                        </div>
 
-                <div style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
-                  <Pill>{caregivers.length} shown</Pill>
-                  <Pill>Active this week: {stats.total}</Pill>
-                  <Pill>Conflicts: {stats.conflicts}</Pill>
-                  <Pill>{dateStrForDow}</Pill>
-                  {availTabName ? <Pill>Source: {availTabName}</Pill> : null}
+                        <span
+                          style={{
+                            flex: "0 0 auto",
+                            fontSize: 14,
+                            fontWeight: 1000,
+                            padding: "6px 12px",
+                            borderRadius: 999,
+                            background: clearMode ? "rgba(2,132,199,0.08)" : "rgba(2,132,199,0.12)",
+                            border: "1px solid rgba(2,132,199,0.18)",
+                            color: "#0b1220",
+                            whiteSpace: "nowrap",
+                            lineHeight: 1,
+                          }}
+                          title={buildScoreTooltip(cg)}
+                        >
+                          {cg.scoreTotal}
+                        </span>
+                      </div>
 
-                  {histLoading ? (
-                    <TinySpinner label="History…" />
-                  ) : histError ? (
-                    <span style={{ fontWeight: 950, color: "#b91c1c" }}>{histError}</span>
-                  ) : null}
-                  {driveLoading ? <TinySpinner label="Drive times…" /> : null}
-                </div>
-
-                {availValues.length > 0 && (caregiverNameIdx < 0 || dayColIndexForSelectedDow < 0) ? (
-                  <div style={{ marginTop: 10, fontSize: 12, fontWeight: 900, color: "#b45309" }}>
-                    Heads up: availability headers didn’t match expected columns (Caregiver Name / day columns). We’ll still show all active caregivers.
-                  </div>
-                ) : null}
-              </div>
-
-              {/* Cards */}
-              <div style={{ padding: 10, maxHeight: 560, overflow: "auto", background: "#e0f2fe", borderTop: "1px solid rgba(2,132,199,0.18)" }}>
-                {initialMenuLoading && caregiversBase.length === 0 ? (
-                  <div style={{ display: "grid", gap: 10 }}>
-                    {Array.from({ length: 6 }).map((_, i) => (
-                      <div
-                        key={i}
+                      <button
+                        type="button"
+                        onClick={() => openMessageToCaregiver({ id: cg.id, name: cg.name })}
+                        disabled={!messagesUI || !norm(cg.id)}
+                        title={!messagesUI ? "Messaging unavailable" : !norm(cg.id) ? "Missing caregiverId" : "Message this caregiver"}
+                        aria-label="Message this caregiver"
                         style={{
-                          background: "#ffffff",
-                          borderRadius: 14,
-                          border: "1px solid rgba(15,23,42,0.14)",
-                          boxShadow: "0 6px 18px rgba(15,23,42,0.08)",
-                          padding: 12,
-                          color: "#111827",
+                          flex: "0 0 auto",
+                          width: 38,
+                          height: 38,
+                          borderRadius: 12,
+                          border: "1px solid rgba(59,130,246,0.18)",
+                          background: clearMode ? "rgba(59,130,246,0.05)" : "rgba(59,130,246,0.10)",
+                          color: "#2563eb",
+                          display: "inline-flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          cursor: !messagesUI || !norm(cg.id) ? "not-allowed" : "pointer",
+                          opacity: !messagesUI || !norm(cg.id) ? 0.55 : 1,
                         }}
                       >
-                        <SkeletonLine w="40%" />
-                        <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
-                          <SkeletonLine w="90px" />
-                          <SkeletonLine w="120px" />
-                          <SkeletonLine w="110px" />
-                        </div>
-                        <div style={{ marginTop: 10 }}>
-                          <SkeletonLine w="70%" />
-                          <div style={{ marginTop: 6 }} />
-                          <SkeletonLine w="55%" />
-                        </div>
+                        <MessageBubbleIcon size={20} />
+                      </button>
+                    </div>
+
+                    <div
+  style={{
+    marginTop: 8,
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 6,
+    alignItems: "center",
+  }}
+>
+  {cg.availabilityMatchType === "exact" || cg.availabilityMatchType === "strong" ? (
+    <ScoreChip
+      label="Fits Availability"
+      tone="good"
+      title={`Availability match: ${cg.availabilityMatchLabel}`}
+    />
+  ) : cg.availabilityMatchType === "partial" ? (
+    <ScoreChip
+      label="Partial Availability Match"
+      tone="warn"
+      title={`Availability match: ${cg.availabilityMatchLabel}`}
+    />
+  ) : showAvailabilityReviewBadge ? (
+    <ScoreChip
+      label="Review availability"
+      tone="warn"
+      title={`Posted availability needs human review: ${cg.availRaw || "Unclear entry"}`}
+    />
+  ) : !norm(cg.availRaw) ? (
+    <ScoreChip
+      label="No Availability"
+      tone="bad"
+      title="No availability was posted for this caregiver for this day."
+    />
+  ) : cg.availabilityMatchType === "none" ? (
+    <ScoreChip
+      label="Does not fit availability"
+      tone="bad"
+      title={`Availability match: ${cg.availabilityMatchLabel || "No match"}`}
+    />
+  ) : null}
+
+  <ScoreChip
+    label={cg.hasConflict ? "Conflict" : "No Conflict"}
+    tone={cg.hasConflict ? "bad" : "good"}
+    title={
+      cg.hasConflict
+        ? `Overlap: ${Math.round(cg.conflictMinutes || 0)} minutes`
+        : "No overlap"
+    }
+  />
+
+  <ScoreChip
+    label={`History: ${cg.historyCount}`}
+    tone={cg.historyCount > 0 ? "good" : "neutral"}
+    title={
+      cg.historyCount === 1
+        ? "1 prior shift"
+        : `${cg.historyCount} prior shifts`
+    }
+  />
+
+  <ScoreChip
+    label={`Drive time: ${driveLabel}`}
+    tone={
+      cg.driveTimeMinutes == null
+        ? "neutral"
+        : cg.driveTimeMinutes <= 20
+          ? "good"
+          : cg.driveTimeMinutes <= 30
+            ? "warn"
+            : "bad"
+    }
+    title={
+      cg.driveTimeText ||
+      (cg.driveTimeMinutes != null
+        ? `Drive time: ${cg.driveTimeMinutes} min`
+        : clientDestination
+          ? "Drive time unavailable (missing caregiver address or API returned no result)"
+          : "Drive time unavailable (missing client address)")
+    }
+  />
+
+  <ScoreChip
+    label={`Desired: ${desiredLabel}`}
+    tone="neutral"
+    title={
+      gapValue == null
+        ? `Desired hours: ${desiredLabel}`
+        : `Desired (${desiredTarget}) - Total (${cg.totalHours.toFixed(1)}) = Gap ${gapValue.toFixed(1)}h`
+    }
+  />
+
+  <ScoreChip
+    label={`Total hours: ${cg.totalHours.toFixed(1)}`}
+    tone={
+      cg.totalHours > 40
+        ? "bad"
+        : cg.totalHours >= 35
+          ? "warn"
+          : "neutral"
+    }
+    title="Total scheduled hours this week"
+  />
+
+  {(cg.totalHours > 40 || cg.totalHours + shiftDurationHours(start, end) > 40) ? (
+    <ScoreChip
+      label="Over 40 Hours"
+      tone="bad"
+      title={
+        cg.totalHours > 40
+          ? `Already above 40 hours at ${cg.totalHours.toFixed(1)}h`
+          : `This shift would bring them to ${(cg.totalHours + shiftDurationHours(start, end)).toFixed(1)}h`
+      }
+    />
+  ) : null}
+</div>
+
+                    <div
+                      style={{
+                        marginTop: 8,
+                        display: "grid",
+                        gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                        gap: 8,
+                      }}
+                    >
+                      <MetaField
+                        label="Shifts today"
+                        value={cg.dayShifts.length}
+                        clearMode={clearMode}
+                      />
+                    </div>
+
+                    <div style={{ marginTop: 8 }}>
+                      <div
+                        style={{
+                          fontSize: 11,
+                          fontWeight: 950,
+                          color: "#64748b",
+                          marginBottom: 4,
+                        }}
+                      >
+                        Availability
                       </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div style={{ display: "grid", gap: 10 }}>
-                    {caregivers.map((cg) => {
-                      const desiredLabel = cg.desiredMeta.wantsMax ? "As many as possible" : `${cg.desiredMeta.hours}`;
-                      const gapValue = cg.desiredMeta.wantsMax ? null : cg.desiredMeta.hours - cg.totalHours;
 
-                      return (
-                        <div
-                          key={cg.key}
-                          style={{
-                            background: "#ffffff",
-                            borderRadius: 14,
-                            border: "1px solid rgba(15,23,42,0.14)",
-                            boxShadow: "0 6px 18px rgba(15,23,42,0.08)",
-                            padding: 12,
-                            color: "#111827",
-                          }}
-                        >
-                          {/* Header row */}
-                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
-                            <div style={{ minWidth: 0, flex: "1 1 auto" }}>
-                              <div
-                                style={{
-                                  fontSize: 15,
-                                  fontWeight: 1000,
-                                  minWidth: 0,
-                                  overflow: "hidden",
-                                  textOverflow: "ellipsis",
-                                  whiteSpace: "nowrap",
-                                }}
-                                title={cg.name}
-                              >
-                                {cg.name}
-                              </div>
+                      <div
+                        style={{
+                          border: "1px solid rgba(17,24,39,0.08)",
+                          borderRadius: 10,
+                          padding: "8px 10px",
+                          background: clearMode ? "rgba(255,255,255,0.03)" : "rgba(255,255,255,0.62)",
+                          backdropFilter: clearMode ? "blur(1px)" : "none",
+                          WebkitBackdropFilter: clearMode ? "blur(1px)" : "none",
+                        }}
+                      >
+                        <AvailabilityCell value={cg.availRaw || "—"} />
+                        {(norm(cg.availLabel) || norm(cg.availSource)) && (
+                          <AvailabilityPill label={cg.availLabel} source={cg.availSource} />
+                        )}
+                      </div>
+                    </div>
 
-                              <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                                <span
-                                  style={{
-                                    fontSize: 12,
-                                    fontWeight: 1000,
-                                    padding: "4px 10px",
-                                    borderRadius: 999,
-                                    background: "rgba(2,132,199,0.10)",
-                                    border: "1px solid rgba(2,132,199,0.22)",
-                                    color: "#0b1220",
-                                    whiteSpace: "nowrap",
-                                  }}
-                                  title={[
-                                    `History: ${cg.scoreBreakdown.history}/30`,
-                                    `Availability: ${cg.scoreBreakdown.availability}/30`,
-                                    `Drive: ${cg.scoreBreakdown.drive_time}/20`,
-                                    `Weekly: ${cg.scoreBreakdown.weekly_hours}/10`,
-                                    `Cert: ${cg.scoreBreakdown.certification}/5`,
-                                  ].join(" • ")}
-                                >
-                                  Score: {cg.scoreTotal}
-                                </span>
+                    <div style={{ marginTop: 8 }}>
+                      <div
+                        style={{
+                          fontSize: 11,
+                          fontWeight: 950,
+                          color: "#64748b",
+                          marginBottom: 4,
+                        }}
+                      >
+                        Schedule this day
+                      </div>
 
-                                {cg.hasConflict ? (
-                                  <span
-                                    style={{
-                                      fontSize: 12,
-                                      fontWeight: 1000,
-                                      padding: "4px 10px",
-                                      borderRadius: 999,
-                                      background: "rgba(239,68,68,0.12)",
-                                      border: "1px solid rgba(239,68,68,0.22)",
-                                      color: "#7f1d1d",
-                                      whiteSpace: "nowrap",
-                                    }}
-                                    title={`Conflicts: ${Math.round(cg.conflictMinutes)} minutes overlap`}
-                                  >
-                                    Conflict
-                                  </span>
-                                ) : (
-                                  <span
-                                    style={{
-                                      fontSize: 12,
-                                      fontWeight: 950,
-                                      padding: "4px 10px",
-                                      borderRadius: 999,
-                                      background: "rgba(34,197,94,0.10)",
-                                      border: "1px solid rgba(34,197,94,0.18)",
-                                      color: "#065f46",
-                                      whiteSpace: "nowrap",
-                                    }}
-                                    title="No overlap with today’s schedule"
-                                  >
-                                    No conflict
-                                  </span>
-                                )}
-
-                                <span
-                                  style={{
-                                    fontSize: 12,
-                                    fontWeight: 950,
-                                    padding: "4px 10px",
-                                    borderRadius: 999,
-                                    background: "rgba(59,130,246,0.14)",
-                                    border: "1px solid rgba(59,130,246,0.25)",
-                                    color: "#0b1220",
-                                    whiteSpace: "nowrap",
-                                  }}
-                                  title="Times worked with this client"
-                                >
-                                  {cg.historyCount}×
-                                </span>
-
-                                {cg.historyLast ? (
-                                  <span
-                                    style={{
-                                      fontSize: 12,
-                                      fontWeight: 900,
-                                      padding: "4px 10px",
-                                      borderRadius: 999,
-                                      background: "rgba(2,132,199,0.10)",
-                                      border: "1px solid rgba(2,132,199,0.20)",
-                                      color: "#0b1220",
-                                      whiteSpace: "nowrap",
-                                    }}
-                                    title="Last worked with this client"
-                                  >
-                                    Last: {formatMaybeDateLabel(cg.historyLast)}
-                                  </span>
-                                ) : (
-                                  <span
-                                    style={{
-                                      fontSize: 12,
-                                      fontWeight: 900,
-                                      padding: "4px 10px",
-                                      borderRadius: 999,
-                                      background: "rgba(148,163,184,0.14)",
-                                      border: "1px solid rgba(148,163,184,0.25)",
-                                      color: "#0b1220",
-                                      whiteSpace: "nowrap",
-                                    }}
-                                  >
-                                    No history
-                                  </span>
-                                )}
-                              </div>
-                            </div>
-
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.preventDefault();
-                                e.stopPropagation();
-                                openMessageToCaregiver({ id: cg.id, name: cg.name });
-                              }}
-                              disabled={!messagesUI || !norm(cg.id)}
-                              style={{
-                                border: "1px solid rgba(59,130,246,0.35)",
-                                background: !messagesUI || !norm(cg.id) ? "rgba(148,163,184,0.25)" : "rgba(59,130,246,0.12)",
-                                borderRadius: 12,
-                                width: 44,
-                                height: 44,
-                                display: "inline-flex",
-                                alignItems: "center",
-                                justifyContent: "center",
-                                cursor: !messagesUI || !norm(cg.id) ? "not-allowed" : "pointer",
-                                color: !messagesUI || !norm(cg.id) ? "rgba(17,24,39,0.45)" : "#2563eb",
-                                flex: "0 0 auto",
-                              }}
-                              title={!messagesUI ? "Messaging unavailable" : !norm(cg.id) ? "Missing caregiverId" : "Message this caregiver"}
-                              aria-label="Message this caregiver"
-                            >
-                              <MessageBubbleIcon size={22} />
-                            </button>
-                          </div>
-
-                          {/* Metrics row */}
-                          <div style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: 8 }}>
-                            <span
-                              style={{
-                                fontSize: 12,
-                                fontWeight: 950,
-                                padding: "4px 10px",
-                                borderRadius: 999,
-                                background: "rgba(17,24,39,0.06)",
-                                border: "1px solid rgba(17,24,39,0.10)",
-                                color: "#0b1220",
-                                whiteSpace: "nowrap",
-                              }}
-                              title="Total scheduled hours this week (from schedule)"
-                            >
-                              Total: {cg.totalHours.toFixed(1)}h
-                            </span>
-
-                            <span
-                              style={{
-                                fontSize: 12,
-                                fontWeight: 950,
-                                padding: "4px 10px",
-                                borderRadius: 999,
-                                background: "rgba(124,58,237,0.10)",
-                                border: "1px solid rgba(124,58,237,0.18)",
-                                color: "#0b1220",
-                                whiteSpace: "nowrap",
-                              }}
-                              title={
-                                gapValue == null
-                                  ? "Desired is 'As many as possible'"
-                                  : `Gap = Desired (${cg.desiredMeta.hours}) - Total (${cg.totalHours.toFixed(1)})`
-                              }
-                            >
-                              Desired: {desiredLabel}
-                              {gapValue == null ? "" : ` • Gap: ${gapValue.toFixed(1)}h`}
-                            </span>
-
-                            <span
-                              style={{
-                                fontSize: 12,
-                                fontWeight: 950,
-                                padding: "4px 10px",
-                                borderRadius: 999,
-                                background: "rgba(34,197,94,0.10)",
-                                border: "1px solid rgba(34,197,94,0.18)",
-                                color: "#0b1220",
-                                whiteSpace: "nowrap",
-                              }}
-                              title="Number of shifts this caregiver has on this day"
-                            >
-                              Today shifts: {cg.dayShifts.length}
-                            </span>
-
-                            {/* Drive time chip */}
-                            {driveLoading && cg.driveTimeMinutes == null && !cg.driveTimeText ? (
+                      {cg.dayShifts.length ? (
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                          {cg.dayShifts.map((s, idx) => {
+                            const st = normalizeShiftStatusFromText(s.status);
+                            return (
                               <span
+                                key={`${s.shiftId || idx}-${s.client}-${s.startTime}-${s.endTime}`}
+                                title={`${s.client} • ${s.startTime}-${s.endTime}${s.status ? ` • ${st}` : ""}`}
                                 style={{
-                                  fontSize: 12,
-                                  fontWeight: 950,
-                                  padding: "4px 10px",
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  gap: 6,
+                                  maxWidth: "100%",
+                                  padding: "4px 8px",
                                   borderRadius: 999,
-                                  background: "rgba(245,158,11,0.10)",
-                                  border: "1px solid rgba(245,158,11,0.18)",
-                                  color: "#78350f",
-                                  whiteSpace: "nowrap",
-                                }}
-                                title="Loading drive time…"
-                              >
-                                Drive: <span style={{ opacity: 0.75 }}>…</span>
-                              </span>
-                            ) : cg.driveTimeMinutes != null ? (
-                              <span
-                                style={{
-                                  fontSize: 12,
-                                  fontWeight: 950,
-                                  padding: "4px 10px",
-                                  borderRadius: 999,
-                                  background: "rgba(245,158,11,0.12)",
-                                  border: "1px solid rgba(245,158,11,0.22)",
-                                  color: "#78350f",
-                                  whiteSpace: "nowrap",
-                                }}
-                                title={cg.driveTimeText || `Drive time: ${cg.driveTimeMinutes} min`}
-                              >
-                                Drive: {Math.round(cg.driveTimeMinutes)}m
-                              </span>
-                            ) : (
-                              <span
-                                style={{
-                                  fontSize: 12,
+                                  fontSize: 11,
                                   fontWeight: 900,
-                                  padding: "4px 10px",
-                                  borderRadius: 999,
-                                  background: "rgba(148,163,184,0.14)",
-                                  border: "1px solid rgba(148,163,184,0.25)",
-                                  color: "#0b1220",
-                                  whiteSpace: "nowrap",
+                                  lineHeight: 1.1,
+                                  background: clearMode ? "rgba(248,250,252,0.04)" : "rgba(248,250,252,0.95)",
+                                  border: "1px solid rgba(148,163,184,0.18)",
+                                  color: "#111827",
                                 }}
-                                title={
-                                  clientDestination
-                                    ? "Drive time unavailable (missing caregiver address or API returned no result)"
-                                    : "Drive time unavailable (missing client address)"
-                                }
                               >
-                                Drive: —
+                                <span
+                                  style={{
+                                    maxWidth: 180,
+                                    overflow: "hidden",
+                                    textOverflow: "ellipsis",
+                                    whiteSpace: "nowrap",
+                                  }}
+                                >
+                                  {s.client}
+                                </span>
+                                <span style={{ opacity: 0.75 }}>
+                                  {s.startTime}-{s.endTime}
+                                </span>
                               </span>
-                            )}
-                          </div>
-
-                          {/* Availability */}
-                          <div style={{ marginTop: 12 }}>
-                            <div style={{ fontSize: 11.5, fontWeight: 950, opacity: 0.75 }}>Availability (this day)</div>
-                            <div style={{ marginTop: 8, display: "grid", gap: 8 }}>
-                              <div>
-                                <AvailabilityCell value={cg.availRaw || "—"} />
-                              </div>
-
-                              {(norm(cg.availLabel) || norm(cg.availSource)) && (
-                                <AvailabilityPill label={cg.availLabel} source={cg.availSource} />
-                              )}
-                            </div>
-                          </div>
-
-                          {/* Day schedule */}
-                          <div style={{ marginTop: 12 }}>
-                            <div style={{ fontSize: 11.5, fontWeight: 950, opacity: 0.75 }}>Schedule for {dateStrForDow}</div>
-
-                            {cg.dayShifts.length ? (
-                              <div style={{ marginTop: 8, display: "grid", gap: 8 }}>
-                                {cg.dayShifts.map((s, idx) => {
-                                  const st = normalizeShiftStatusFromText(s.status);
-                                  return (
-                                    <div
-                                      key={`${s.shiftId || idx}-${s.client}-${s.startTime}-${s.endTime}`}
-                                      style={{
-                                        border: "1px solid rgba(15,23,42,0.12)",
-                                        borderRadius: 12,
-                                        padding: "8px 10px",
-                                        background: "rgba(248,250,252,0.95)",
-                                        display: "flex",
-                                        justifyContent: "space-between",
-                                        gap: 10,
-                                        alignItems: "center",
-                                      }}
-                                    >
-                                      <div style={{ minWidth: 0 }}>
-                                        <div
-                                          style={{
-                                            fontWeight: 950,
-                                            color: "#111827",
-                                            overflow: "hidden",
-                                            textOverflow: "ellipsis",
-                                            whiteSpace: "nowrap",
-                                          }}
-                                          title={s.client}
-                                        >
-                                          {s.client}
-                                        </div>
-                                        <div style={{ marginTop: 3, fontWeight: 850, opacity: 0.8, fontSize: 12 }}>
-                                          {s.startTime}-{s.endTime}{" "}
-                                          <span style={{ opacity: 0.8, fontWeight: 900 }}>
-                                            • {shiftDurationHours(s.startTime, s.endTime).toFixed(1)}h
-                                          </span>
-                                        </div>
-                                      </div>
-                                      {s.status ? (
-                                        <span
-                                          style={{
-                                            display: "inline-flex",
-                                            alignItems: "center",
-                                            borderRadius: 999,
-                                            padding: "4px 10px",
-                                            fontSize: 12,
-                                            fontWeight: 950,
-                                            lineHeight: 1.1,
-                                            whiteSpace: "nowrap",
-                                            background: "rgba(17,24,39,0.06)",
-                                            border: "1px solid rgba(17,24,39,0.12)",
-                                            color: "#111827",
-                                          }}
-                                          title={st}
-                                        >
-                                          {st}
-                                        </span>
-                                      ) : null}
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            ) : (
-                              <div style={{ marginTop: 8, fontWeight: 900, opacity: 0.75, color: "#111827" }}>(No shifts)</div>
-                            )}
-                          </div>
+                            );
+                          })}
                         </div>
-                      );
-                    })}
-
-                    {!caregivers.length ? (
-                      <div style={{ padding: 10, fontWeight: 900, opacity: 0.75, color: "#111827" }}>
-                        No caregivers match that search.
-                      </div>
-                    ) : null}
+                      ) : (
+                        <div style={{ fontSize: 12, fontWeight: 850, color: "#64748b" }}>
+                          No shifts
+                        </div>
+                      )}
+                    </div>
                   </div>
-                )}
-              </div>
+                );
+              })}
+
+              {!caregivers.length ? (
+                <div style={{ padding: 10, fontWeight: 900, opacity: 0.75, color: "#111827" }}>
+                  No caregivers match that search.
+                </div>
+              ) : null}
             </div>
-          </Section>
+          )}
         </div>
-      </FloatingPanel>
+      </div>
+    </div>
+  </div>
+</FloatingPanel>
     </>
   );
 }

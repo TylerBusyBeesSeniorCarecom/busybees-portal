@@ -1,20 +1,73 @@
 "use client";
 
-import { useState } from "react";
+import { FormEvent, useState } from "react";
 import { signIn } from "next-auth/react";
 
 export default function Home() {
-  const [isSigningIn, setIsSigningIn] = useState(false);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+
+  const [isGoogleSigningIn, setIsGoogleSigningIn] = useState(false);
+  const [isCredentialsSigningIn, setIsCredentialsSigningIn] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
 
   async function handleGoogleSignIn() {
     try {
-      setIsSigningIn(true);
+      setErrorMessage("");
+      setIsGoogleSigningIn(true);
       await signIn("google", { callbackUrl: "/schedule" });
     } catch (error) {
       console.error("Google sign-in failed:", error);
-      setIsSigningIn(false);
+      setErrorMessage("Google sign-in failed. Please try again.");
+      setIsGoogleSigningIn(false);
     }
   }
+
+  async function handleCredentialsSignIn(
+    e: FormEvent<HTMLFormElement>
+  ) {
+    e.preventDefault();
+
+    try {
+      setErrorMessage("");
+
+      const cleanUsername = username.trim();
+
+      if (!cleanUsername || !password) {
+        setErrorMessage("Please enter your username and password.");
+        return;
+      }
+
+      setIsCredentialsSigningIn(true);
+
+      const result = await signIn("credentials", {
+        username: cleanUsername,
+        password,
+        redirect: false,
+        callbackUrl: "/schedule",
+      });
+
+      if (!result) {
+        setErrorMessage("Sign-in failed. Please try again.");
+        setIsCredentialsSigningIn(false);
+        return;
+      }
+
+      if (result.error) {
+        setErrorMessage("Invalid username, password, or access level.");
+        setIsCredentialsSigningIn(false);
+        return;
+      }
+
+      window.location.href = result.url || "/schedule";
+    } catch (error) {
+      console.error("Credentials sign-in failed:", error);
+      setErrorMessage("Sign-in failed. Please try again.");
+      setIsCredentialsSigningIn(false);
+    }
+  }
+
+  const isBusy = isGoogleSigningIn || isCredentialsSigningIn;
 
   return (
     <main
@@ -160,7 +213,7 @@ export default function Home() {
               {[
                 "View and manage weekly schedules",
                 "Access caregiver and client workflow tools",
-                "Use your Busy Bees Google Workspace account",
+                "Sign in with Google or your portal credentials",
               ].map((item) => (
                 <div
                   key={item}
@@ -220,7 +273,7 @@ export default function Home() {
                 Access
               </div>
               <div style={{ color: "white", fontWeight: 700, fontSize: 14 }}>
-                Internal Google Workspace only
+                Admin portal access
               </div>
             </div>
 
@@ -309,11 +362,8 @@ export default function Home() {
               lineHeight: 1.7,
             }}
           >
-            Use your{" "}
-            <span style={{ fontWeight: 800, color: "#111827" }}>
-              @busybeesseniorcare.com
-            </span>{" "}
-            Google account to access the Busy Bees Scheduler Portal.
+            Sign in with your Busy Bees admin email and password, or continue
+            with Google if your account is enabled for it.
           </p>
 
           <div
@@ -328,31 +378,166 @@ export default function Home() {
               marginBottom: 22,
             }}
           >
-            This portal is restricted to authorized Busy Bees team members using
-            company-managed Google Workspace accounts.
+            This portal is restricted to authorized admin users.
+          </div>
+
+          <form
+            onSubmit={handleCredentialsSignIn}
+            style={{
+              display: "grid",
+              gap: 14,
+            }}
+          >
+            <div style={{ display: "grid", gap: 8 }}>
+              <label
+                htmlFor="username"
+                style={{
+                  fontSize: 13,
+                  fontWeight: 700,
+                  color: "#374151",
+                }}
+              >
+                Username
+              </label>
+              <input
+                id="username"
+                type="text"
+                autoComplete="username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="Email address"
+                disabled={isBusy}
+                style={{
+                  width: "100%",
+                  padding: "15px 16px",
+                  borderRadius: 14,
+                  border: "1px solid #d1d5db",
+                  background: "#ffffff",
+                  color: "#111827",
+                  fontSize: 15,
+                  outline: "none",
+                }}
+              />
+            </div>
+
+            <div style={{ display: "grid", gap: 8 }}>
+              <label
+                htmlFor="password"
+                style={{
+                  fontSize: 13,
+                  fontWeight: 700,
+                  color: "#374151",
+                }}
+              >
+                Password
+              </label>
+              <input
+                id="password"
+                type="password"
+                autoComplete="current-password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="Password"
+                disabled={isBusy}
+                style={{
+                  width: "100%",
+                  padding: "15px 16px",
+                  borderRadius: 14,
+                  border: "1px solid #d1d5db",
+                  background: "#ffffff",
+                  color: "#111827",
+                  fontSize: 15,
+                  outline: "none",
+                }}
+              />
+            </div>
+
+            {errorMessage ? (
+              <div
+                style={{
+                  background: "#fef2f2",
+                  border: "1px solid #fecaca",
+                  color: "#b91c1c",
+                  borderRadius: 14,
+                  padding: "12px 14px",
+                  fontSize: 13,
+                  lineHeight: 1.5,
+                }}
+              >
+                {errorMessage}
+              </div>
+            ) : null}
+
+            <button
+              type="submit"
+              disabled={isBusy}
+              style={{
+                width: "100%",
+                padding: "15px 16px",
+                borderRadius: 14,
+                border: "none",
+                background: isBusy
+                  ? "#e5e7eb"
+                  : "linear-gradient(180deg, #facc15 0%, #f59e0b 100%)",
+                color: "#111827",
+                fontSize: 16,
+                fontWeight: 800,
+                cursor: isBusy ? "not-allowed" : "pointer",
+                boxShadow: isBusy
+                  ? "none"
+                  : "0 14px 28px rgba(245,158,11,0.22)",
+                transition: "all 0.18s ease",
+              }}
+            >
+              {isCredentialsSigningIn ? "Signing you in..." : "Sign in with username and password"}
+            </button>
+          </form>
+
+          <div
+            style={{
+              marginTop: 22,
+              marginBottom: 22,
+              display: "flex",
+              alignItems: "center",
+              gap: 12,
+            }}
+          >
+            <div style={{ flex: 1, height: 1, background: "#e5e7eb" }} />
+            <div
+              style={{
+                fontSize: 12,
+                fontWeight: 700,
+                color: "#9ca3af",
+                letterSpacing: 0.4,
+                textTransform: "uppercase",
+              }}
+            >
+              Or
+            </div>
+            <div style={{ flex: 1, height: 1, background: "#e5e7eb" }} />
           </div>
 
           <button
             type="button"
             onClick={handleGoogleSignIn}
-            disabled={isSigningIn}
+            disabled={isBusy}
             style={{
               width: "100%",
               padding: "15px 16px",
               borderRadius: 14,
               border: "1px solid #d1d5db",
-              background: isSigningIn
+              background: isBusy
                 ? "#e5e7eb"
                 : "linear-gradient(180deg, #ffffff 0%, #f9fafb 100%)",
               color: "#111827",
               fontSize: 16,
               fontWeight: 700,
-              cursor: isSigningIn ? "not-allowed" : "pointer",
+              cursor: isBusy ? "not-allowed" : "pointer",
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
               gap: 12,
-              boxShadow: isSigningIn ? "none" : "0 10px 24px rgba(15,23,42,0.08)",
+              boxShadow: isBusy ? "none" : "0 10px 24px rgba(15,23,42,0.08)",
               transition: "all 0.18s ease",
             }}
           >
@@ -373,7 +558,7 @@ export default function Home() {
             >
               G
             </span>
-            {isSigningIn ? "Signing you in..." : "Continue with Google"}
+            {isGoogleSigningIn ? "Signing you in..." : "Continue with Google"}
           </button>
 
           <div
