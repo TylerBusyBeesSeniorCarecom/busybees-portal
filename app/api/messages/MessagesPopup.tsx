@@ -37,6 +37,14 @@ type ThreadResponse = {
   messages: ThreadMessage[];
 };
 
+type IncomingAlert = {
+  id: string;
+  caregiverId: string;
+  caregiverName: string;
+  snippet: string;
+  addedUnread: number;
+};
+
 type WeekKind = "cw" | "nw";
 
 type ClientItem = {
@@ -55,7 +63,9 @@ const UI = {
   text: "#111827",
   textDim: "#6b7280",
   bg: "rgba(255,255,255,0.98)",
-  shadow: "0 20px 60px rgba(0,0,0,.18)",
+  bgSoft: "linear-gradient(180deg, rgba(255,255,255,0.99) 0%, rgba(248,250,252,0.98) 100%)",
+  panel: "#f8fafc",
+  shadow: "0 24px 70px rgba(15,23,42,0.18)",
   blue: "#2563eb",
   red: "#ef4444",
   green: "#10b981",
@@ -63,6 +73,8 @@ const UI = {
   grayBubble: "#e5e7eb",
   orange: "#f97316",
   yellow: "#f59e0b",
+  bubbleMine: "#1d4ed8",
+  bubbleTheirs: "#ffffff",
 };
 
 const AVAIL_API_PATH = "/api/availability"; // adjust if needed
@@ -168,6 +180,10 @@ function isUnreadMsg(m: ThreadMessage, viewerId: string) {
 
 type WinState = { x: number; y: number; w: number; h: number };
 const DEFAULT_WIN: WinState = { x: 24, y: 90, w: 520, h: 720 };
+const WIN_STORAGE_KEY = "messages_window_v1";
+const DOCKED_STORAGE_KEY = "messages_window_docked_v1";
+const CLEAR_STORAGE_KEY = "messages_window_clear_v1";
+const THREAD_CACHE_LIMIT = 24;
 
 function receiptSummary(receipts: { id: string; name: string; time: string }[]) {
   const arr = Array.isArray(receipts) ? receipts : [];
@@ -238,6 +254,72 @@ function PersonIcon({ color = UI.orange }: { color?: string }) {
   );
 }
 
+function InitialsAvatar({
+  name,
+  size = 40,
+  active = false,
+}: {
+  name: string;
+  size?: number;
+  active?: boolean;
+}) {
+  const initials = String(name || "?")
+    .trim()
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase() || "")
+    .join("") || "?";
+
+  return (
+    <div
+      aria-hidden="true"
+      style={{
+        width: size,
+        height: size,
+        borderRadius: "50%",
+        background: active
+          ? "linear-gradient(180deg, rgba(59,130,246,0.22) 0%, rgba(37,99,235,0.14) 100%)"
+          : "linear-gradient(180deg, rgba(226,232,240,0.95) 0%, rgba(241,245,249,0.98) 100%)",
+        border: `1px solid ${active ? "rgba(37,99,235,0.28)" : "rgba(148,163,184,0.18)"}`,
+        color: active ? UI.blue : UI.textDim,
+        display: "grid",
+        placeItems: "center",
+        fontSize: Math.max(12, Math.floor(size / 2.6)),
+        fontWeight: 900,
+        letterSpacing: 0.3,
+        flex: "0 0 auto",
+      }}
+    >
+      {initials}
+    </div>
+  );
+}
+
+function UnreadBadge({ count, size = 44 }: { count: number; size?: number }) {
+  const label = count > 99 ? "99+" : String(Math.max(0, count));
+  return (
+    <div
+      aria-hidden="true"
+      style={{
+        width: size,
+        height: size,
+        borderRadius: "50%",
+        background: "linear-gradient(180deg, #ef4444 0%, #dc2626 100%)",
+        color: "#fff",
+        display: "grid",
+        placeItems: "center",
+        fontSize: count > 99 ? 12 : 15,
+        fontWeight: 900,
+        letterSpacing: 0.2,
+        boxShadow: "0 12px 24px rgba(220,38,38,0.20)",
+        flex: "0 0 auto",
+      }}
+    >
+      {label}
+    </div>
+  );
+}
+
 /** ---------------- Component ---------------- */
 
 export default function MessagesPopup() {
@@ -263,12 +345,13 @@ export default function MessagesPopup() {
   const threadReqId = useRef(0);
   const listInFlight = useRef(false);
   const threadInFlight = useRef(false);
+  const threadCacheRef = useRef<Map<string, ThreadResponse>>(new Map());
+  const threadPrefetchingRef = useRef<Set<string>>(new Set());
 
   // composer
   const [category, setCategory] = useState<"General" | "Scheduling" | "Payroll">("General");
   const [text, setText] = useState("");
   const [sendStatus, setSendStatus] = useState<string>("");
-  const [composerExpanded, setComposerExpanded] = useState(false);
   const [insertingWeek, setInsertingWeek] = useState<WeekKind | null>(null);
 
   const POLL_MS = 5000;
@@ -276,6 +359,13 @@ export default function MessagesPopup() {
 
   // floating window state
   const [win, setWin] = useState<WinState>(DEFAULT_WIN);
+  const [docked, setDocked] = useState(false);
+  const [clearMode, setClearMode] = useState(false);
+  const [expandedReceipts, setExpandedReceipts] = useState<Record<string, boolean>>({});
+  const [incomingAlerts, setIncomingAlerts] = useState<IncomingAlert[]>([]);
+  const msgInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const unreadSnapshotRef = useRef<Record<string, number>>({});
+  const unreadSnapshotReadyRef = useRef(false);
 
   const dragRef = useRef({
     active: false,
@@ -322,8 +412,11 @@ export default function MessagesPopup() {
     const vw = window.innerWidth;
     const vh = window.innerHeight;
 
-    const w = Math.max(360, Math.min(next.w, vw - pad * 2));
-    const h = Math.max(420, Math.min(next.h, vh - pad * 2));
+    const minW = Math.min(360, Math.max(320, vw - pad * 2));
+    const minH = Math.min(420, Math.max(400, vh - pad * 2));
+
+    const w = Math.max(minW, Math.min(next.w, vw - pad * 2));
+    const h = Math.max(minH, Math.min(next.h, vh - pad * 2));
 
     const x = Math.max(pad, Math.min(next.x, vw - w - pad));
     const y = Math.max(pad, Math.min(next.y, vh - h - pad));
@@ -331,15 +424,167 @@ export default function MessagesPopup() {
     return { x, y, w, h };
   }
 
+  function goToInbox() {
+    threadReqId.current += 1;
+    threadInFlight.current = false;
+    setActiveCaregiverId("");
+    setActiveCaregiverName("");
+    setThread([]);
+    setThreadReady(false);
+    setLoadingThread(false);
+  }
+
+  function syncComposerHeight() {
+    const el = msgInputRef.current;
+    if (!el) return;
+    el.style.height = "0px";
+    const next = Math.min(Math.max(el.scrollHeight, 48), 180);
+    el.style.height = `${next}px`;
+  }
+
+  function reorderConversations(next: Conversation[], caregiverId: string) {
+    const cid = String(caregiverId || "").trim();
+    if (!cid) return next;
+    const idx = next.findIndex((c) => String(c.caregiverId || "") === cid);
+    if (idx <= 0) return next;
+    const copy = next.slice();
+    const [hit] = copy.splice(idx, 1);
+    copy.unshift(hit);
+    return copy;
+  }
+
+  function dismissIncomingAlert(id: string) {
+    setIncomingAlerts((prev) => prev.filter((item) => item.id !== id));
+  }
+
+  function queueIncomingAlert(conv: Conversation, addedUnread: number) {
+    const cid = String(conv.caregiverId || "").trim();
+    if (!cid || addedUnread <= 0) return;
+    const id = `${cid}-${Date.now()}`;
+    const caregiverName = String(conv.caregiverName || cid);
+    const snippet = String(conv.lastSnippet || "").trim() || "New message";
+
+    setIncomingAlerts((prev) => {
+      const next = prev.filter((item) => item.caregiverId !== cid);
+      next.unshift({
+        id,
+        caregiverId: cid,
+        caregiverName,
+        snippet,
+        addedUnread,
+      });
+      return next.slice(0, 4);
+    });
+
+    window.setTimeout(() => {
+      setIncomingAlerts((prev) => prev.filter((item) => item.id !== id));
+    }, 7000);
+  }
+
+  function syncUnreadSnapshot(next: Conversation[], opts?: { notify?: boolean }) {
+    const map: Record<string, number> = {};
+    const notify = opts?.notify !== false;
+
+    for (const conv of next) {
+      const cid = String(conv.caregiverId || "").trim();
+      if (!cid) continue;
+
+      const unread = Math.max(0, Number(conv.unreadCount || 0));
+      map[cid] = unread;
+
+      if (!notify || !unreadSnapshotReadyRef.current) continue;
+
+      const prevUnread = Math.max(0, Number(unreadSnapshotRef.current[cid] || 0));
+      const addedUnread = unread - prevUnread;
+      const isActiveThread = open && String(activeCaregiverId || "") === cid;
+      if (addedUnread > 0 && !isActiveThread) {
+        queueIncomingAlert(conv, addedUnread);
+      }
+    }
+
+    unreadSnapshotRef.current = map;
+    unreadSnapshotReadyRef.current = true;
+  }
+
+  function storeThreadCache(caregiverId: string, value: ThreadResponse) {
+    const key = String(caregiverId || "").trim();
+    if (!key) return;
+    const next = new Map(threadCacheRef.current);
+    next.delete(key);
+    next.set(key, value);
+    while (next.size > THREAD_CACHE_LIMIT) {
+      const oldest = next.keys().next().value;
+      if (!oldest) break;
+      next.delete(oldest);
+    }
+    threadCacheRef.current = next;
+  }
+
+  function primeThreadFromCache(caregiverId: string) {
+    const cached = threadCacheRef.current.get(String(caregiverId || "").trim());
+    if (!cached) return false;
+    setThread(cached.messages || []);
+    setActiveCaregiverId(cached.caregiverId || caregiverId);
+    setActiveCaregiverName(cached.caregiverName || caregiverId);
+    setThreadReady(true);
+    setLoadingThread(false);
+    return true;
+  }
+
+  async function prefetchThread(caregiverId: string) {
+    const cid = String(caregiverId || "").trim();
+    if (!cid) return;
+    if (threadCacheRef.current.has(cid)) return;
+    if (threadPrefetchingRef.current.has(cid)) return;
+
+    threadPrefetchingRef.current.add(cid);
+    try {
+      const res: ThreadResponse = await apiGet({ action: "getThread", caregiverId: cid });
+      if (!res) return;
+      storeThreadCache(cid, {
+        caregiverId: res.caregiverId || cid,
+        caregiverName: res.caregiverName || cid,
+        messages: Array.isArray(res.messages) ? res.messages : [],
+      });
+    } catch {
+      // ignore
+    } finally {
+      threadPrefetchingRef.current.delete(cid);
+    }
+  }
+
+  function openConversation(caregiverId: string, caregiverName?: string) {
+    const cid = String(caregiverId || "").trim();
+    if (!cid) return;
+    setConvs((prev) => reorderConversations(prev, cid));
+    setActiveCaregiverId(cid);
+    setActiveCaregiverName(String(caregiverName || cid));
+    setExpandedReceipts({});
+    markThreadReadNow(cid);
+
+    const hadCached = primeThreadFromCache(cid);
+    if (!hadCached) {
+      setThread([]);
+      setThreadReady(false);
+      setLoadingThread(true);
+      loadThread(cid, { markRead: false });
+      return;
+    }
+
+    loadThread(cid, { silent: true, markRead: false });
+  }
+
   // load saved window state once
   useEffect(() => {
     try {
-      const raw = localStorage.getItem("messages_window_v1");
+      const raw = localStorage.getItem(WIN_STORAGE_KEY);
       if (raw) {
         const parsed = JSON.parse(raw);
         const merged = { ...DEFAULT_WIN, ...parsed } as WinState;
         setWin(clampToViewport(merged));
       }
+      setDocked(localStorage.getItem(DOCKED_STORAGE_KEY) === "1");
+      setClearMode(localStorage.getItem(CLEAR_STORAGE_KEY) === "1");
     } catch {}
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -347,9 +592,11 @@ export default function MessagesPopup() {
   // persist window
   useEffect(() => {
     try {
-      localStorage.setItem("messages_window_v1", JSON.stringify(win));
+      localStorage.setItem(WIN_STORAGE_KEY, JSON.stringify(win));
+      localStorage.setItem(DOCKED_STORAGE_KEY, docked ? "1" : "0");
+      localStorage.setItem(CLEAR_STORAGE_KEY, clearMode ? "1" : "0");
     } catch {}
-  }, [win]);
+  }, [clearMode, docked, win]);
 
   // keep on-screen when viewport resizes
   useEffect(() => {
@@ -372,6 +619,7 @@ export default function MessagesPopup() {
   }, []);
 
   function onDragStart(e: React.MouseEvent) {
+    if (docked) return;
     const target = e.target as HTMLElement;
     if (target.closest("button, select, input, textarea, a")) return;
 
@@ -383,6 +631,7 @@ export default function MessagesPopup() {
   }
 
   function onResizeStart(e: React.MouseEvent) {
+    if (docked) return;
     resizeRef.current.active = true;
     resizeRef.current.startX = e.clientX;
     resizeRef.current.startY = e.clientY;
@@ -506,6 +755,7 @@ export default function MessagesPopup() {
 
       const next = (res?.conversations || []) as Conversation[];
       setConvs(next);
+      syncUnreadSnapshot(next, { notify: !!opts?.silent });
       setListReady(true);
     } finally {
       listInFlight.current = false;
@@ -515,32 +765,58 @@ export default function MessagesPopup() {
 
   async function loadThread(caregiverId: string, opts?: { silent?: boolean; markRead?: boolean }) {
     if (!caregiverId) return;
-    if (threadInFlight.current) return;
 
     const silent = !!opts?.silent;
-    const markRead = opts?.markRead !== false;
 
     threadInFlight.current = true;
     const req = ++threadReqId.current;
 
-    if (!silent && !threadReady) setLoadingThread(true);
+    if (!silent) setLoadingThread(true);
 
     try {
       const res: ThreadResponse = await apiGet({ action: "getThread", caregiverId });
       if (req !== threadReqId.current) return;
 
-      setThread(res?.messages || []);
-      setActiveCaregiverId(res?.caregiverId || caregiverId);
-      setActiveCaregiverName(res?.caregiverName || caregiverId);
-      setThreadReady(true);
+      const normalized: ThreadResponse = {
+        caregiverId: res?.caregiverId || caregiverId,
+        caregiverName: res?.caregiverName || caregiverId,
+        messages: Array.isArray(res?.messages) ? res.messages : [],
+      };
 
-      if (markRead && viewerId) {
-        apiPost({ action: "markThreadRead", viewerId, caregiverId }).catch(() => {});
-      }
+      storeThreadCache(caregiverId, normalized);
+
+      setThread(normalized.messages);
+      setActiveCaregiverId((prev) => prev || normalized.caregiverId || caregiverId);
+      setActiveCaregiverName((prev) => prev || normalized.caregiverName || caregiverId);
+      setThreadReady(true);
     } finally {
-      threadInFlight.current = false;
-      if (!silent && !threadReady) setLoadingThread(false);
+      if (req === threadReqId.current) {
+        threadInFlight.current = false;
+        setLoadingThread(false);
+      }
     }
+  }
+
+  function markThreadReadNow(caregiverId: string) {
+    const cid = String(caregiverId || "").trim();
+    if (!cid || !viewerId) return;
+
+    setConvs((prev) =>
+      reorderConversations(
+        prev.map((c) =>
+          String(c.caregiverId || "") === cid
+            ? {
+                ...c,
+                unreadCount: 0,
+              }
+            : c
+        ),
+        cid
+      )
+    );
+
+    apiPost({ action: "markThreadRead", viewerId, caregiverId: cid }).catch(() => {});
+    loadConversations(viewerId, { silent: true });
   }
 
   /** ---------------- Enrichment ---------------- */
@@ -701,12 +977,14 @@ export default function MessagesPopup() {
       localStorage.setItem("messages_viewer_id", viewerId);
     } catch {}
 
+    threadCacheRef.current = new Map();
+    threadPrefetchingRef.current = new Set();
+    unreadSnapshotRef.current = {};
+    unreadSnapshotReadyRef.current = false;
+    setIncomingAlerts([]);
     setListReady(false);
     setThreadReady(false);
-
-    setActiveCaregiverId("");
-    setActiveCaregiverName("");
-    setThread([]);
+    goToInbox();
     loadConversations(viewerId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewerId]);
@@ -714,12 +992,11 @@ export default function MessagesPopup() {
   // polling (light)
   useEffect(() => {
     if (!viewerId) return;
-    if (!open) return;
 
     const t = setInterval(() => {
       if (document.hidden) return;
       loadConversations(viewerId, { silent: true });
-      if (activeCaregiverId) loadThread(activeCaregiverId, { silent: true, markRead: false });
+      if (open && activeCaregiverId) loadThread(activeCaregiverId, { silent: true, markRead: false });
     }, POLL_MS);
 
     return () => clearInterval(t);
@@ -758,8 +1035,7 @@ export default function MessagesPopup() {
 
     // open + load thread
     openPanel();
-    setThreadReady(false);
-    loadThread(cid);
+    openConversation(cid, req.caregiverName);
 
     // focus composer after open + thread load starts
     if (req.focusComposer !== false) {
@@ -787,6 +1063,26 @@ export default function MessagesPopup() {
       (c) => (c.caregiverName || "").toLowerCase().includes(q) || (c.caregiverId || "").toLowerCase().includes(q)
     );
   }, [convs, query]);
+
+  const totalUnread = useMemo(
+    () => convs.reduce((sum, conv) => sum + Math.max(0, Number(conv.unreadCount || 0)), 0),
+    [convs]
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    const hottest = filteredConvs.slice(0, 4);
+    if (!hottest.length) return;
+
+    const t = window.setTimeout(() => {
+      hottest.forEach((c, idx) => {
+        window.setTimeout(() => prefetchThread(c.caregiverId), idx * 180);
+      });
+    }, 250);
+
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, filteredConvs]);
 
   /** ---------------- Actions ---------------- */
 
@@ -990,6 +1286,10 @@ export default function MessagesPopup() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, activeCaregiverId, thread.length]);
 
+  useEffect(() => {
+    syncComposerHeight();
+  }, [text]);
+
   /** ---------------- Client picker ---------------- */
 
   const filteredClients = useMemo(() => {
@@ -1104,8 +1404,145 @@ export default function MessagesPopup() {
 
   /** ---------------- Render ---------------- */
 
+  const viewportWidth = typeof window === "undefined" ? 1440 : window.innerWidth;
+  const viewportHeight = typeof window === "undefined" ? 900 : window.innerHeight;
+  const panelWidth = docked ? Math.min(430, Math.max(320, viewportWidth - 24)) : win.w;
+  const panelHeight = docked
+    ? Math.min(activeCaregiverId ? 720 : 640, Math.max(420, viewportHeight - 24))
+    : win.h;
+
+  const shellStyle: React.CSSProperties = docked
+    ? {
+        position: "fixed",
+        right: 12,
+        bottom: 12,
+        width: panelWidth,
+        height: panelHeight,
+      }
+    : {
+        position: "fixed",
+        left: win.x,
+        top: win.y,
+        width: win.w,
+        height: win.h,
+      };
+
+  const shellBackground = clearMode ? "rgba(255,255,255,0.58)" : UI.bgSoft;
+  const chromeBackground = clearMode ? "rgba(255,255,255,0.46)" : "rgba(255,255,255,0.78)";
+  const subChromeBackground = clearMode ? "rgba(248,250,252,0.36)" : "rgba(248,250,252,0.7)";
+  const bodyBackground = clearMode
+    ? "linear-gradient(180deg, rgba(248,250,252,0.34) 0%, rgba(255,255,255,0.30) 100%)"
+    : "linear-gradient(180deg, rgba(248,250,252,0.85) 0%, rgba(255,255,255,0.92) 100%)";
+  const inboxBackground = clearMode ? "rgba(248,250,252,0.24)" : "rgba(248,250,252,0.48)";
+  const composerBackground = clearMode ? "rgba(255,255,255,0.42)" : "rgba(255,255,255,0.88)";
+
   return (
     <>
+      {incomingAlerts.length ? (
+        <div
+          style={{
+            position: "fixed",
+            right: 16,
+            bottom: 76,
+            zIndex: 10000,
+            display: "grid",
+            gap: 8,
+            width: "min(360px, calc(100vw - 32px))",
+            pointerEvents: "none",
+          }}
+        >
+          {incomingAlerts.map((alert) => (
+            <div
+              key={alert.id}
+              style={{
+                pointerEvents: "auto",
+                border: `1px solid rgba(239,68,68,0.16)`,
+                background: "rgba(255,255,255,0.97)",
+                borderRadius: 18,
+                boxShadow: "0 18px 40px rgba(15,23,42,0.16)",
+                padding: "10px 12px",
+                display: "grid",
+                gap: 8,
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 11, fontWeight: 900, color: UI.red }}>New message</div>
+                  <div
+                    style={{
+                      fontSize: 13,
+                      fontWeight: 900,
+                      color: UI.text,
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                  >
+                    {alert.caregiverName}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => dismissIncomingAlert(alert.id)}
+                  style={{
+                    border: "none",
+                    background: "transparent",
+                    color: UI.textDim,
+                    cursor: "pointer",
+                    fontSize: 14,
+                    lineHeight: 1,
+                    padding: 0,
+                  }}
+                  title="Dismiss"
+                >
+                  ✕
+                </button>
+              </div>
+
+              <div
+                style={{
+                  fontSize: 12,
+                  color: UI.textDim,
+                  lineHeight: 1.45,
+                  display: "-webkit-box",
+                  WebkitLineClamp: 2,
+                  WebkitBoxOrient: "vertical",
+                  overflow: "hidden",
+                }}
+              >
+                {alert.snippet}
+              </div>
+
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+                <div style={{ fontSize: 11, fontWeight: 900, color: UI.red }}>
+                  {alert.addedUnread} new
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    openPanel();
+                    openConversation(alert.caregiverId, alert.caregiverName);
+                    dismissIncomingAlert(alert.id);
+                  }}
+                  style={{
+                    border: `1px solid ${UI.border}`,
+                    background: "#fff",
+                    borderRadius: 999,
+                    padding: "5px 10px",
+                    cursor: "pointer",
+                    fontWeight: 900,
+                    color: UI.text,
+                    fontSize: 11,
+                  }}
+                >
+                  Open
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
       {/* Floating Messages button */}
       <button
         onClick={toggle}
@@ -1115,9 +1552,9 @@ export default function MessagesPopup() {
           bottom: 16,
           zIndex: 9999,
           border: `1px solid ${UI.border}`,
-          background: UI.bg,
+          background: UI.bgSoft,
           borderRadius: 999,
-          padding: "10px 12px",
+          padding: "11px 14px",
           boxShadow: UI.shadow,
           cursor: "pointer",
           color: UI.text,
@@ -1129,20 +1566,35 @@ export default function MessagesPopup() {
         title="Messages"
       >
         💬 Messages
+        {totalUnread > 0 ? (
+          <span
+            style={{
+              minWidth: 20,
+              height: 20,
+              borderRadius: 999,
+              background: UI.red,
+              color: "#fff",
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: 11,
+              fontWeight: 900,
+              padding: "0 6px",
+            }}
+          >
+            {totalUnread}
+          </span>
+        ) : null}
       </button>
 
       {/* Draggable + resizable floating window */}
       <div
         style={{
-          position: "fixed",
-          left: win.x,
-          top: win.y,
-          width: win.w,
-          height: win.h,
+          ...shellStyle,
           zIndex: 9998,
-          background: UI.bg,
+          background: shellBackground,
           border: `1px solid ${UI.border}`,
-          borderRadius: 14,
+          borderRadius: docked ? 22 : 24,
           boxShadow: UI.shadow,
           overflow: "hidden",
           display: "flex",
@@ -1157,38 +1609,88 @@ export default function MessagesPopup() {
         <div
           onMouseDown={onDragStart}
           style={{
-            padding: "10px 12px",
+            padding: "10px 12px 8px",
             borderBottom: `1px solid ${UI.border}`,
             display: "flex",
             alignItems: "center",
-            justifyContent: "space-between",
             gap: 10,
             userSelect: "none",
-            background: "rgba(248,250,252,0.95)",
-            cursor: "move",
+            background: chromeBackground,
+            backdropFilter: "blur(12px)",
+            cursor: docked ? "default" : "move",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-            <div style={{ fontWeight: 900, color: UI.text, whiteSpace: "nowrap" }}>Messages</div>
-            <div style={{ fontSize: 12, color: UI.textDim, whiteSpace: "nowrap" }}>
-              {activeCaregiverId ? "Thread" : "Inbox"}
+          <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0, flex: 1 }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontWeight: 900, color: UI.text, whiteSpace: "nowrap", lineHeight: 1.1 }}>Messages</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4, minWidth: 0 }}>
+                <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800, whiteSpace: "nowrap" }}>Viewing as</div>
+                <select
+                  value={viewerId}
+                  onChange={(e) => setViewerId(e.target.value)}
+                  style={{
+                    flex: "0 1 170px",
+                    maxWidth: docked ? 132 : 170,
+                    width: docked ? 132 : undefined,
+                    border: `1px solid ${UI.border}`,
+                    borderRadius: 999,
+                    padding: "4px 24px 4px 8px",
+                    background: "#fff",
+                    color: UI.text,
+                    minHeight: 28,
+                    fontSize: 11,
+                    fontWeight: 700,
+                  }}
+                >
+                  {admins.length ? (
+                    admins.map((a) => (
+                      <option key={a.id} value={a.id}>
+                        {a.name}
+                      </option>
+                    ))
+                  ) : (
+                    <option value="">(no admins loaded)</option>
+                  )}
+                </select>
+              </div>
             </div>
           </div>
 
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <div style={{ display: "flex", gap: 6, alignItems: "center", flex: "0 0 auto" }}>
             <button
-              onClick={() => setWin(clampToViewport(DEFAULT_WIN))}
+              onClick={() => setClearMode((prev) => !prev)}
               style={{
                 border: `1px solid ${UI.border}`,
                 background: "#fff",
-                borderRadius: 10,
-                padding: "6px 10px",
+                borderRadius: 999,
+                padding: "5px 8px",
                 cursor: "pointer",
                 fontWeight: 900,
+                color: clearMode ? UI.blue : UI.text,
+                fontSize: 11,
+                minHeight: 28,
               }}
-              title="Reset window"
+              title={clearMode ? "Disable clear mode" : "Enable clear mode"}
             >
-              ⤾
+              Clear
+            </button>
+
+            <button
+              onClick={() => setDocked((prev) => !prev)}
+              style={{
+                border: `1px solid ${UI.border}`,
+                background: "#fff",
+                borderRadius: 999,
+                padding: "5px 8px",
+                cursor: "pointer",
+                fontWeight: 900,
+                color: docked ? UI.blue : UI.text,
+                fontSize: 11,
+                minHeight: 28,
+              }}
+              title={docked ? "Undock window" : "Pin to corner"}
+            >
+              {docked ? "Pinned" : "Pin"}
             </button>
 
             <button
@@ -1201,9 +1703,12 @@ export default function MessagesPopup() {
               style={{
                 border: `1px solid ${UI.border}`,
                 background: "#fff",
-                borderRadius: 10,
-                padding: "6px 10px",
+                borderRadius: 999,
+                padding: "5px 8px",
                 cursor: "pointer",
+                color: UI.text,
+                fontSize: 11,
+                minHeight: 28,
               }}
               title="Refresh"
             >
@@ -1215,10 +1720,13 @@ export default function MessagesPopup() {
               style={{
                 border: `1px solid ${UI.border}`,
                 background: "#fff",
-                borderRadius: 10,
-                padding: "6px 10px",
+                borderRadius: 999,
+                padding: "5px 8px",
                 cursor: "pointer",
                 fontWeight: 900,
+                color: UI.text,
+                fontSize: 11,
+                minHeight: 28,
               }}
               title="Close"
             >
@@ -1228,57 +1736,9 @@ export default function MessagesPopup() {
         </div>
 
         {/* Controls */}
-        <div style={{ padding: 10, borderBottom: `1px solid ${UI.borderSoft}` }}>
-          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-            <div style={{ fontSize: 12, color: UI.textDim }}>Viewing as</div>
-            <select
-              value={viewerId}
-              onChange={(e) => setViewerId(e.target.value)}
-              style={{
-                flex: "1 1 220px",
-                border: `1px solid ${UI.border}`,
-                borderRadius: 10,
-                padding: "6px 8px",
-                background: "#fff",
-              }}
-            >
-              {admins.length ? (
-                admins.map((a) => (
-                  <option key={a.id} value={a.id}>
-                    {a.name}
-                  </option>
-                ))
-              ) : (
-                <option value="">(no admins loaded)</option>
-              )}
-            </select>
-
-            {activeCaregiverId ? (
-              <button
-                onClick={() => {
-                  setActiveCaregiverId("");
-                  setActiveCaregiverName("");
-                  setThread([]);
-                  setThreadReady(false);
-                }}
-                style={{
-                  marginLeft: "auto",
-                  border: `1px solid ${UI.border}`,
-                  background: "#fff",
-                  borderRadius: 10,
-                  padding: "6px 10px",
-                  cursor: "pointer",
-                  fontWeight: 800,
-                }}
-                title="Back to conversations"
-              >
-                ← Back
-              </button>
-            ) : null}
-          </div>
-
+        <div style={{ padding: activeCaregiverId ? "6px 12px" : "8px 12px", borderBottom: `1px solid ${UI.borderSoft}`, background: subChromeBackground }}>
           {!activeCaregiverId ? (
-            <div style={{ marginTop: 8 }}>
+            <div>
               <input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
@@ -1286,16 +1746,52 @@ export default function MessagesPopup() {
                 style={{
                   width: "100%",
                   border: `1px solid ${UI.border}`,
-                  borderRadius: 10,
-                  padding: "8px 10px",
+                  borderRadius: 999,
+                  padding: "9px 12px",
                   background: "#fff",
+                  color: UI.text,
                 }}
               />
             </div>
           ) : (
-            <div style={{ marginTop: 8, fontSize: 13, color: UI.text }}>
-              <div style={{ fontWeight: 900 }}>{activeCaregiverName}</div>
-              <div style={{ fontSize: 12, color: UI.textDim, marginTop: 2 }}>Tip: click your sent messages to edit.</div>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                minWidth: 0,
+              }}
+            >
+              <button
+                onClick={goToInbox}
+                style={{
+                  border: `1px solid ${UI.border}`,
+                  background: "#fff",
+                  borderRadius: 999,
+                  padding: "5px 10px",
+                  cursor: "pointer",
+                  fontWeight: 800,
+                  color: UI.text,
+                  flex: "0 0 auto",
+                }}
+                title="Back to conversations"
+              >
+                ← Back
+              </button>
+
+              <div
+                style={{
+                  fontSize: 19,
+                  lineHeight: 1.1,
+                  fontWeight: 900,
+                  color: UI.text,
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                }}
+              >
+                {activeCaregiverName || activeCaregiverId}
+              </div>
             </div>
           )}
         </div>
@@ -1304,7 +1800,7 @@ export default function MessagesPopup() {
         <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
           {/* Inbox */}
           {!activeCaregiverId ? (
-            <div style={{ flex: 1, overflow: "auto", padding: 10 }}>
+            <div style={{ flex: 1, overflow: "auto", padding: 10, background: inboxBackground }}>
               {loadingList && !listReady ? (
                 <div style={{ color: UI.textDim, fontSize: 13 }}>Loading…</div>
               ) : filteredConvs.length ? (
@@ -1312,6 +1808,7 @@ export default function MessagesPopup() {
                   {filteredConvs.map((c) => {
                     const unread = Number(c.unreadCount || 0);
                     const cid = String(c.caregiverId || "");
+                    const selected = cid === activeCaregiverId;
 
                     const cwAvail = availSubmitted.cw.has(cid);
                     const nwAvail = availSubmitted.nw.has(cid);
@@ -1324,70 +1821,124 @@ export default function MessagesPopup() {
                     return (
                       <button
                         key={c.caregiverId}
-                        onClick={() => {
-                          setThreadReady(false);
-                          loadThread(c.caregiverId);
-                        }}
+                        onClick={() => openConversation(c.caregiverId, c.caregiverName)}
                         style={{
                           textAlign: "left",
-                          border: `1px solid ${UI.border}`,
-                          background: "#fff",
-                          borderRadius: 12,
-                          padding: 10,
+                          border: `1px solid ${selected ? "rgba(37,99,235,0.24)" : "rgba(226,232,240,0.95)"}`,
+                          background: unread > 0 ? "linear-gradient(180deg, #ffffff 0%, #f8fbff 100%)" : "rgba(255,255,255,0.92)",
+                          borderRadius: 22,
+                          padding: "11px 12px",
                           cursor: "pointer",
+                          color: UI.text,
+                          boxShadow: unread > 0 ? "0 14px 28px rgba(37,99,235,0.10)" : "0 6px 16px rgba(15,23,42,0.04)",
                         }}
+                        onMouseEnter={() => prefetchThread(c.caregiverId)}
+                        onFocus={() => prefetchThread(c.caregiverId)}
                       >
-                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                          <div style={{ fontWeight: 900, color: UI.text, minWidth: 0 }}>
-                            {c.caregiverName || c.caregiverId}
-                          </div>
-                          <div style={{ fontSize: 12, color: UI.textDim, whiteSpace: "nowrap" }}>
-                            {fmtDateTime(c.lastTimestamp)}
-                          </div>
-                        </div>
-
-                        <div style={{ fontSize: 12, color: UI.textDim, marginTop: 6 }}>{c.lastSnippet || ""}</div>
-
-                        <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                        <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
                           {unread > 0 ? (
-                            <Chip label={`Unread: ${unread}`} color={UI.red} border={UI.red} bg={"rgba(239,68,68,0.06)"} />
+                            <UnreadBadge count={unread} size={44} />
                           ) : (
-                            <span style={{ fontSize: 11, color: UI.textDim }}>No unread</span>
+                            <InitialsAvatar name={c.caregiverName || c.caregiverId} size={44} active={false} />
                           )}
 
-                          <Chip
-                            label="CW Avail"
-                            color={cwAvail ? UI.green : UI.yellow}
-                            border={cwAvail ? UI.green : UI.yellow}
-                            bg={cwAvail ? "rgba(16,185,129,0.10)" : "rgba(245,158,11,0.12)"}
-                            title={cwAvail ? "CW Availability submitted" : "CW Availability missing"}
-                          />
+                          <div style={{ minWidth: 0, flex: 1 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+                              <div
+                                style={{
+                                  fontWeight: unread > 0 ? 900 : 800,
+                                  color: UI.text,
+                                  minWidth: 0,
+                                  fontSize: 15,
+                                  whiteSpace: "nowrap",
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                }}
+                              >
+                                {c.caregiverName || c.caregiverId}
+                              </div>
+                              <div style={{ fontSize: 11, color: unread > 0 ? UI.blue : UI.textDim, whiteSpace: "nowrap", fontWeight: unread > 0 ? 800 : 600 }}>
+                                {fmtDateTime(c.lastTimestamp)}
+                              </div>
+                            </div>
 
-                          <Chip
-                            label="NW Avail"
-                            color={nwAvail ? UI.green : UI.yellow}
-                            border={nwAvail ? UI.green : UI.yellow}
-                            bg={nwAvail ? "rgba(16,185,129,0.10)" : "rgba(245,158,11,0.12)"}
-                            title={nwAvail ? "NW Availability submitted" : "NW Availability missing"}
-                          />
+                            <div
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 8,
+                                marginTop: 4,
+                                minWidth: 0,
+                              }}
+                            >
+                              {unread > 0 ? (
+                                <span
+                                  style={{
+                                    width: 8,
+                                    height: 8,
+                                    borderRadius: "50%",
+                                    background: UI.blue,
+                                    flex: "0 0 auto",
+                                  }}
+                                />
+                              ) : null}
+                              <div
+                                style={{
+                                  fontSize: 13,
+                                  color: unread > 0 ? UI.text : UI.textDim,
+                                  lineHeight: 1.45,
+                                  display: "-webkit-box",
+                                  WebkitLineClamp: 2,
+                                  WebkitBoxOrient: "vertical",
+                                  overflow: "hidden",
+                                }}
+                              >
+                                {c.lastSnippet || "No recent message"}
+                              </div>
+                            </div>
 
-                          <Chip
-                            label={`Hours • CW ${cwHours || 0} / NW ${nwHours || 0}`}
-                            color={cwHours > 0 || nwHours > 0 ? UI.text : UI.textDim}
-                            border={UI.border}
-                            bg={cwHours > 0 || nwHours > 0 ? "rgba(15,23,42,0.04)" : "rgba(15,23,42,0.03)"}
-                            title="Scheduled hours (non-canceled, non-open)"
-                          />
+                            <div style={{ marginTop: 8, display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                              {unread > 0 ? (
+                                <Chip label={`${unread} new`} color={UI.blue} border={"rgba(37,99,235,0.22)"} bg={"rgba(37,99,235,0.08)"} />
+                              ) : null}
 
-                          {cert ? (
-                            <Chip
-                              label={`Cert • ${cert}`}
-                              color={UI.purple}
-                              border={UI.purple}
-                              bg={"rgba(139,92,246,0.10)"}
-                              title="Certification"
-                            />
-                          ) : null}
+                              <Chip
+                                label={`CW ${cwAvail ? "Avail" : "Missing"}`}
+                                color={cwAvail ? UI.green : UI.yellow}
+                                border={cwAvail ? "rgba(16,185,129,0.25)" : "rgba(245,158,11,0.22)"}
+                                bg={cwAvail ? "rgba(16,185,129,0.08)" : "rgba(245,158,11,0.10)"}
+                                title={cwAvail ? "CW Availability submitted" : "CW Availability missing"}
+                              />
+
+                              <Chip
+                                label={`NW ${nwAvail ? "Avail" : "Missing"}`}
+                                color={nwAvail ? UI.green : UI.yellow}
+                                border={nwAvail ? "rgba(16,185,129,0.25)" : "rgba(245,158,11,0.22)"}
+                                bg={nwAvail ? "rgba(16,185,129,0.08)" : "rgba(245,158,11,0.10)"}
+                                title={nwAvail ? "NW Availability submitted" : "NW Availability missing"}
+                              />
+
+                              {(cwHours > 0 || nwHours > 0) ? (
+                                <Chip
+                                  label={`${cwHours || 0}h / ${nwHours || 0}h`}
+                                  color={UI.text}
+                                  border={"rgba(148,163,184,0.24)"}
+                                  bg={"rgba(15,23,42,0.04)"}
+                                  title="Scheduled hours (CW / NW)"
+                                />
+                              ) : null}
+
+                              {cert ? (
+                                <Chip
+                                  label={cert}
+                                  color={UI.purple}
+                                  border={"rgba(139,92,246,0.25)"}
+                                  bg={"rgba(139,92,246,0.08)"}
+                                  title="Certification"
+                                />
+                              ) : null}
+                            </div>
+                          </div>
                         </div>
                       </button>
                     );
@@ -1400,37 +1951,44 @@ export default function MessagesPopup() {
           ) : (
             /* Thread */
             <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
-              <div ref={threadWrapRef} style={{ flex: 1, overflow: "auto", padding: 10 }}>
+              <div ref={threadWrapRef} style={{ flex: 1, overflow: "auto", padding: "10px 12px 8px", background: bodyBackground }}>
                 {loadingThread && !threadReady ? (
                   <div style={{ color: UI.textDim, fontSize: 13 }}>Loading…</div>
                 ) : thread.length ? (
-                  <div style={{ display: "grid", gap: 10 }}>
+                  <div style={{ display: "grid", gap: 8 }}>
                     {thread.map((m) => {
                       const isMine = String(m.sender?.id || "") === String(viewerId || "");
                       const cat = catKey(m.category);
                       const payroll = cat === "payroll";
                       const scheduling = cat === "scheduling";
 
-                      const fill = isMine ? UI.blue : payroll ? UI.green : scheduling ? UI.purple : UI.grayBubble;
+                      const fill = isMine
+                        ? UI.bubbleMine
+                        : payroll
+                        ? "rgba(16,185,129,0.16)"
+                        : scheduling
+                        ? "rgba(139,92,246,0.12)"
+                        : UI.bubbleTheirs;
 
                       const outline = isMine
                         ? payroll
                           ? UI.green
                           : scheduling
                           ? UI.purple
-                          : "rgba(37,99,235,0.35)"
+                        : "rgba(37,99,235,0.35)"
                         : payroll
-                        ? "rgba(16,185,129,0.8)"
+                        ? "rgba(16,185,129,0.35)"
                         : scheduling
-                        ? "rgba(139,92,246,0.8)"
-                        : "rgba(107,114,128,0.6)";
+                        ? "rgba(139,92,246,0.30)"
+                        : "rgba(148,163,184,0.45)";
 
-                      const textColor = isMine ? "#fff" : fill === UI.grayBubble ? UI.text : "#fff";
-                      const metaColor = isMine || fill !== UI.grayBubble ? "rgba(255,255,255,0.85)" : UI.textDim;
+                      const textColor = isMine ? "#fff" : UI.text;
+                      const metaColor = isMine ? "rgba(255,255,255,0.82)" : UI.textDim;
 
                       const unread = isUnreadMsg(m, viewerId);
                       const rr = Array.isArray(m.readReceipts) ? m.readReceipts : [];
                       const rrText = rr.length ? receiptSummary(rr) : "Not read yet";
+                      const receiptsOpen = !!expandedReceipts[m.messageId];
 
                       return (
                         <div
@@ -1443,18 +2001,20 @@ export default function MessagesPopup() {
                             justifyContent: isMine ? "flex-end" : "flex-start",
                           }}
                         >
-                          <div style={{ maxWidth: "70%", width: "fit-content", display: "grid", gap: 4 }}>
+                          <div style={{ maxWidth: "82%", width: "fit-content", display: "grid", gap: 4 }}>
                             <div
                               onClick={() => openEditForMessage(m)}
                               title={isMine ? "Click to edit" : undefined}
                               style={{
-                                border: `2px solid ${outline}`,
+                                border: `1px solid ${outline}`,
                                 background: fill,
-                                borderRadius: 16,
+                                borderRadius: isMine ? "20px 20px 6px 20px" : "20px 20px 20px 6px",
                                 padding: "10px 12px",
                                 overflowWrap: "anywhere",
                                 cursor: isMine ? "pointer" : "default",
-                                boxShadow: "0 6px 16px rgba(0,0,0,0.08)",
+                                boxShadow: isMine
+                                  ? "0 10px 24px rgba(29,78,216,0.20)"
+                                  : "0 8px 20px rgba(15,23,42,0.06)",
                               }}
                             >
                               <div style={{ fontSize: 12, fontWeight: 900, color: textColor }}>
@@ -1470,21 +2030,51 @@ export default function MessagesPopup() {
                               </div>
                             </div>
 
-                            {/* Read receipts BELOW bubble (grey) */}
-                            {isMine ? (
-                              <div style={{ fontSize: 11, color: UI.textDim, paddingLeft: 8 }}>
+                            {/* Read receipts BELOW bubble */}
+                            <div
+                              style={{
+                                fontSize: 11,
+                                color: UI.textDim,
+                                paddingLeft: isMine ? 8 : 0,
+                                paddingRight: isMine ? 0 : 8,
+                                display: "grid",
+                                gap: 3,
+                                justifyItems: isMine ? "end" : "start",
+                              }}
+                            >
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  rr.length
+                                    ? setExpandedReceipts((prev) => ({
+                                        ...prev,
+                                        [m.messageId]: !prev[m.messageId],
+                                      }))
+                                    : undefined
+                                }
+                                style={{
+                                  border: "none",
+                                  background: "transparent",
+                                  padding: 0,
+                                  color: UI.textDim,
+                                  cursor: rr.length ? "pointer" : "default",
+                                  fontSize: 11,
+                                  textAlign: isMine ? "right" : "left",
+                                  whiteSpace: "nowrap",
+                                }}
+                                disabled={!rr.length}
+                                title={rr.length ? (receiptsOpen ? "Hide read receipts" : "Show read receipts") : undefined}
+                              >
                                 {rrText}
-                                {rr.length ? (
-                                  <span style={{ marginLeft: 8, fontSize: 10.5, opacity: 0.95 }}>
-                                    {rr
-                                      .slice(0, 4)
-                                      .map((r) => `${r.name || r.id} • ${fmtDateTime(r.time)}`)
-                                      .join(" · ")}
-                                    {rr.length > 4 ? ` · +${rr.length - 4} more` : ""}
-                                  </span>
-                                ) : null}
-                              </div>
-                            ) : null}
+                                {rr.length ? <span style={{ marginLeft: 6, color: UI.blue }}>{receiptsOpen ? "Hide" : "Show"}</span> : null}
+                              </button>
+
+                              {rr.length && receiptsOpen ? (
+                                <div style={{ fontSize: 10.5, opacity: 0.95, textAlign: isMine ? "right" : "left" }}>
+                                  {rr.map((r) => `${r.name || r.id} • ${fmtDateTime(r.time)}`).join(" · ")}
+                                </div>
+                              ) : null}
+                            </div>
                           </div>
                         </div>
                       );
@@ -1496,16 +2086,22 @@ export default function MessagesPopup() {
               </div>
 
               {/* Composer */}
-              <div style={{ borderTop: `1px solid ${UI.border}`, padding: 10, background: "rgba(248,250,252,0.95)" }}>
-                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
+              <div style={{ borderTop: `1px solid ${UI.border}`, padding: "6px 10px 10px", background: composerBackground, backdropFilter: "blur(10px)" }}>
+                <div style={{ display: "flex", gap: 5, alignItems: "center", marginBottom: 6, flexWrap: "nowrap" }}>
                   <select
                     value={category}
                     onChange={(e) => setCategory(e.target.value as any)}
                     style={{
+                      flex: "0 1 84px",
+                      width: 84,
                       border: `1px solid ${UI.border}`,
-                      borderRadius: 10,
-                      padding: "6px 8px",
+                      borderRadius: 999,
+                      padding: "4px 20px 4px 8px",
                       background: "#fff",
+                      color: UI.text,
+                      minHeight: 28,
+                      fontSize: 12,
+                      fontWeight: 700,
                     }}
                   >
                     <option value="General">General</option>
@@ -1519,14 +2115,18 @@ export default function MessagesPopup() {
                     style={{
                       border: `1px solid ${UI.border}`,
                       background: "#fff",
-                      borderRadius: 10,
-                      padding: "6px 10px",
+                      borderRadius: 999,
+                      padding: "4px 7px",
                       cursor: insertingWeek ? "not-allowed" : "pointer",
                       fontWeight: 900,
                       display: "inline-flex",
                       alignItems: "center",
                       gap: 8,
                       opacity: insertingWeek ? 0.7 : 1,
+                      color: UI.text,
+                      minHeight: 28,
+                      fontSize: 12,
+                      whiteSpace: "nowrap",
                     }}
                     title="Insert this week's schedule"
                   >
@@ -1540,14 +2140,18 @@ export default function MessagesPopup() {
                     style={{
                       border: `1px solid ${UI.border}`,
                       background: "#fff",
-                      borderRadius: 10,
-                      padding: "6px 10px",
+                      borderRadius: 999,
+                      padding: "4px 7px",
                       cursor: insertingWeek ? "not-allowed" : "pointer",
                       fontWeight: 900,
                       display: "inline-flex",
                       alignItems: "center",
                       gap: 8,
                       opacity: insertingWeek ? 0.7 : 1,
+                      color: UI.text,
+                      minHeight: 28,
+                      fontSize: 12,
+                      whiteSpace: "nowrap",
                     }}
                     title="Insert next week's schedule"
                   >
@@ -1560,14 +2164,17 @@ export default function MessagesPopup() {
                     style={{
                       border: `1px solid ${UI.border}`,
                       background: "#fff",
-                      borderRadius: 10,
-                      padding: "6px 10px",
+                      borderRadius: 999,
+                      padding: "4px 7px",
                       cursor: "pointer",
                       fontWeight: 900,
                       display: "inline-flex",
                       alignItems: "center",
                       gap: 8,
                       color: UI.orange,
+                      minHeight: 28,
+                      fontSize: 12,
+                      whiteSpace: "nowrap",
                     }}
                     title="Insert client profile"
                   >
@@ -1575,35 +2182,24 @@ export default function MessagesPopup() {
                     Client
                   </button>
 
-                  <button
-                    onClick={() => setComposerExpanded((v) => !v)}
-                    style={{
-                      border: `1px solid ${UI.border}`,
-                      background: "#fff",
-                      borderRadius: 10,
-                      padding: "6px 10px",
-                      cursor: "pointer",
-                      fontWeight: 900,
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: 8,
-                    }}
-                    title={composerExpanded ? "Shrink message box" : "Expand message box"}
-                  >
-                    {composerExpanded ? "▾" : "▴"} Text
-                  </button>
-
-                  <div style={{ marginLeft: "auto", fontSize: 11, color: UI.textDim }}>{sendStatus}</div>
+                  <div style={{ marginLeft: "auto", fontSize: 10.5, color: UI.textDim, whiteSpace: "nowrap", flex: "0 0 auto" }}>
+                    {sendStatus}
+                  </div>
 
                   <button
                     onClick={doSend}
                     style={{
-                      border: `1px solid ${UI.border}`,
-                      background: "#fff",
-                      borderRadius: 10,
-                      padding: "6px 10px",
+                      flex: "0 0 auto",
+                      border: `1px solid ${UI.blue}`,
+                      background: UI.blue,
+                      color: "#fff",
+                      borderRadius: 999,
+                      padding: "4px 8px",
                       cursor: "pointer",
                       fontWeight: 900,
+                      minHeight: 28,
+                      fontSize: 12,
+                      whiteSpace: "nowrap",
                     }}
                   >
                     Send
@@ -1612,19 +2208,26 @@ export default function MessagesPopup() {
 
                 <textarea
                   id="msgInput"
+                  ref={msgInputRef}
                   value={text}
-                  onChange={(e) => setText(e.target.value)}
+                  onChange={(e) => {
+                    setText(e.target.value);
+                    syncComposerHeight();
+                  }}
                   placeholder="Type a message…"
                   style={{
                     width: "100%",
-                    minHeight: composerExpanded ? 160 : 74,
-                    maxHeight: composerExpanded ? 420 : 220,
-                    resize: "vertical",
+                    minHeight: 48,
+                    maxHeight: 180,
+                    resize: "none",
                     border: `1px solid ${UI.border}`,
-                    borderRadius: 12,
-                    padding: 10,
+                    borderRadius: 18,
+                    padding: "10px 12px",
                     background: "#fff",
                     fontSize: 13,
+                    color: UI.text,
+                    lineHeight: 1.45,
+                    overflowY: "auto",
                   }}
                 />
               </div>
@@ -1633,23 +2236,25 @@ export default function MessagesPopup() {
         </div>
 
         {/* Resize handle */}
-        <div
-          onMouseDown={onResizeStart}
-          title="Resize window"
-          style={{
-            position: "absolute",
-            right: 6,
-            bottom: 6,
-            width: 18,
-            height: 18,
-            cursor: "nwse-resize",
-            borderRight: `3px solid ${UI.textDim}`,
-            borderBottom: `3px solid ${UI.textDim}`,
-            opacity: 0.35,
-            borderRadius: 3,
-            userSelect: "none",
-          }}
-        />
+        {!docked ? (
+          <div
+            onMouseDown={onResizeStart}
+            title="Resize window"
+            style={{
+              position: "absolute",
+              right: 8,
+              bottom: 8,
+              width: 18,
+              height: 18,
+              cursor: "nwse-resize",
+              borderRight: `3px solid ${UI.textDim}`,
+              borderBottom: `3px solid ${UI.textDim}`,
+              opacity: 0.35,
+              borderRadius: 3,
+              userSelect: "none",
+            }}
+          />
+        ) : null}
 
         {/* Edit Message Modal */}
         {editOpen ? (

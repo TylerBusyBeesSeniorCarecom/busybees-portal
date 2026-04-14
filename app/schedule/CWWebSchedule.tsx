@@ -5,6 +5,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation"; // ✅ NEW
 import { useSession } from "next-auth/react";
 import ShiftCard, { type ShiftStatus as ShiftCardStatus } from "./components/ShiftCard";
+import FloatingPanel from "./components/FloatingPanel";
 import { useShiftInfo } from "./components/useShiftInfo";
 import { useMessagesUI } from "@/app/api/messages/MessagesContext";
 import TopNav from "./components/TopNav";
@@ -567,13 +568,16 @@ const SHEET_COLORS: Record<ShiftStatus, string> = {
 };
 
 function worstStatus(statuses: ShiftStatus[]): ShiftStatus {
+  const meaningful = statuses.filter((s) => s !== "none");
+  if (!meaningful.length) return "none";
+  if (meaningful.every((s) => s === "canceled")) return "canceled";
   if (statuses.includes("open")) return "open";
   if (statuses.includes("considering")) return "considering";
   if (statuses.includes("offered")) return "offered";
   if (statuses.includes("offering")) return "offering";
   if (statuses.includes("pending")) return "pending";
-  if (statuses.includes("canceled")) return "canceled";
   if (statuses.includes("filled")) return "filled";
+  if (statuses.includes("canceled")) return "canceled";
   return "none";
 }
 
@@ -588,6 +592,13 @@ function containsCI(haystack: string, needle: string) {
   const n = (needle || "").toLowerCase().trim();
   if (!n) return true;
   return h.includes(n);
+}
+
+function parseSearchTerms(raw: string): string[] {
+  return String(raw ?? "")
+    .split(/[\n,;]+/)
+    .map((part) => norm(part))
+    .filter(Boolean);
 }
 
 function normalizeCellText(raw: unknown): string {
@@ -636,6 +647,9 @@ const UI = {
   borderSoft: "#e5e7eb",
   text: "#111827",
   textDim: "#6b7280",
+  accent: "#f4b400",
+  accentSoft: "#fff7d6",
+  accentText: "#7a4b00",
 };
 
 function scheduleStatusColor(raw: string): string {
@@ -645,6 +659,47 @@ function scheduleStatusColor(raw: string): string {
   if (k === "considering") return SHEET_COLORS.considering;
   if (k === "pending") return SHEET_COLORS.pending;
   return UI.text;
+}
+
+function draftStatusMeta(raw: string): {
+  label: string;
+  color: string;
+  bg: string;
+} {
+  const status = statusFromCellValue(raw);
+  if (status === "filled") {
+    return { label: "Filled", color: SHEET_COLORS.filled, bg: "#edf9f0" };
+  }
+  if (status === "considering") {
+    return { label: "Considering", color: SHEET_COLORS.considering, bg: "#fff5e8" };
+  }
+  if (status === "offered") {
+    return { label: "Offered", color: SHEET_COLORS.offered, bg: "#edf4ff" };
+  }
+  if (status === "offering") {
+    return { label: "Offering", color: SHEET_COLORS.offering, bg: "#eafaff" };
+  }
+  if (status === "pending") {
+    return { label: "Pending Client Approval", color: SHEET_COLORS.pending, bg: "#f5edff" };
+  }
+  if (status === "open") {
+    return { label: "Open", color: SHEET_COLORS.open, bg: "#ffeded" };
+  }
+  if (status === "canceled") {
+    return { label: "Canceled", color: SHEET_COLORS.canceled, bg: "#f3f4f6" };
+  }
+  if (!norm(raw)) {
+    return { label: "Empty", color: UI.textDim, bg: "#f8fafc" };
+  }
+  return { label: "Edited", color: UI.text, bg: "#f3f4f6" };
+}
+
+function draftChangeActionLabel(originalValue: string, draftValue: string): string {
+  const before = norm(originalValue);
+  const after = norm(draftValue);
+  if (!before && after) return "Created shift";
+  if (before && !after) return "Removed shift";
+  return "Updated shift";
 }
 
 const DOW_LABELS = [
@@ -1553,6 +1608,19 @@ function compareDatesLoose(a: string, b: string) {
   return ta - tb;
 }
 
+function MessageBubbleIcon({ size = 18 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M20 14.5c0 1.4-1.1 2.5-2.5 2.5H9l-4 3v-3H6.5C5.1 17 4 15.9 4 14.5V7.5C4 6.1 5.1 5 6.5 5h11C19 5 20 6.1 20 7.5v7z"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 function buildClientHistoryList(args: {
   clientName: string;
   historicalRows: HistoricalRow[];
@@ -2051,6 +2119,7 @@ const {
   redo,
   canUndo,
   canRedo,
+  changedCells,
   hasDraftChanges,
   changedCellCount,
   setDraftCell,
@@ -2062,15 +2131,21 @@ const {
     // ✅ TopNav height tracking (MUST live inside component)
   const [topNavH, setTopNavH] = useState(0);
   const topNavRef = useRef<HTMLDivElement | null>(null);
+  const headerScrollRef = useRef<HTMLDivElement | null>(null);
+  const bodyScrollRef = useRef<HTMLDivElement | null>(null);
+  const syncingScrollRef = useRef<"header" | "body" | null>(null);
 
   // ✅ Computed sticky tops (depend on topNavH)
   // The day/date header rows should sit directly below the sticky TopNav.
   // This is the correct setup for the final table/header layout fix.
   // ✅ Computed sticky tops (depend on measured TopNav height)
-// Day row should sit directly under TopNav
-// Date row should sit directly under the day row
+// Header should pin directly to the top of the viewport.
 const STICKY_DAY_ROW_TOP = 0;
 const STICKY_DATE_ROW_TOP = STICKY_DAY_ROW_HEIGHT;
+  const draftUpdates = useMemo(() => {
+    return [...changedCells].sort((a, b) => b.updatedAt - a.updatedAt);
+  }, [changedCells]);
+
     // ✅ Measure TopNav height so sticky schedule headers sit right under it
   useEffect(() => {
     const el = topNavRef.current;
@@ -2092,6 +2167,25 @@ const STICKY_DATE_ROW_TOP = STICKY_DAY_ROW_HEIGHT;
       window.removeEventListener("resize", update);
     };
   }, []);
+
+  function syncHorizontalScroll(source: "header" | "body") {
+    const headerEl = headerScrollRef.current;
+    const bodyEl = bodyScrollRef.current;
+    if (!headerEl || !bodyEl) return;
+
+    if (syncingScrollRef.current && syncingScrollRef.current !== source) return;
+
+    syncingScrollRef.current = source;
+    if (source === "header") {
+      bodyEl.scrollLeft = headerEl.scrollLeft;
+    } else {
+      headerEl.scrollLeft = bodyEl.scrollLeft;
+    }
+
+    requestAnimationFrame(() => {
+      if (syncingScrollRef.current === source) syncingScrollRef.current = null;
+    });
+  }
   // ✅ NEW: write week to URL (preserve any existing query params)
   function setWeekAndUrl(next: WeekKind) {
     setWeek(next);
@@ -2112,6 +2206,20 @@ const STICKY_DATE_ROW_TOP = STICKY_DAY_ROW_HEIGHT;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams]);
+
+  useEffect(() => {
+    const id = "cw_bulk_step_anim";
+    if (document.getElementById(id)) return;
+    const style = document.createElement("style");
+    style.id = id;
+    style.textContent = `
+      @keyframes cwBulkStepSlideIn {
+        from { opacity: 0; transform: translateX(28px); }
+        to { opacity: 1; transform: translateX(0); }
+      }
+    `;
+    document.head.appendChild(style);
+  }, []);
 
   // Messages UI
   const messagesUI = useMessagesUI();
@@ -2333,6 +2441,7 @@ const [bulkCancelledTarget, setBulkCancelledTarget] = useState<
 const [bulkSelectionMode, setBulkSelectionMode] = useState<
   "caregiver" | "client" | "status" | "manual"
 >("caregiver");
+const [bulkStepTwoArmed, setBulkStepTwoArmed] = useState(false);
 
 const [showCaregiverSuggestions, setShowCaregiverSuggestions] = useState(false);
 const [showClientSuggestions, setShowClientSuggestions] = useState(false);
@@ -3065,8 +3174,8 @@ const selectedCellHistoryRows = useMemo(() => {
  
 
     const rows = useMemo(() => {
-    const q = searchText.trim();
-    if (!q) return rowsAll;
+    const terms = parseSearchTerms(searchText);
+    if (!terms.length) return rowsAll;
 
     return rowsAll.filter((r) => {
       const name = norm(r.clientName);
@@ -3077,33 +3186,30 @@ const selectedCellHistoryRows = useMemo(() => {
       const clientDescription = norm(clientProfile?.description);
       const clientRate = norm(clientProfile?.rate);
 
-      if (containsCI(name, q)) return true;
-      if (containsCI(clientLocation, q)) return true;
-      if (containsCI(clientDescription, q)) return true;
-      if (containsCI(clientRate, q)) return true;
-
-      const anyCell = r.cells.some((c) => {
+      const cellTexts = r.cells.map((c) => {
         const originalValue = norm(c.value);
-        const effectiveValue =
-          draftMode && c.a1
-            ? norm(
-                getDraftValue({
-                  a1: c.a1,
-                  week,
-                  originalValue,
-                })
-              )
-            : originalValue;
-
-        return containsCI(effectiveValue, q);
+        return draftMode && c.a1
+          ? norm(
+              getDraftValue({
+                a1: c.a1,
+                week,
+                originalValue,
+              })
+            )
+          : originalValue;
       });
 
-      return anyCell;
+      const searchableText = [name, clientLocation, clientDescription, clientRate, ...cellTexts]
+        .filter(Boolean)
+        .join("\n");
+
+      return terms.some((term) => containsCI(searchableText, term));
     });
   }, [rowsAll, searchText, clientsByName, draftMode, getDraftValue, week]);
 
   const dayHeaders = data?.headers?.dayHeaders ?? ["Client Name", ...DOW_LABELS];
   const dateHeaders = data?.headers?.dateHeaders ?? ["Date", "", "", "", "", "", "", ""];
+  const tableMinWidth = selectedDow == null ? 1200 : 680;
 
   // ✅ IMPORTANT: ghost map key must match lookup key (NO dow in either place)
   const ghostByCell = useMemo(() => {
@@ -3173,7 +3279,7 @@ const selectedCellHistoryRows = useMemo(() => {
 
     return out;
   }, [rows, visibleDows, draftMode, getDraftValue, week, dateHeaders, dayHeaders]);
-  function smartSelectByCaregiver(caregiverName: string) {
+function smartSelectByCaregiver(caregiverName: string) {
   const target = normalizeKey(caregiverName);
   if (!target) return;
 
@@ -3185,6 +3291,7 @@ const selectedCellHistoryRows = useMemo(() => {
   const next: Record<string, BulkSelectedCell> = {};
   for (const m of matches) next[m.a1] = m;
   setSelectedBulkCells(next);
+  setBulkStepTwoArmed(true);
 }
 
 function smartSelectByClient(clientName: string) {
@@ -3198,6 +3305,7 @@ function smartSelectByClient(clientName: string) {
   const next: Record<string, BulkSelectedCell> = {};
   for (const m of matches) next[m.a1] = m;
   setSelectedBulkCells(next);
+  setBulkStepTwoArmed(true);
 }
 
 function smartSelectByStatus(status: Exclude<BulkSmartStatusFilter, "Any">) {
@@ -3209,6 +3317,7 @@ function smartSelectByStatus(status: Exclude<BulkSmartStatusFilter, "Any">) {
   const next: Record<string, BulkSelectedCell> = {};
   for (const m of matches) next[m.a1] = m;
   setSelectedBulkCells(next);
+  setBulkStepTwoArmed(true);
 }
 
 function smartSelectByCaregiverAndStatus(
@@ -3228,12 +3337,14 @@ function smartSelectByCaregiverAndStatus(
   const next: Record<string, BulkSelectedCell> = {};
   for (const m of matches) next[m.a1] = m;
   setSelectedBulkCells(next);
+  setBulkStepTwoArmed(true);
 }
 
 function selectAllVisibleShifts() {
   const next: Record<string, BulkSelectedCell> = {};
   for (const c of visibleBulkCandidates) next[c.a1] = c;
   setSelectedBulkCells(next);
+  setBulkStepTwoArmed(true);
 }
 
 const bulkCaregiverSuggestions = useMemo(() => {
@@ -3263,8 +3374,231 @@ const bulkClientSuggestions = useMemo(() => {
   return names.filter((name) => normalizeKey(name).includes(q)).slice(0, 8);
 }, [visibleBulkCandidates, bulkSmartClient]);
 
+const bulkPreviewCandidates = useMemo(() => {
+  if (bulkSelectionMode === "manual") {
+    return Object.values(selectedBulkCells);
+  }
+
+  if (!bulkStepTwoArmed) return [];
+
+  if (bulkSelectionMode === "caregiver") {
+    const target = normalizeKey(bulkSmartCaregiver);
+    if (!target) return [];
+    return visibleBulkCandidates.filter((cell) => {
+      const parsed = parseScheduleShiftCell(cell.originalValue);
+      const caregiverMatch = normalizeKey(parsed.caregiverName || "") === target;
+      const statusMatch = bulkSmartStatus === "Any" ? true : parsed.baseStatus === bulkSmartStatus;
+      return caregiverMatch && statusMatch;
+    });
+  }
+
+  if (bulkSelectionMode === "client") {
+    const target = normalizeKey(bulkSmartClient);
+    if (!target) return [];
+    return visibleBulkCandidates.filter((cell) => normalizeKey(cell.clientName) === target);
+  }
+
+  if (bulkSelectionMode === "status") {
+    if (bulkSmartStatus === "Any") return [];
+    return visibleBulkCandidates.filter((cell) => parseScheduleShiftCell(cell.originalValue).baseStatus === bulkSmartStatus);
+  }
+
+  return [];
+}, [
+  bulkSelectionMode,
+  bulkSmartCaregiver,
+  bulkSmartClient,
+  bulkSmartStatus,
+  bulkStepTwoArmed,
+  selectedBulkCells,
+  visibleBulkCandidates,
+]);
+
+const bulkShiftList = useMemo(() => {
+  return bulkPreviewCandidates
+    .map((cell) => {
+      const parsed = parseScheduleShiftCell(cell.originalValue);
+      return {
+        ...cell,
+        caregiverName: parsed.caregiverName || "Open",
+        status: parsed.baseStatus,
+        startTime: parsed.startTime || "",
+        endTime: parsed.endTime || "",
+        selected: Boolean(selectedBulkCells[cell.a1]),
+      };
+    })
+    .sort((a, b) => {
+      const dateCmp = dateKey(a.dateStr).localeCompare(dateKey(b.dateStr));
+      if (dateCmp !== 0) return dateCmp;
+      const timeCmp = (parseTimeToMinutes(a.startTime) ?? 0) - (parseTimeToMinutes(b.startTime) ?? 0);
+      if (timeCmp !== 0) return timeCmp;
+      return a.clientName.localeCompare(b.clientName);
+    });
+}, [bulkPreviewCandidates, selectedBulkCells]);
+
+const bulkStepOneReady = Boolean(bulkSelectionMode);
+const bulkStepTwoVisible = bulkStepOneReady;
+const bulkStepThreeVisible =
+  bulkSelectionMode === "manual" ? selectedBulkCount > 0 : bulkStepTwoArmed && bulkShiftList.length > 0;
+
+const bulkMessageTarget = useMemo(() => {
+  const cells = Object.values(selectedBulkCells);
+  if (!cells.length) {
+    return {
+      caregiverId: "",
+      caregiverName: "",
+      reason: "Select at least one shift to paste a message.",
+    };
+  }
+
+  const uniqueNames = Array.from(
+    new Set(
+      cells
+        .map((cell) => parseScheduleShiftCell(cell.originalValue).caregiverName || "")
+        .map((name) => norm(name))
+        .filter(Boolean)
+    )
+  );
+
+  let caregiverName = "";
+
+  if (uniqueNames.length === 1) {
+    caregiverName = uniqueNames[0];
+  } else if (uniqueNames.length > 1) {
+    return {
+      caregiverId: "",
+      caregiverName: "",
+      reason: "Messaging from bulk edit only works when all selected shifts belong to one caregiver.",
+    };
+  } else if (bulkSelectionMode === "caregiver" && norm(bulkSmartCaregiver)) {
+    caregiverName = norm(bulkSmartCaregiver);
+  } else {
+    return {
+      caregiverId: "",
+      caregiverName: "",
+      reason: "Choose one caregiver first, then select shifts to message.",
+    };
+  }
+
+  const caregiverId = idByNameOnSchedule[normalizeKey(caregiverName)] || "";
+  if (!caregiverId) {
+    return {
+      caregiverId: "",
+      caregiverName,
+      reason: `Could not find a caregiver ID for ${caregiverName}.`,
+    };
+  }
+
+  const profile = caregiversById[caregiverId];
+  return {
+    caregiverId,
+    caregiverName: norm(profile?.nameOnSchedule) || norm(profile?.name) || caregiverName,
+    reason: "",
+  };
+}, [bulkSelectionMode, bulkSmartCaregiver, caregiversById, idByNameOnSchedule, selectedBulkCells]);
+
+function openBulkOfferMessage() {
+  const target = bulkMessageTarget;
+  if (!target.caregiverId || !target.caregiverName) {
+    setSaveToast({
+      id: Date.now(),
+      kind: "warning",
+      title: "Cannot open bulk message",
+      lines: [target.reason || "Choose one caregiver and at least one shift first."],
+    });
+    return;
+  }
+
+  const selectedItems = Object.values(selectedBulkCells)
+    .map((cell) => {
+      const parsed = parseScheduleShiftCell(cell.originalValue);
+      return {
+        clientName: cell.clientName,
+        dateStr: cell.dateStr,
+        startTime: parsed.startTime || "",
+        endTime: parsed.endTime || "",
+      };
+    })
+    .sort((a, b) => {
+      const dateCmp = dateKey(a.dateStr).localeCompare(dateKey(b.dateStr));
+      if (dateCmp !== 0) return dateCmp;
+      return (parseTimeToMinutes(a.startTime) ?? 0) - (parseTimeToMinutes(b.startTime) ?? 0);
+    });
+
+  if (!selectedItems.length) {
+    setSaveToast({
+      id: Date.now(),
+      kind: "warning",
+      title: "No shifts selected",
+      lines: ["Select one or more shifts before opening a message draft."],
+    });
+    return;
+  }
+
+  const intro =
+    week === "nw"
+      ? "Hi -  here is your schedule for the upcoming week:"
+      : "Hi -  here is your schedule for this week:";
+  const lines = selectedItems.map(
+    (item) =>
+      `${formatBulkMessageDate(item.dateStr)} ${formatBulkTimeLabel(item.startTime)}-${formatBulkTimeLabel(item.endTime)} w/ ${item.clientName}`
+  );
+  const text = `${intro}\n\n${lines.join("\n")}\n\nPlease let me know if this works for you. Thank you!`;
+
+  messagesUI.openCompose({
+    caregiverId: target.caregiverId,
+    caregiverName: target.caregiverName,
+    category: "Scheduling",
+    text,
+    replaceText: true,
+    focusComposer: true,
+  });
+}
+
+function bulkStatusTone(status: BulkSmartStatusFilter | BaseShiftStatus) {
+  if (status === "Filled") {
+    return { bg: "#ecfdf5", border: "#22c55e", text: "#166534" };
+  }
+  if (status === "Considering") {
+    return { bg: "#fff7ed", border: "#fb923c", text: "#9a3412" };
+  }
+  if (status === "Offered") {
+    return { bg: "#eff6ff", border: "#60a5fa", text: "#1d4ed8" };
+  }
+  if (status === "PendingClientApproval") {
+    return { bg: "#faf5ff", border: "#c084fc", text: "#7e22ce" };
+  }
+  if (status === "Open") {
+    return { bg: "#fef2f2", border: "#f87171", text: "#b91c1c" };
+  }
+  return { bg: "#f8fafc", border: UI.border, text: UI.textDim };
+}
+
+function formatBulkMessageDate(dateStr: string) {
+  const d = toDateSafe(dateStr);
+  if (!d) return dateStr;
+  return d.toLocaleDateString(undefined, {
+    weekday: "long",
+  });
+}
+
+function formatBulkTimeLabel(raw: string) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  if (/[ap]m/i.test(s) && s.length <= 10) return s.replace(/\s+/g, "");
+  const m = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return s.replace(/\s+/g, "");
+  let hh = Number(m[1]);
+  const mm = m[2];
+  const ap = hh >= 12 ? "PM" : "AM";
+  hh = hh % 12;
+  if (hh === 0) hh = 12;
+  return `${hh}:${mm}${ap}`;
+}
+
 function resetBulkSearchUi(mode: "caregiver" | "client" | "status" | "manual") {
   setBulkSelectionMode(mode);
+  setBulkStepTwoArmed(false);
   setBulkSmartCaregiver("");
   setBulkSmartClient("");
   setBulkSmartStatus("Any");
@@ -3306,7 +3640,7 @@ function resetBulkSearchUi(mode: "caregiver" | "client" | "status" | "manual") {
     return map;
   }, [rows, draftMode, getDraftValue, week]);
 
-    const totals = useMemo(() => {
+const totals = useMemo(() => {
   let totalHours = 0;
   const clientSet = new Set<string>();
   const caregiverSet = new Set<string>();
@@ -3352,6 +3686,102 @@ function resetBulkSearchUi(mode: "caregiver" | "client" | "status" | "manual") {
     totalHours,
   };
 }, [rows, selectedDow, draftMode, getDraftValue, week]);
+
+const weekProgress = useMemo(() => {
+  const items: Array<{
+    status: ShiftStatus;
+    dateStr: string;
+    start: string;
+    end: string;
+  }> = [];
+
+  for (const r of rows) {
+    for (let dow = 0; dow < 7; dow++) {
+      if (selectedDow != null && dow !== selectedDow) continue;
+
+      const c = r.cells[dow];
+      const originalValue = norm(c?.value);
+      const value =
+        draftMode && c?.a1
+          ? norm(
+              getDraftValue({
+                a1: c.a1,
+                week,
+                originalValue,
+              })
+            )
+          : originalValue;
+
+      if (!value) continue;
+
+      const status = statusFromCellValue(value);
+      if (status === "none" || status === "canceled") continue;
+
+      const timeRange = parseFirstTimeRange(value);
+      const dateStr = norm(dateHeaders?.[dow + 1]);
+      if (!timeRange || !dateStr) continue;
+
+      items.push({
+        status,
+        dateStr,
+        start: timeRange.start,
+        end: timeRange.end,
+      });
+    }
+  }
+
+  if (week === "nw") {
+    const counts: Partial<Record<ShiftStatus, number>> = {};
+    for (const item of items) counts[item.status] = (counts[item.status] || 0) + 1;
+    const total = items.length;
+
+    const segments = (["filled", "considering", "offered", "pending", "open"] as ShiftStatus[])
+      .map((status) => ({
+        status,
+        count: counts[status] || 0,
+        color: SHEET_COLORS[status],
+      }))
+      .filter((segment) => segment.count > 0)
+      .map((segment) => ({
+        ...segment,
+        pct: total ? (segment.count / total) * 100 : 0,
+      }));
+
+    return {
+      kind: "next" as const,
+      total,
+      worked: 0,
+      segments,
+    };
+  }
+
+  const now = new Date();
+  let worked = 0;
+  for (const item of items) {
+    const startMin = parseTimeToMinutes(item.start);
+    const endMin = parseTimeToMinutes(item.end);
+    const scheduledStart = buildScheduledDate(item.dateStr, item.start);
+    let scheduledEnd = buildScheduledDate(item.dateStr, item.end);
+    if (
+      scheduledStart &&
+      scheduledEnd &&
+      startMin != null &&
+      endMin != null &&
+      endMin <= startMin
+    ) {
+      scheduledEnd = addDays(scheduledEnd, 1);
+    }
+
+    if (scheduledEnd && scheduledEnd.getTime() <= now.getTime()) worked += 1;
+  }
+
+  return {
+    kind: "current" as const,
+    total: items.length,
+    worked,
+    segments: [],
+  };
+}, [rows, selectedDow, draftMode, getDraftValue, week, dateHeaders]);
 
    const hoursByClient = useMemo(() => {
   const map = new Map<string, number>();
@@ -4681,6 +5111,24 @@ async function handleCaregiverDropToShift(args: {
         🧠 Workpad
       </button>
 
+      <button
+        type="button"
+        onClick={() => setOnboardingOpen(true)}
+        style={{
+          border: `1px solid ${onboardingOpen ? UI.accent : UI.border}`,
+          background: onboardingOpen ? UI.accentSoft : UI.panelBg,
+          color: onboardingOpen ? UI.accentText : UI.text,
+          borderRadius: 10,
+          padding: "8px 12px",
+          fontWeight: 900,
+          cursor: "pointer",
+          whiteSpace: "nowrap",
+        }}
+        title="Open onboarding panel"
+      >
+        Onboarding
+      </button>
+
             <div
               style={{
                 display: "inline-flex",
@@ -4701,8 +5149,8 @@ async function handleCaregiverDropToShift(args: {
                   fontWeight: 900,
                   border: "none",
                   cursor: "pointer",
-                  background: week === "cw" ? "#111827" : UI.headerBg,
-                  color: week === "cw" ? "#fff" : UI.text,
+                  background: week === "cw" ? UI.accentSoft : UI.headerBg,
+                  color: week === "cw" ? UI.accentText : UI.text,
                 }}
                 aria-pressed={week === "cw"}
               >
@@ -4718,8 +5166,8 @@ async function handleCaregiverDropToShift(args: {
                   fontWeight: 900,
                   border: "none",
                   cursor: "pointer",
-                  background: week === "nw" ? "#111827" : UI.headerBg,
-                  color: week === "nw" ? "#fff" : UI.text,
+                  background: week === "nw" ? UI.accentSoft : UI.headerBg,
+                  color: week === "nw" ? UI.accentText : UI.text,
                 }}
                 aria-pressed={week === "nw"}
               >
@@ -4736,11 +5184,11 @@ async function handleCaregiverDropToShift(args: {
                 background:
                   publishingSchedule || loading || hasDraftChanges
                     ? "#f3f4f6"
-                    : "#f4b400",
+                    : UI.panelBg,
                 color:
                   publishingSchedule || loading || hasDraftChanges
                     ? "#9ca3af"
-                    : "#111827",
+                    : UI.text,
                 borderRadius: 10,
                 padding: "7px 10px",
                 fontSize: 13,
@@ -4784,13 +5232,13 @@ async function handleCaregiverDropToShift(args: {
               💬 Messages
             </button>
 
-           <button
+   <button
   type="button"
   onClick={() => setPanelOpen((v) => !v)}
   style={{
-    border: `1px solid ${UI.border}`,
-    background: panelOpen ? "#111827" : "#f4b400",
-    color: panelOpen ? "#fff" : "#111827",
+    border: `1px solid ${panelOpen ? UI.accent : UI.border}`,
+    background: panelOpen ? UI.accentSoft : UI.panelBg,
+    color: panelOpen ? UI.accentText : UI.text,
     borderRadius: 10,
     padding: "7px 10px",
     fontSize: 13,
@@ -4805,9 +5253,9 @@ async function handleCaregiverDropToShift(args: {
               type="button"
               onClick={toggleDraftMode}
               style={{
-                border: `1px solid ${draftMode ? "#111827" : UI.border}`,
-                background: draftMode ? "#111827" : UI.headerBg,
-                color: draftMode ? "#fff" : UI.text,
+                border: `1px solid ${draftMode ? UI.accent : UI.border}`,
+                background: draftMode ? UI.accentSoft : UI.headerBg,
+                color: draftMode ? UI.accentText : UI.text,
                 borderRadius: 10,
                 padding: "7px 10px",
                 fontSize: 13,
@@ -4832,9 +5280,9 @@ async function handleCaregiverDropToShift(args: {
                 setShowClientSuggestions(false);
               }}
               style={{
-                border: `1px solid ${bulkMode ? "#111827" : UI.border}`,
-                background: bulkMode ? "#111827" : UI.headerBg,
-                color: bulkMode ? "#fff" : UI.text,
+                border: `1px solid ${bulkMode ? UI.accent : UI.border}`,
+                background: bulkMode ? UI.accentSoft : UI.headerBg,
+                color: bulkMode ? UI.accentText : UI.text,
                 borderRadius: 10,
                 padding: "7px 10px",
                 fontSize: 13,
@@ -4977,9 +5425,7 @@ async function handleCaregiverDropToShift(args: {
       <div>
         <h1 style={{ margin: 0, fontSize: 22 }}>{weekLabel(week)}</h1>
         <p style={{ opacity: 0.8, marginTop: 6, fontSize: 13 }}>
-          Source: <code>{sheetLabelForWeek(week)}</code>
-
-          <span style={{ marginLeft: 10, fontSize: 12, color: UI.textDim }}>
+          <span style={{ fontSize: 12, color: UI.textDim }}>
             (Portal user:{" "}
             {sessionStatus === "loading"
               ? "loading…"
@@ -5018,41 +5464,10 @@ async function handleCaregiverDropToShift(args: {
         flexWrap: "wrap",
       }}
     >
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-        <DayChip label="All Days" active={selectedDow == null} onClick={() => setSelectedDow(null)} />
-        {DOW_LABELS.map((d, idx) => (
-          <DayChip
-            key={d}
-            label={d}
-            active={selectedDow === idx}
-            onClick={() => setSelectedDow(idx)}
-          />
-        ))}
-      </div>
-
-      <button
-        type="button"
-        onClick={() => setOnboardingOpen(true)}
-        style={{
-          border: `1px solid ${UI.border}`,
-          background: onboardingOpen ? "#111827" : UI.panelBg,
-          color: onboardingOpen ? "#fff" : UI.text,
-          borderRadius: 999,
-          padding: "6px 12px",
-          fontSize: 12,
-          cursor: "pointer",
-          fontWeight: 900,
-          whiteSpace: "nowrap",
-        }}
-        title="Open onboarding panel"
-      >
-        Onboarding
-      </button>
-
       <input
         value={searchText ?? ""}
         onChange={(e) => setSearchText(e.target.value)}
-        placeholder="Search client or cell text…"
+        placeholder="Search clients/caregivers… use commas for multiple"
         style={{
           marginLeft: "auto",
           width: 320,
@@ -5125,6 +5540,94 @@ async function handleCaregiverDropToShift(args: {
 
 <div
   style={{
+    background: UI.panelBg,
+    border: `1px solid ${UI.border}`,
+    borderRadius: 12,
+    padding: "8px 10px",
+    minWidth: 280,
+    flex: "1 1 320px",
+  }}
+>
+  <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+    <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>
+      {week === "nw" ? "Next Week Shift Status" : "Current Week Worked Progress"}
+    </div>
+    <div style={{ fontSize: 12, fontWeight: 900, color: UI.text }}>
+      {week === "nw"
+        ? `${weekProgress.total} shifts`
+        : `${weekProgress.worked}/${weekProgress.total} worked`}
+    </div>
+  </div>
+
+  <div
+    style={{
+      marginTop: 8,
+      height: 14,
+      borderRadius: 999,
+      overflow: "hidden",
+      background: "#eef2f7",
+      border: `1px solid ${UI.borderSoft}`,
+      display: "flex",
+    }}
+  >
+    {week === "nw" ? (
+      weekProgress.total ? (
+        weekProgress.segments.map((segment) => (
+          <div
+            key={segment.status}
+            title={`${segment.status}: ${segment.count}`}
+            style={{
+              width: `${segment.pct}%`,
+              background: segment.color,
+            }}
+          />
+        ))
+      ) : (
+        <div style={{ width: "100%", background: "#e5e7eb" }} />
+      )
+    ) : (
+      <div
+        style={{
+          width: `${weekProgress.total ? (weekProgress.worked / weekProgress.total) * 100 : 0}%`,
+          background: "#16a34a",
+        }}
+      />
+    )}
+  </div>
+
+  <div style={{ marginTop: 8, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+    {week === "nw" ? (
+      weekProgress.segments.length ? (
+        weekProgress.segments.map((segment) => (
+          <div
+            key={`legend_${segment.status}`}
+            style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 11, color: UI.textDim, fontWeight: 800 }}
+          >
+            <span
+              style={{
+                width: 10,
+                height: 10,
+                borderRadius: 999,
+                background: segment.color,
+                flex: "0 0 auto",
+              }}
+            />
+            {segment.status === "pending" ? "Pending" : segment.status[0].toUpperCase() + segment.status.slice(1)} {segment.count}
+          </div>
+        ))
+      ) : (
+        <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>No scheduled shifts yet.</div>
+      )
+    ) : (
+      <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>
+        Worked shifts are counted when the scheduled shift end time is in the past.
+      </div>
+    )}
+  </div>
+</div>
+
+<div
+  style={{
     marginLeft: "auto",
     display: "flex",
     gap: 10,
@@ -5159,28 +5662,166 @@ async function handleCaregiverDropToShift(args: {
       <div
         style={{
           marginTop: 12,
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          gap: 12,
-          flexWrap: "wrap",
-          padding: "10px 12px",
-          borderRadius: 12,
-          border: "1px solid #cbd5e1",
-          background: "#eff6ff",
+          display: "grid",
+          gap: 10,
         }}
       >
-        <div>
-          <div style={{ fontSize: 13, fontWeight: 1000, color: "#111827" }}>Draft Mode is ON</div>
-          <div style={{ fontSize: 12, color: "#475569", marginTop: 2 }}>
-            Changes stay in the portal until you click Save Schedule.
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: 12,
+            flexWrap: "wrap",
+            padding: "10px 12px",
+            borderRadius: 12,
+            border: "1px solid #cbd5e1",
+            background: "#eff6ff",
+          }}
+        >
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 1000, color: "#111827" }}>Draft Mode is ON</div>
+            <div style={{ fontSize: 12, color: "#475569", marginTop: 2 }}>
+              Changes stay in the portal until you click Save Schedule.
+            </div>
+          </div>
+
+          <div style={{ fontSize: 12, fontWeight: 900, color: "#1e3a8a" }}>
+            {hasDraftChanges
+              ? `${changedCellCount} unsaved draft change${changedCellCount === 1 ? "" : "s"}`
+              : "No draft changes yet"}
           </div>
         </div>
 
-        <div style={{ fontSize: 12, fontWeight: 900, color: "#1e3a8a" }}>
-          {hasDraftChanges
-            ? `${changedCellCount} unsaved draft change${changedCellCount === 1 ? "" : "s"}`
-            : "No draft changes yet"}
+        <div
+          style={{
+            borderRadius: 14,
+            border: `1px solid ${UI.border}`,
+            background: UI.panelBg,
+            padding: 12,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 12,
+              flexWrap: "wrap",
+              marginBottom: 10,
+            }}
+          >
+            <div style={{ fontSize: 13, fontWeight: 1000, color: UI.text }}>Draft Updates</div>
+            <div style={{ fontSize: 11, fontWeight: 900, color: UI.textDim }}>
+              Newest changes first
+            </div>
+          </div>
+
+          {draftUpdates.length ? (
+            <div
+              style={{
+                display: "grid",
+                gap: 8,
+                maxHeight: 240,
+                overflowY: "auto",
+                paddingRight: 4,
+              }}
+            >
+              {draftUpdates.map((change) => {
+                const before = draftStatusMeta(change.originalValue);
+                const after = draftStatusMeta(change.draftValue);
+                const weekLabel = change.week === "cw" ? "Current Week" : "Next Week";
+
+                return (
+                  <div
+                    key={`${change.week}-${change.a1}`}
+                    style={{
+                      display: "grid",
+                      gap: 8,
+                      padding: "10px 12px",
+                      borderRadius: 12,
+                      border: `1px solid ${UI.borderSoft}`,
+                      background: UI.headerBg,
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: 10,
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                        <div style={{ fontSize: 12, fontWeight: 1000, color: UI.text }}>
+                          {change.clientName || "Unknown client"}
+                        </div>
+                        <div style={{ fontSize: 11, fontWeight: 900, color: UI.textDim }}>
+                          {change.dayLabel || "Day"} {change.dateStr || ""}
+                        </div>
+                        <div
+                          style={{
+                            fontSize: 10,
+                            fontWeight: 1000,
+                            color: "#1e3a8a",
+                            background: "#dbeafe",
+                            borderRadius: 999,
+                            padding: "3px 7px",
+                          }}
+                        >
+                          {weekLabel}
+                        </div>
+                      </div>
+
+                      <div style={{ fontSize: 11, fontWeight: 900, color: UI.textDim }}>
+                        {draftChangeActionLabel(change.originalValue, change.draftValue)}
+                      </div>
+                    </div>
+
+                    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                      <div
+                        style={{
+                          fontSize: 11,
+                          fontWeight: 900,
+                          color: before.color,
+                          background: before.bg,
+                          borderRadius: 999,
+                          padding: "4px 8px",
+                        }}
+                      >
+                        Was {before.label}
+                      </div>
+                      <div style={{ fontSize: 12, fontWeight: 1000, color: UI.textDim }}>→</div>
+                      <div
+                        style={{
+                          fontSize: 11,
+                          fontWeight: 900,
+                          color: after.color,
+                          background: after.bg,
+                          borderRadius: 999,
+                          padding: "4px 8px",
+                        }}
+                      >
+                        Now {after.label}
+                      </div>
+                      <div style={{ fontSize: 11, color: UI.textDim }}>Cell {change.a1}</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div
+              style={{
+                fontSize: 12,
+                color: UI.textDim,
+                padding: "2px 0",
+              }}
+            >
+              Changes you make in draft mode will appear here before you save them.
+            </div>
+          )}
         </div>
       </div>
     ) : null}
@@ -5190,9 +5831,9 @@ async function handleCaregiverDropToShift(args: {
         style={{
           marginTop: 12,
           display: "grid",
-          gap: 12,
-          padding: "12px",
-          borderRadius: 12,
+          gap: 14,
+          padding: "14px",
+          borderRadius: 16,
           border: `1px solid ${UI.border}`,
           background: UI.panelBg,
         }}
@@ -5203,63 +5844,27 @@ async function handleCaregiverDropToShift(args: {
             gap: 10,
             alignItems: "center",
             flexWrap: "wrap",
+            justifyContent: "space-between",
           }}
         >
-          <div style={{ fontSize: 13, fontWeight: 1000, color: UI.text }}>Bulk Edit Mode</div>
-
-          <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>
-            {selectedBulkCount} selected
+          <div style={{ display: "flex", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
+            <div style={{ fontSize: 14, fontWeight: 1000, color: UI.text }}>Bulk Edit Mode</div>
+            <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>
+              {selectedBulkCount} selected
+            </div>
+            <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 800 }}>
+              Highlighted shifts stay marked directly on the schedule.
+            </div>
           </div>
 
-          <button
-            type="button"
-            onClick={selectAllVisibleShifts}
-            style={{
-              border: `1px solid ${UI.border}`,
-              background: UI.headerBg,
-              color: UI.text,
-              borderRadius: 10,
-              padding: "6px 10px",
-              fontSize: 12,
-              cursor: "pointer",
-              fontWeight: 900,
-            }}
-          >
-            Select All Visible
-          </button>
-
-          <button
-            type="button"
-            onClick={clearBulkSelection}
-            disabled={!selectedBulkCount}
-            style={{
-              border: `1px solid ${UI.border}`,
-              background: selectedBulkCount ? UI.headerBg : "#f3f4f6",
-              color: selectedBulkCount ? UI.text : "#9ca3af",
-              borderRadius: 10,
-              padding: "6px 10px",
-              fontSize: 12,
-              cursor: selectedBulkCount ? "pointer" : "default",
-              fontWeight: 900,
-            }}
-          >
-            Clear Selection
-          </button>
-        </div>
-
-        <div style={{ display: "grid", gap: 8 }}>
-          <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>
-            Step 1: Choose how to find shifts
-          </div>
-
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
             <button
               type="button"
-              onClick={() => resetBulkSearchUi("caregiver")}
+              onClick={selectAllVisibleShifts}
               style={{
-                border: `1px solid ${bulkSelectionMode === "caregiver" ? "#111827" : UI.border}`,
-                background: bulkSelectionMode === "caregiver" ? "#111827" : UI.headerBg,
-                color: bulkSelectionMode === "caregiver" ? "#fff" : UI.text,
+                border: `1px solid ${UI.border}`,
+                background: UI.headerBg,
+                color: UI.text,
                 borderRadius: 10,
                 padding: "6px 10px",
                 fontSize: 12,
@@ -5267,345 +5872,537 @@ async function handleCaregiverDropToShift(args: {
                 fontWeight: 900,
               }}
             >
-              By Caregiver
+              Select All Visible
             </button>
 
             <button
               type="button"
-              onClick={() => resetBulkSearchUi("client")}
+              onClick={clearBulkSelection}
+              disabled={!selectedBulkCount}
               style={{
-                border: `1px solid ${bulkSelectionMode === "client" ? "#111827" : UI.border}`,
-                background: bulkSelectionMode === "client" ? "#111827" : UI.headerBg,
-                color: bulkSelectionMode === "client" ? "#fff" : UI.text,
+                border: `1px solid ${UI.border}`,
+                background: selectedBulkCount ? UI.headerBg : "#f3f4f6",
+                color: selectedBulkCount ? UI.text : "#9ca3af",
                 borderRadius: 10,
                 padding: "6px 10px",
                 fontSize: 12,
-                cursor: "pointer",
+                cursor: selectedBulkCount ? "pointer" : "default",
                 fontWeight: 900,
               }}
             >
-              By Client
-            </button>
-
-            <button
-              type="button"
-              onClick={() => resetBulkSearchUi("status")}
-              style={{
-                border: `1px solid ${bulkSelectionMode === "status" ? "#111827" : UI.border}`,
-                background: bulkSelectionMode === "status" ? "#111827" : UI.headerBg,
-                color: bulkSelectionMode === "status" ? "#fff" : UI.text,
-                borderRadius: 10,
-                padding: "6px 10px",
-                fontSize: 12,
-                cursor: "pointer",
-                fontWeight: 900,
-              }}
-            >
-              By Status
-            </button>
-
-            <button
-              type="button"
-              onClick={() => resetBulkSearchUi("manual")}
-              style={{
-                border: `1px solid ${bulkSelectionMode === "manual" ? "#111827" : UI.border}`,
-                background: bulkSelectionMode === "manual" ? "#111827" : UI.headerBg,
-                color: bulkSelectionMode === "manual" ? "#fff" : UI.text,
-                borderRadius: 10,
-                padding: "6px 10px",
-                fontSize: 12,
-                cursor: "pointer",
-                fontWeight: 900,
-              }}
-            >
-              Manual Select
+              Clear Selection
             </button>
           </div>
         </div>
 
-        {bulkSelectionMode === "caregiver" ? (
-          <div style={{ display: "grid", gap: 8 }}>
-            <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>
-              Step 2: Choose caregiver
-            </div>
-
-            <div style={{ position: "relative", maxWidth: 320 }}>
-              <input
-                value={bulkSmartCaregiver}
-                onChange={(e) => {
-                  setBulkSmartCaregiver(e.target.value);
-                  setShowCaregiverSuggestions(true);
-                }}
-                onFocus={() => setShowCaregiverSuggestions(true)}
-                placeholder="Search caregiver…"
-                style={{
-                  width: "100%",
-                  border: `1px solid ${UI.border}`,
-                  borderRadius: 10,
-                  padding: "8px 10px",
-                  fontSize: 12,
-                  outline: "none",
-                  background: UI.panelBg,
-                  boxSizing: "border-box",
-                }}
-              />
-
-              {showCaregiverSuggestions && bulkCaregiverSuggestions.length > 0 ? (
-                <div
-                  style={{
-                    position: "absolute",
-                    top: "calc(100% + 4px)",
-                    left: 0,
-                    right: 0,
-                    background: "#fff",
-                    border: `1px solid ${UI.border}`,
-                    borderRadius: 10,
-                    boxShadow: "0 8px 20px rgba(0,0,0,0.12)",
-                    zIndex: 40,
-                    overflow: "hidden",
-                  }}
-                >
-                  {bulkCaregiverSuggestions.map((name) => (
-                    <button
-                      key={name}
-                      type="button"
-                      onClick={() => {
-                        setBulkSmartCaregiver(name);
-                        setShowCaregiverSuggestions(false);
-                        smartSelectByCaregiverAndStatus(name, bulkSmartStatus);
-                      }}
-                      style={{
-                        width: "100%",
-                        textAlign: "left",
-                        border: "none",
-                        background: "#fff",
-                        padding: "9px 10px",
-                        fontSize: 12,
-                        cursor: "pointer",
-                        fontWeight: 800,
-                      }}
-                    >
-                      {name}
-                    </button>
-                  ))}
-                </div>
-              ) : null}
-            </div>
-
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-              <select
-                value={bulkSmartStatus}
-                onChange={(e) => setBulkSmartStatus(e.target.value as BulkSmartStatusFilter)}
-                style={{
-                  border: `1px solid ${UI.border}`,
-                  borderRadius: 10,
-                  padding: "8px 10px",
-                  fontSize: 12,
-                  outline: "none",
-                  background: UI.panelBg,
-                  fontWeight: 800,
-                }}
-              >
-                <option value="Any">Any status</option>
-                <option value="Open">Open</option>
-                <option value="Filled">Filled</option>
-                <option value="Offered">Offered</option>
-                <option value="Considering">Considering</option>
-                <option value="PendingClientApproval">Pending Approval</option>
-              </select>
-
-              <button
-                type="button"
-                onClick={() =>
-                  smartSelectByCaregiverAndStatus(bulkSmartCaregiver, bulkSmartStatus)
-                }
-                style={{
-                  border: `1px solid ${UI.border}`,
-                  background: UI.headerBg,
-                  color: UI.text,
-                  borderRadius: 10,
-                  padding: "8px 10px",
-                  fontSize: 12,
-                  cursor: "pointer",
-                  fontWeight: 900,
-                }}
-              >
-                Select Matching Shifts
-              </button>
-            </div>
-          </div>
-        ) : null}
-
-        {bulkSelectionMode === "client" ? (
-          <div style={{ display: "grid", gap: 8 }}>
-            <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>
-              Step 2: Choose client
-            </div>
-
-            <div style={{ position: "relative", maxWidth: 320 }}>
-              <input
-                value={bulkSmartClient}
-                onChange={(e) => {
-                  setBulkSmartClient(e.target.value);
-                  setShowClientSuggestions(true);
-                }}
-                onFocus={() => setShowClientSuggestions(true)}
-                placeholder="Search client…"
-                style={{
-                  width: "100%",
-                  border: `1px solid ${UI.border}`,
-                  borderRadius: 10,
-                  padding: "8px 10px",
-                  fontSize: 12,
-                  outline: "none",
-                  background: UI.panelBg,
-                  boxSizing: "border-box",
-                }}
-              />
-
-              {showClientSuggestions && bulkClientSuggestions.length > 0 ? (
-                <div
-                  style={{
-                    position: "absolute",
-                    top: "calc(100% + 4px)",
-                    left: 0,
-                    right: 0,
-                    background: "#fff",
-                    border: `1px solid ${UI.border}`,
-                    borderRadius: 10,
-                    boxShadow: "0 8px 20px rgba(0,0,0,0.12)",
-                    zIndex: 40,
-                    overflow: "hidden",
-                  }}
-                >
-                  {bulkClientSuggestions.map((name) => (
-                    <button
-                      key={name}
-                      type="button"
-                      onClick={() => {
-                        setBulkSmartClient(name);
-                        setShowClientSuggestions(false);
-                        smartSelectByClient(name);
-                      }}
-                      style={{
-                        width: "100%",
-                        textAlign: "left",
-                        border: "none",
-                        background: "#fff",
-                        padding: "9px 10px",
-                        fontSize: 12,
-                        cursor: "pointer",
-                        fontWeight: 800,
-                      }}
-                    >
-                      {name}
-                    </button>
-                  ))}
-                </div>
-              ) : null}
-            </div>
-
-            <div>
-              <button
-                type="button"
-                onClick={() => smartSelectByClient(bulkSmartClient)}
-                style={{
-                  border: `1px solid ${UI.border}`,
-                  background: UI.headerBg,
-                  color: UI.text,
-                  borderRadius: 10,
-                  padding: "8px 10px",
-                  fontSize: 12,
-                  cursor: "pointer",
-                  fontWeight: 900,
-                }}
-              >
-                Select Matching Shifts
-              </button>
-            </div>
-          </div>
-        ) : null}
-
-        {bulkSelectionMode === "status" ? (
-          <div style={{ display: "grid", gap: 8 }}>
-            <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>
-              Step 2: Choose status
-            </div>
-
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-              <select
-                value={bulkSmartStatus}
-                onChange={(e) => setBulkSmartStatus(e.target.value as BulkSmartStatusFilter)}
-                style={{
-                  border: `1px solid ${UI.border}`,
-                  borderRadius: 10,
-                  padding: "8px 10px",
-                  fontSize: 12,
-                  outline: "none",
-                  background: UI.panelBg,
-                  fontWeight: 800,
-                }}
-              >
-                <option value="Any">Any status</option>
-                <option value="Open">Open</option>
-                <option value="Filled">Filled</option>
-                <option value="Offered">Offered</option>
-                <option value="Considering">Considering</option>
-                <option value="PendingClientApproval">Pending Approval</option>
-              </select>
-
-              <button
-                type="button"
-                disabled={bulkSmartStatus === "Any"}
-                onClick={() => {
-                  if (bulkSmartStatus !== "Any") {
-                    smartSelectByStatus(bulkSmartStatus);
-                  }
-                }}
-                style={{
-                  border: `1px solid ${UI.border}`,
-                  background: UI.headerBg,
-                  color: bulkSmartStatus === "Any" ? "#9ca3af" : UI.text,
-                  borderRadius: 10,
-                  padding: "8px 10px",
-                  fontSize: 12,
-                  cursor: bulkSmartStatus === "Any" ? "default" : "pointer",
-                  fontWeight: 900,
-                }}
-              >
-                Select Matching Shifts
-              </button>
-            </div>
-          </div>
-        ) : null}
-
-        {bulkSelectionMode === "manual" ? (
-          <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 800 }}>
-            Step 2: Click schedule cells directly to select them.
-          </div>
-        ) : null}
-
-        {selectedBulkCount > 0 ? (
+        <div
+          style={{
+            display: "grid",
+            gap: 12,
+            gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
+            alignItems: "start",
+          }}
+        >
           <div
             style={{
               display: "grid",
               gap: 10,
-              paddingTop: 8,
-              borderTop: `1px solid ${UI.borderSoft}`,
+              padding: 14,
+              border: `1px solid ${UI.borderSoft}`,
+              borderRadius: 14,
+              background: UI.headerBg,
+              minHeight: 220,
             }}
           >
-            <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>
-              Step 3: Choose what to change
+            <div style={{ fontSize: 12, fontWeight: 1000, color: UI.text }}>Step 1</div>
+            <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 900 }}>
+              Choose how you want to find shifts.
             </div>
 
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <div style={{ display: "grid", gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => resetBulkSearchUi("caregiver")}
+                style={{
+                  border: `1px solid ${bulkSelectionMode === "caregiver" ? "#111827" : UI.border}`,
+                  background: bulkSelectionMode === "caregiver" ? "#111827" : "#fff",
+                  color: bulkSelectionMode === "caregiver" ? "#fff" : UI.text,
+                  borderRadius: 12,
+                  padding: "10px 12px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                  fontWeight: 900,
+                  textAlign: "left",
+                }}
+              >
+                By Caregiver
+              </button>
+
+              <button
+                type="button"
+                onClick={() => resetBulkSearchUi("client")}
+                style={{
+                  border: `1px solid ${bulkSelectionMode === "client" ? "#111827" : UI.border}`,
+                  background: bulkSelectionMode === "client" ? "#111827" : "#fff",
+                  color: bulkSelectionMode === "client" ? "#fff" : UI.text,
+                  borderRadius: 12,
+                  padding: "10px 12px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                  fontWeight: 900,
+                  textAlign: "left",
+                }}
+              >
+                By Client
+              </button>
+
+              <button
+                type="button"
+                onClick={() => resetBulkSearchUi("status")}
+                style={{
+                  border: `1px solid ${bulkSelectionMode === "status" ? "#111827" : UI.border}`,
+                  background: bulkSelectionMode === "status" ? "#111827" : "#fff",
+                  color: bulkSelectionMode === "status" ? "#fff" : UI.text,
+                  borderRadius: 12,
+                  padding: "10px 12px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                  fontWeight: 900,
+                  textAlign: "left",
+                }}
+              >
+                By Status
+              </button>
+
+              <button
+                type="button"
+                onClick={() => resetBulkSearchUi("manual")}
+                style={{
+                  border: `1px solid ${bulkSelectionMode === "manual" ? "#111827" : UI.border}`,
+                  background: bulkSelectionMode === "manual" ? "#111827" : "#fff",
+                  color: bulkSelectionMode === "manual" ? "#fff" : UI.text,
+                  borderRadius: 12,
+                  padding: "10px 12px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                  fontWeight: 900,
+                  textAlign: "left",
+                }}
+              >
+                Manual Select
+              </button>
+            </div>
+          </div>
+
+          {bulkStepTwoVisible ? (
+            <div
+              style={{
+                display: "grid",
+                gap: 10,
+                padding: 14,
+                border: `1px solid ${UI.borderSoft}`,
+                borderRadius: 14,
+                background: UI.headerBg,
+                minHeight: 220,
+                animation: "cwBulkStepSlideIn 220ms ease both",
+              }}
+            >
+              <div style={{ fontSize: 12, fontWeight: 1000, color: UI.text }}>Step 2</div>
+              <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 900 }}>
+                {bulkSelectionMode === "manual"
+                  ? "Click the schedule cells you want to include."
+                  : bulkSelectionMode === "caregiver"
+                  ? "Choose a caregiver and optional status filter."
+                  : bulkSelectionMode === "client"
+                  ? "Choose a client to pull matching shifts."
+                  : "Choose which status to target."}
+              </div>
+
+              {bulkSelectionMode === "caregiver" ? (
+                <>
+                  <div style={{ position: "relative" }}>
+                    <input
+                      value={bulkSmartCaregiver}
+                      onChange={(e) => {
+                        setBulkSmartCaregiver(e.target.value);
+                        setBulkStepTwoArmed(false);
+                        setShowCaregiverSuggestions(true);
+                      }}
+                      onFocus={() => setShowCaregiverSuggestions(true)}
+                      placeholder="Search caregiver…"
+                      style={{
+                        width: "100%",
+                        border: `1px solid ${UI.border}`,
+                        borderRadius: 12,
+                        padding: "10px 12px",
+                        fontSize: 12,
+                        outline: "none",
+                        background: UI.panelBg,
+                        boxSizing: "border-box",
+                      }}
+                    />
+
+                        {showCaregiverSuggestions && bulkCaregiverSuggestions.length > 0 ? (
+                      <div
+                        style={{
+                          position: "absolute",
+                          top: "calc(100% + 4px)",
+                          left: 0,
+                          right: 0,
+                          background: "#fff",
+                          border: `1px solid ${UI.border}`,
+                          borderRadius: 12,
+                          boxShadow: "0 8px 20px rgba(0,0,0,0.12)",
+                          zIndex: TOPNAV_Z + 20,
+                          overflow: "hidden",
+                        }}
+                      >
+                        {bulkCaregiverSuggestions.map((name) => (
+                          <button
+                            key={name}
+                            type="button"
+                            onClick={() => {
+                              setBulkSmartCaregiver(name);
+                              setShowCaregiverSuggestions(false);
+                              smartSelectByCaregiverAndStatus(name, bulkSmartStatus);
+                            }}
+                            style={{
+                              width: "100%",
+                              textAlign: "left",
+                              border: "none",
+                              background: "#fff",
+                              padding: "10px 12px",
+                              fontSize: 12,
+                              cursor: "pointer",
+                              fontWeight: 800,
+                            }}
+                          >
+                            {name}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                    <select
+                      value={bulkSmartStatus}
+                      onChange={(e) => {
+                        setBulkSmartStatus(e.target.value as BulkSmartStatusFilter);
+                        setBulkStepTwoArmed(false);
+                      }}
+                      style={{
+                        border: `1px solid ${UI.border}`,
+                        borderRadius: 12,
+                        padding: "10px 12px",
+                        fontSize: 12,
+                        outline: "none",
+                        background: UI.panelBg,
+                        fontWeight: 800,
+                      }}
+                    >
+                      <option value="Any">Any status</option>
+                      <option value="Open">Open</option>
+                      <option value="Filled">Filled</option>
+                      <option value="Offered">Offered</option>
+                      <option value="Considering">Considering</option>
+                      <option value="PendingClientApproval">Pending Approval</option>
+                    </select>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        smartSelectByCaregiverAndStatus(bulkSmartCaregiver, bulkSmartStatus)
+                      }
+                      style={{
+                        border: `1px solid ${UI.border}`,
+                        background: "#fff",
+                        color: UI.text,
+                        borderRadius: 12,
+                        padding: "10px 12px",
+                        fontSize: 12,
+                        cursor: "pointer",
+                        fontWeight: 900,
+                      }}
+                    >
+                      Select Matching Shifts
+                    </button>
+                  </div>
+                </>
+              ) : null}
+
+              {bulkSelectionMode === "client" ? (
+                <>
+                  <div style={{ position: "relative" }}>
+                    <input
+                      value={bulkSmartClient}
+                      onChange={(e) => {
+                        setBulkSmartClient(e.target.value);
+                        setBulkStepTwoArmed(false);
+                        setShowClientSuggestions(true);
+                      }}
+                      onFocus={() => setShowClientSuggestions(true)}
+                      placeholder="Search client…"
+                      style={{
+                        width: "100%",
+                        border: `1px solid ${UI.border}`,
+                        borderRadius: 12,
+                        padding: "10px 12px",
+                        fontSize: 12,
+                        outline: "none",
+                        background: UI.panelBg,
+                        boxSizing: "border-box",
+                      }}
+                    />
+
+                    {showClientSuggestions && bulkClientSuggestions.length > 0 ? (
+                      <div
+                        style={{
+                          position: "absolute",
+                          top: "calc(100% + 4px)",
+                          left: 0,
+                          right: 0,
+                          background: "#fff",
+                          border: `1px solid ${UI.border}`,
+                          borderRadius: 12,
+                          boxShadow: "0 8px 20px rgba(0,0,0,0.12)",
+                          zIndex: TOPNAV_Z + 20,
+                          overflow: "hidden",
+                        }}
+                      >
+                        {bulkClientSuggestions.map((name) => (
+                          <button
+                            key={name}
+                            type="button"
+                            onClick={() => {
+                              setBulkSmartClient(name);
+                              setShowClientSuggestions(false);
+                              smartSelectByClient(name);
+                            }}
+                            style={{
+                              width: "100%",
+                              textAlign: "left",
+                              border: "none",
+                              background: "#fff",
+                              padding: "10px 12px",
+                              fontSize: 12,
+                              cursor: "pointer",
+                              fontWeight: 800,
+                            }}
+                          >
+                            {name}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => smartSelectByClient(bulkSmartClient)}
+                    style={{
+                      border: `1px solid ${UI.border}`,
+                      background: "#fff",
+                      color: UI.text,
+                      borderRadius: 12,
+                      padding: "10px 12px",
+                      fontSize: 12,
+                      cursor: "pointer",
+                      fontWeight: 900,
+                      justifySelf: "start",
+                    }}
+                  >
+                    Select Matching Shifts
+                  </button>
+                </>
+              ) : null}
+
+              {bulkSelectionMode === "status" ? (
+                <div style={{ display: "grid", gap: 8 }}>
+                  <select
+                      value={bulkSmartStatus}
+                      onChange={(e) => {
+                        setBulkSmartStatus(e.target.value as BulkSmartStatusFilter);
+                        setBulkStepTwoArmed(false);
+                      }}
+                    style={{
+                      border: `1px solid ${UI.border}`,
+                      borderRadius: 12,
+                      padding: "10px 12px",
+                      fontSize: 12,
+                      outline: "none",
+                      background: UI.panelBg,
+                      fontWeight: 800,
+                    }}
+                  >
+                    <option value="Any">Any status</option>
+                    <option value="Open">Open</option>
+                    <option value="Filled">Filled</option>
+                    <option value="Offered">Offered</option>
+                    <option value="Considering">Considering</option>
+                    <option value="PendingClientApproval">Pending Approval</option>
+                  </select>
+
+                  <button
+                    type="button"
+                    disabled={bulkSmartStatus === "Any"}
+                    onClick={() => {
+                      if (bulkSmartStatus !== "Any") smartSelectByStatus(bulkSmartStatus);
+                    }}
+                    style={{
+                      border: `1px solid ${UI.border}`,
+                      background: "#fff",
+                      color: bulkSmartStatus === "Any" ? "#9ca3af" : UI.text,
+                      borderRadius: 12,
+                      padding: "10px 12px",
+                      fontSize: 12,
+                      cursor: bulkSmartStatus === "Any" ? "default" : "pointer",
+                      fontWeight: 900,
+                      justifySelf: "start",
+                    }}
+                  >
+                    Select Matching Shifts
+                  </button>
+                </div>
+              ) : null}
+
+              {bulkSelectionMode === "manual" ? (
+                <div
+                  style={{
+                    padding: 12,
+                    borderRadius: 12,
+                    border: `1px dashed ${UI.border}`,
+                    background: "#fff",
+                    fontSize: 12,
+                    color: UI.textDim,
+                    fontWeight: 800,
+                  }}
+                >
+                  Click any schedule cell to add or remove it from the bulk selection. Selected cells stay highlighted in gold on the schedule.
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {bulkStepThreeVisible ? (
+            <div
+              style={{
+                display: "grid",
+                gap: 10,
+                padding: 14,
+                border: `1px solid ${UI.borderSoft}`,
+                borderRadius: 14,
+                background: UI.headerBg,
+                minHeight: 220,
+                animation: "cwBulkStepSlideIn 240ms ease both",
+              }}
+            >
+              <div style={{ fontSize: 12, fontWeight: 1000, color: UI.text }}>Step 3</div>
+              <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 900 }}>
+                Review all visible shifts here. Click any item to include or exclude it from the bulk update.
+              </div>
+
+              <div
+                style={{
+                  display: "grid",
+                  gap: 8,
+                  maxHeight: 310,
+                  overflow: "auto",
+                  paddingRight: 4,
+                }}
+              >
+                {bulkShiftList.length ? (
+                  bulkShiftList.map((cell) => {
+                    const tone = bulkStatusTone(cell.status);
+                    return (
+                      <button
+                        key={cell.a1}
+                        type="button"
+                        onClick={() =>
+                          toggleBulkCellSelection({
+                            a1: cell.a1,
+                            week: cell.week,
+                            clientName: cell.clientName,
+                            dateStr: cell.dateStr,
+                            dayLabel: cell.dayLabel,
+                            originalValue: cell.originalValue,
+                          })
+                        }
+                        style={{
+                          display: "grid",
+                          gap: 5,
+                          textAlign: "left",
+                          border: `2px solid ${cell.selected ? "#f59e0b" : tone.border}`,
+                          background: tone.bg,
+                          borderRadius: 12,
+                          padding: "10px 12px",
+                          cursor: "pointer",
+                          boxShadow: cell.selected ? "inset 0 0 0 2px rgba(245,158,11,0.25)" : "none",
+                        }}
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+                          <div style={{ fontSize: 12, fontWeight: 1000, color: UI.text }}>{cell.clientName}</div>
+                          <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 900 }}>
+                            {cell.dayLabel} • {cell.dateStr}
+                          </div>
+                        </div>
+                        <div style={{ fontSize: 12, color: tone.text, fontWeight: 900 }}>
+                          {cell.status === "Unknown" ? "Unknown" : cell.status}
+                        </div>
+                        <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 800 }}>
+                          {cell.caregiverName}
+                          {cell.startTime && cell.endTime ? ` • ${cell.startTime}-${cell.endTime}` : ""}
+                        </div>
+                        <div style={{ fontSize: 11, color: cell.selected ? "#92400e" : UI.textDim, fontWeight: 900 }}>
+                          {cell.selected ? "Selected for bulk update" : "Click to include"}
+                        </div>
+                      </button>
+                    );
+                  })
+                ) : (
+                  <div
+                    style={{
+                      padding: 12,
+                      borderRadius: 12,
+                      border: `1px dashed ${UI.border}`,
+                      background: "#fff",
+                      fontSize: 12,
+                      color: UI.textDim,
+                      fontWeight: 800,
+                    }}
+                  >
+                    No visible shifts match the current schedule view.
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : null}
+
+          {bulkStepThreeVisible ? (
+            <div
+              style={{
+                display: "grid",
+                gap: 10,
+                padding: 14,
+                border: `1px solid ${UI.borderSoft}`,
+                borderRadius: 14,
+                background: UI.headerBg,
+                minHeight: 220,
+                animation: "cwBulkStepSlideIn 260ms ease both",
+              }}
+            >
+              <div style={{ fontSize: 12, fontWeight: 1000, color: UI.text }}>Step 4</div>
+              <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 900 }}>
+                Choose the new status for every selected shift.
+              </div>
+
               <select
                 value={bulkCancelledTarget}
                 onChange={(e) => setBulkCancelledTarget(e.target.value as any)}
                 style={{
                   border: `1px solid ${UI.border}`,
-                  borderRadius: 10,
-                  padding: "8px 10px",
+                  borderRadius: 12,
+                  padding: "10px 12px",
                   fontSize: 12,
                   outline: "none",
                   background: UI.panelBg,
@@ -5617,144 +6414,187 @@ async function handleCaregiverDropToShift(args: {
                 <option value="cancelled">Make cancelled</option>
                 <option value="not_cancelled">Remove cancelled</option>
               </select>
+
+              <div style={{ display: "grid", gap: 8 }}>
+                <button
+                  type="button"
+                  onClick={() =>
+                    applyBulkStatusChange({
+                      targetBaseStatus: "Considering",
+                      targetCancelled:
+                        bulkCancelledTarget === "keep"
+                          ? "keep"
+                          : bulkCancelledTarget === "cancelled",
+                    })
+                  }
+                  disabled={bulkApplying}
+                  style={{
+                    border: `1px solid ${UI.border}`,
+                    background: "#fff7ed",
+                    color: "#9a3412",
+                    borderRadius: 12,
+                    padding: "10px 12px",
+                    fontSize: 12,
+                    cursor: bulkApplying ? "default" : "pointer",
+                    fontWeight: 900,
+                    textAlign: "left",
+                  }}
+                >
+                  Change to Considering
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    applyBulkStatusChange({
+                      targetBaseStatus: "Offered",
+                      targetCancelled:
+                        bulkCancelledTarget === "keep"
+                          ? "keep"
+                          : bulkCancelledTarget === "cancelled",
+                    })
+                  }
+                  disabled={bulkApplying}
+                  style={{
+                    border: `1px solid ${UI.border}`,
+                    background: "#eff6ff",
+                    color: "#1d4ed8",
+                    borderRadius: 12,
+                    padding: "10px 12px",
+                    fontSize: 12,
+                    cursor: bulkApplying ? "default" : "pointer",
+                    fontWeight: 900,
+                    textAlign: "left",
+                  }}
+                >
+                  Change to Offered
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    applyBulkStatusChange({
+                      targetBaseStatus: "Filled",
+                      targetCancelled:
+                        bulkCancelledTarget === "keep"
+                          ? "keep"
+                          : bulkCancelledTarget === "cancelled",
+                    })
+                  }
+                  disabled={bulkApplying}
+                  style={{
+                    border: `1px solid ${UI.border}`,
+                    background: "#ecfdf5",
+                    color: "#166534",
+                    borderRadius: 12,
+                    padding: "10px 12px",
+                    fontSize: 12,
+                    cursor: bulkApplying ? "default" : "pointer",
+                    fontWeight: 900,
+                    textAlign: "left",
+                  }}
+                >
+                  Change to Filled
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    applyBulkStatusChange({
+                      targetBaseStatus: "PendingClientApproval",
+                      targetCancelled:
+                        bulkCancelledTarget === "keep"
+                          ? "keep"
+                          : bulkCancelledTarget === "cancelled",
+                    })
+                  }
+                  disabled={bulkApplying}
+                  style={{
+                    border: `1px solid ${UI.border}`,
+                    background: "#faf5ff",
+                    color: "#7e22ce",
+                    borderRadius: 12,
+                    padding: "10px 12px",
+                    fontSize: 12,
+                    cursor: bulkApplying ? "default" : "pointer",
+                    fontWeight: 900,
+                    textAlign: "left",
+                  }}
+                >
+                  Change to Pending Approval
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    applyBulkStatusChange({
+                      targetBaseStatus: "Open",
+                      targetCancelled:
+                        bulkCancelledTarget === "keep"
+                          ? "keep"
+                          : bulkCancelledTarget === "cancelled",
+                    })
+                  }
+                  disabled={bulkApplying}
+                  style={{
+                    border: `1px solid ${UI.border}`,
+                    background: "#fef2f2",
+                    color: "#b91c1c",
+                    borderRadius: 12,
+                    padding: "10px 12px",
+                    fontSize: 12,
+                    cursor: bulkApplying ? "default" : "pointer",
+                    fontWeight: 900,
+                    textAlign: "left",
+                  }}
+                >
+                  Change to Open
+                </button>
+              </div>
+
+              <div
+                style={{
+                  display: "grid",
+                  gap: 6,
+                  paddingTop: 6,
+                  borderTop: `1px solid ${UI.borderSoft}`,
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={openBulkOfferMessage}
+                  disabled={!bulkMessageTarget.caregiverId}
+                  style={{
+                    border: `1px solid ${bulkMessageTarget.caregiverId ? "#2563eb" : UI.border}`,
+                    background: bulkMessageTarget.caregiverId ? "#eff6ff" : "#f3f4f6",
+                    color: bulkMessageTarget.caregiverId ? "#1d4ed8" : "#9ca3af",
+                    borderRadius: 12,
+                    padding: "10px 12px",
+                    fontSize: 12,
+                    cursor: bulkMessageTarget.caregiverId ? "pointer" : "default",
+                    fontWeight: 900,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 8,
+                    justifyContent: "center",
+                  }}
+                  title="Open Messages and paste the selected shifts into the caregiver conversation"
+                >
+                  <MessageBubbleIcon size={16} />
+                  Open Message Draft
+                </button>
+                <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>
+                  {bulkMessageTarget.caregiverId
+                    ? `Opens Messages for ${bulkMessageTarget.caregiverName} and pastes the draft only. It does not send automatically.`
+                    : bulkMessageTarget.reason}
+                </div>
+              </div>
             </div>
-
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-              <button
-                type="button"
-                onClick={() =>
-                  applyBulkStatusChange({
-                    targetBaseStatus: "Considering",
-                    targetCancelled:
-                      bulkCancelledTarget === "keep"
-                        ? "keep"
-                        : bulkCancelledTarget === "cancelled",
-                  })
-                }
-                disabled={bulkApplying}
-                style={{
-                  border: `1px solid ${UI.border}`,
-                  background: "#fff7ed",
-                  color: "#9a3412",
-                  borderRadius: 10,
-                  padding: "6px 10px",
-                  fontSize: 12,
-                  cursor: bulkApplying ? "default" : "pointer",
-                  fontWeight: 900,
-                }}
-              >
-                Change to Considering
-              </button>
-
-              <button
-                type="button"
-                onClick={() =>
-                  applyBulkStatusChange({
-                    targetBaseStatus: "Offered",
-                    targetCancelled:
-                      bulkCancelledTarget === "keep"
-                        ? "keep"
-                        : bulkCancelledTarget === "cancelled",
-                  })
-                }
-                disabled={bulkApplying}
-                style={{
-                  border: `1px solid ${UI.border}`,
-                  background: "#eff6ff",
-                  color: "#1d4ed8",
-                  borderRadius: 10,
-                  padding: "6px 10px",
-                  fontSize: 12,
-                  cursor: bulkApplying ? "default" : "pointer",
-                  fontWeight: 900,
-                }}
-              >
-                Change to Offered
-              </button>
-
-              <button
-                type="button"
-                onClick={() =>
-                  applyBulkStatusChange({
-                    targetBaseStatus: "Filled",
-                    targetCancelled:
-                      bulkCancelledTarget === "keep"
-                        ? "keep"
-                        : bulkCancelledTarget === "cancelled",
-                  })
-                }
-                disabled={bulkApplying}
-                style={{
-                  border: `1px solid ${UI.border}`,
-                  background: "#ecfdf5",
-                  color: "#166534",
-                  borderRadius: 10,
-                  padding: "6px 10px",
-                  fontSize: 12,
-                  cursor: bulkApplying ? "default" : "pointer",
-                  fontWeight: 900,
-                }}
-              >
-                Change to Filled
-              </button>
-
-              <button
-                type="button"
-                onClick={() =>
-                  applyBulkStatusChange({
-                    targetBaseStatus: "PendingClientApproval",
-                    targetCancelled:
-                      bulkCancelledTarget === "keep"
-                        ? "keep"
-                        : bulkCancelledTarget === "cancelled",
-                  })
-                }
-                disabled={bulkApplying}
-                style={{
-                  border: `1px solid ${UI.border}`,
-                  background: "#faf5ff",
-                  color: "#7e22ce",
-                  borderRadius: 10,
-                  padding: "6px 10px",
-                  fontSize: 12,
-                  cursor: bulkApplying ? "default" : "pointer",
-                  fontWeight: 900,
-                }}
-              >
-                Change to Pending Approval
-              </button>
-
-              <button
-                type="button"
-                onClick={() =>
-                  applyBulkStatusChange({
-                    targetBaseStatus: "Open",
-                    targetCancelled:
-                      bulkCancelledTarget === "keep"
-                        ? "keep"
-                        : bulkCancelledTarget === "cancelled",
-                  })
-                }
-                disabled={bulkApplying}
-                style={{
-                  border: `1px solid ${UI.border}`,
-                  background: "#fef2f2",
-                  color: "#b91c1c",
-                  borderRadius: 10,
-                  padding: "6px 10px",
-                  fontSize: 12,
-                  cursor: bulkApplying ? "default" : "pointer",
-                  fontWeight: 900,
-                }}
-              >
-                Change to Open
-              </button>
-            </div>
-          </div>
-        ) : null}
+          ) : null}
+        </div>
 
         <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>
-          Bulk mode now works in steps: choose a filter, select shifts, then choose the change.
+          Bulk mode now reveals each next step after the previous choice is made: pick a selection method, build the selection, review the shifts, then apply the change.
         </div>
       </div>
     ) : null}
@@ -6335,7 +7175,7 @@ async function handleCaregiverDropToShift(args: {
   })()}
 </Modal>
 
-   <Modal
+   <FloatingPanel
   open={Boolean(editHistoryModalTarget)}
   title={
     editHistoryModalTarget
@@ -6348,9 +7188,14 @@ async function handleCaregiverDropToShift(args: {
     setShiftRateReason("");
     setShiftRateCustomReason("");
   }}
+  storageKey="cwwebschedule:edit-history-rate"
+  initial={{ w: 820, h: 720, x: 120, y: 80 }}
+  minW={560}
+  minH={420}
+  zIndex={10020}
 >
   {editHistoryModalTarget ? (
-    <div style={{ display: "grid", gap: 10 }}>
+    <div style={{ display: "grid", gap: 10, padding: 12 }}>
       <div
         style={{
           border: `1px solid ${UI.borderSoft}`,
@@ -6768,7 +7613,7 @@ async function handleCaregiverDropToShift(args: {
       )}
     </div>
   ) : null}
-</Modal>
+</FloatingPanel>
 
     <OnboardingPanel open={onboardingOpen} onClose={() => setOnboardingOpen(false)} />
 
@@ -6787,11 +7632,135 @@ async function handleCaregiverDropToShift(args: {
                 border: `1px solid ${UI.border}`,
                 borderRadius: 12,
                 background: UI.panelBg,
-                overflow: "hidden",
+                overflow: "visible",
                 position: "relative",
               }}
             >
               <div
+                ref={headerScrollRef}
+                onScroll={() => syncHorizontalScroll("header")}
+                style={{
+                  position: "sticky",
+                  top: 0,
+                  zIndex: STICKY_DAY_Z + 20,
+                  overflowX: "auto",
+                  overflowY: "hidden",
+                  WebkitOverflowScrolling: "touch",
+                  background: UI.headerBg,
+                  isolation: "isolate",
+                  boxShadow: `0 1px 0 ${UI.border}`,
+                }}
+              >
+                <table
+                  style={{
+                    width: "100%",
+                    minWidth: tableMinWidth,
+                    borderCollapse: "separate",
+                    borderSpacing: 0,
+                    tableLayout: "fixed",
+                  }}
+                >
+                  <thead>
+                    <tr>
+                      <th
+                        style={{
+                          position: "sticky",
+                          left: 0,
+                          zIndex: STICKY_DAY_Z + 25,
+                          background: UI.headerBg,
+                          backgroundClip: "padding-box",
+                          boxShadow: `0 1px 0 ${UI.border}`,
+                          textAlign: "left",
+                          padding: "10px 12px",
+                          borderBottom: `1px solid ${UI.border}`,
+                          width: CLIENT_COL_WIDTH,
+                          maxWidth: CLIENT_COL_WIDTH,
+                          fontSize: 13,
+                          borderRight: `1px solid ${UI.borderSoft}`,
+                          height: STICKY_DAY_ROW_HEIGHT,
+                        }}
+                      >
+                        {dayHeaders?.[0] || "Client Name"}
+                      </th>
+
+                      {visibleDows.map((dow) => (
+                        <th
+                          key={`sticky_day_${dow}`}
+                          style={{
+                            background: UI.headerBg,
+                            backgroundClip: "padding-box",
+                            boxShadow: `0 1px 0 ${UI.border}`,
+                            textAlign: "left",
+                            padding: "10px 10px",
+                            borderBottom: `1px solid ${UI.border}`,
+                            fontSize: 13,
+                            borderRight:
+                              dow === visibleDows[visibleDows.length - 1]
+                                ? "none"
+                                : `1px solid ${UI.borderSoft}`,
+                            height: STICKY_DAY_ROW_HEIGHT,
+                          }}
+                        >
+                          <div style={{ fontWeight: 700 }}>
+                            {dayHeaders?.[dow + 1] || DOW_LABELS[dow]}
+                          </div>
+                        </th>
+                      ))}
+                    </tr>
+
+                    <tr>
+                      <th
+                        style={{
+                          position: "sticky",
+                          left: 0,
+                          zIndex: STICKY_DATE_Z + 25,
+                          background: UI.headerBg,
+                          backgroundClip: "padding-box",
+                          boxShadow: `0 1px 0 ${UI.border}`,
+                          textAlign: "left",
+                          padding: "8px 12px",
+                          borderBottom: `1px solid ${UI.border}`,
+                          width: CLIENT_COL_WIDTH,
+                          maxWidth: CLIENT_COL_WIDTH,
+                          fontSize: 12,
+                          color: UI.textDim,
+                          borderRight: `1px solid ${UI.borderSoft}`,
+                          height: STICKY_DATE_ROW_HEIGHT,
+                        }}
+                      >
+                        {dateHeaders?.[0] || "Date"}
+                      </th>
+
+                      {visibleDows.map((dow) => (
+                        <th
+                          key={`sticky_date_${dow}`}
+                          style={{
+                            background: UI.headerBg,
+                            backgroundClip: "padding-box",
+                            boxShadow: `0 1px 0 ${UI.border}`,
+                            textAlign: "left",
+                            padding: "8px 10px",
+                            borderBottom: `1px solid ${UI.border}`,
+                            fontSize: 12,
+                            color: UI.textDim,
+                            borderRight:
+                              dow === visibleDows[visibleDows.length - 1]
+                                ? "none"
+                                : `1px solid ${UI.borderSoft}`,
+                            height: STICKY_DATE_ROW_HEIGHT,
+                          }}
+                        >
+                          {dateHeaders?.[dow + 1] || ""}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                </table>
+              </div>
+
+              <div
+                ref={bodyScrollRef}
+                onScroll={() => syncHorizontalScroll("body")}
                 style={{
                   overflowX: "auto",
                   overflowY: "visible",
@@ -6800,17 +7769,24 @@ async function handleCaregiverDropToShift(args: {
                   background: UI.panelBg,
                 }}
               >
+
                 <table
                   style={{
                     width: "100%",
-                    minWidth: selectedDow == null ? 1200 : 680,
+                    minWidth: tableMinWidth,
                     borderCollapse: "separate",
                     borderSpacing: 0,
                     tableLayout: "fixed",
                   }}
                 >
-                  <thead>
-                    <tr>
+                  <thead style={{ display: "none" }}>
+                    <tr
+                      style={{
+                        position: "sticky",
+                        top: STICKY_DAY_ROW_TOP,
+                        zIndex: STICKY_DAY_Z,
+                      }}
+                    >
                       <th
                         style={{
                           position: "sticky",
@@ -6861,7 +7837,13 @@ async function handleCaregiverDropToShift(args: {
                       ))}
                     </tr>
 
-                    <tr>
+                    <tr
+                      style={{
+                        position: "sticky",
+                        top: STICKY_DATE_ROW_TOP,
+                        zIndex: STICKY_DATE_Z,
+                      }}
+                    >
                       <th
                         style={{
                           position: "sticky",

@@ -18,6 +18,17 @@ export type ShiftStatus =
 
 type WeekKind = "cw" | "nw";
 
+type PopupShiftTarget = {
+  shiftId: string;
+  dateStr: string;
+  clientName: string;
+  caregiverName: string;
+  caregiverId?: string;
+  startTime: string;
+  endTime: string;
+  status: ShiftStatus;
+};
+
 export type EditHistoryOpenPayload = {
   shiftId: string;
   a1Key: string;
@@ -384,21 +395,25 @@ const CARD_EXPANDED_MIN_HEIGHT = 84;
 const EMPTY_CELL_HEIGHT = 20;
 
 /** ---------- Small UI bits ---------- */
-function Pill({ children }: { children: React.ReactNode }) {
+function Pill({ children, clearMode = false }: { children: React.ReactNode; clearMode?: boolean }) {
   return (
     <span
       style={{
         display: "inline-flex",
         alignItems: "center",
-        border: "1px solid rgba(17,24,39,0.12)",
+        border: clearMode
+          ? "1px solid rgba(255,255,255,0.16)"
+          : "1px solid rgba(17,24,39,0.12)",
         borderRadius: 999,
         padding: "4px 10px",
         fontSize: 12,
         fontWeight: 900,
         color: "#111827",
-        background: "rgba(255,255,255,0.85)",
+        background: clearMode ? "rgba(255,255,255,0.03)" : "rgba(255,255,255,0.85)",
         lineHeight: 1.1,
         whiteSpace: "nowrap",
+        backdropFilter: clearMode ? "blur(4px)" : "none",
+        WebkitBackdropFilter: clearMode ? "blur(4px)" : "none",
       }}
     >
       {children}
@@ -1307,14 +1322,14 @@ function formatFriendlyDate(raw: string): string {
 /** ---------- Component ---------- */
 export default function ShiftCard({
   a1Key,
-  value,
-  status,
+  value: rawValue,
+  status: rawStatus,
   disabled,
   onRequestEdit,
   expanded,
   onToggleExpanded,
-  dateStrForDow,
-  clientName,
+  dateStrForDow: rawDateStrForDow,
+  clientName: rawClientName,
   shiftInfo,
   rowIsEmpty,
   cellBg,
@@ -1339,6 +1354,11 @@ onOpenEditHistory,
   driveTimeEndpoint = "/api/drive-time",
 
   clientDescription = "",
+  popupOnly = false,
+  popupTarget = null,
+  onPopupOnlyClose,
+  panelStorageKey,
+  panelInitial,
 }: {
   a1Key: string;
   value: string;
@@ -1377,7 +1397,20 @@ onOpenEditHistory,
   driveTimeEndpoint?: string;
 
   clientDescription?: string;
+  popupOnly?: boolean;
+  popupTarget?: PopupShiftTarget | null;
+  onPopupOnlyClose?: () => void;
+  panelStorageKey?: string;
+  panelInitial?: Partial<{ x: number; y: number; w: number; h: number }>;
 }) {
+const value =
+  popupOnly && popupTarget
+    ? `${popupTarget.caregiverName || "Open"}, ${popupTarget.startTime}-${popupTarget.endTime}`
+    : rawValue;
+const status = popupOnly && popupTarget ? popupTarget.status : rawStatus;
+const dateStrForDow = popupOnly && popupTarget ? popupTarget.dateStr : rawDateStrForDow;
+const clientName = popupOnly && popupTarget ? popupTarget.clientName : rawClientName;
+
    const isRequested = status === "requested";
 
 const v = norm(value);
@@ -1526,11 +1559,52 @@ const showHistoryIcon =
   const showClockRow = expanded && !isEmpty && !isCancelled && tState !== "future" && tState !== "unknown";
   const showCombinedNoClock = !isEmpty && !isCancelled && tState === "past" && !clockEval.clockIn && !clockEval.clockOut;
 
-  /** ---------- Shift Menu (FloatingPanel) state ---------- */
- const [menuOpen, setMenuOpen] = useState(false);
+ /** ---------- Shift Menu (FloatingPanel) state ---------- */
+const [menuOpen, setMenuOpen] = useState(Boolean(popupOnly));
+const [popupWindows, setPopupWindows] = useState<
+  Array<{ id: string; target: PopupShiftTarget; initial?: Partial<{ x: number; y: number; w: number; h: number }> }>
+>([]);
 const [showDesc, setShowDesc] = useState(false);
 const [clearMode, setClearMode] = useState(false);
+const currentPanelStorageKey = panelStorageKey ?? `shift-menu:${week}:${a1Key}`;
 
+const isGlass = clearMode;
+
+const popupShellBg = isGlass
+  ? "rgba(255,255,255,0.01)"
+  : "#f8fbff";
+
+const popupSectionBg = isGlass
+  ? "rgba(255,255,255,0.02)"
+  : "rgba(255,255,255,0.92)";
+
+const popupSoftBg = isGlass
+  ? "rgba(255,255,255,0.03)"
+  : "rgba(255,255,255,0.62)";
+
+const popupButtonBg = isGlass
+  ? "rgba(255,255,255,0.035)"
+  : "rgba(255,255,255,0.82)";
+
+const popupCardBg = isGlass
+  ? "rgba(255,255,255,0.035)"
+  : "#ffffff";
+
+const popupBorder = isGlass
+  ? "1px solid rgba(255,255,255,0.14)"
+  : "1px solid rgba(15,23,42,0.10)";
+
+const popupStrongBorder = isGlass
+  ? "1px solid rgba(255,255,255,0.18)"
+  : "1px solid rgba(17,24,39,0.10)";
+
+const popupShadow = isGlass
+  ? "0 8px 24px rgba(15,23,42,0.08)"
+  : "0 6px 18px rgba(15,23,42,0.06)";
+
+// Reduced blur for better visibility through the panel
+const popupBlur = isGlass ? "blur(.01px)" : "none";
+const popupLightBlur = isGlass ? "none" : "none";
   // Client history
   const [histLoading, setHistLoading] = useState(false);
   const [histError, setHistError] = useState<string>("");
@@ -1896,39 +1970,93 @@ clientHistoryCache.set(key, { ts: Date.now(), data: cleaned });
   }
 
   function openShiftMenu() {
-    if (!canOpenShiftMenu) return;
-    setMenuOpen(true);
+  if (!canOpenShiftMenu) return;
+  setMenuOpen(true);
+}
+function readPanelRect(storageKey: string) {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    return {
+      x: Number(parsed.x) || undefined,
+      y: Number(parsed.y) || undefined,
+      w: Number(parsed.w) || undefined,
+      h: Number(parsed.h) || undefined,
+    };
+  } catch {
+    return null;
   }
+}
+function openNestedShiftMenu(target: PopupShiftTarget) {
+  if (!norm(target.startTime) || !norm(target.endTime)) return;
+
+  const baseRect = readPanelRect(currentPanelStorageKey);
+  const baseX = baseRect?.x ?? 40;
+  const baseY = baseRect?.y ?? 40;
+  const baseW = baseRect?.w ?? 720;
+  const baseH = baseRect?.h ?? 520;
+  const vw = typeof window !== "undefined" ? window.innerWidth : 1440;
+  const childX = Math.min(baseX + baseW + 20, Math.max(12, vw - baseW - 12));
+
+  const normalizedTarget: PopupShiftTarget = {
+    shiftId: norm(target.shiftId),
+    dateStr: norm(target.dateStr),
+    clientName: norm(target.clientName),
+    caregiverName: norm(target.caregiverName),
+    caregiverId: norm(target.caregiverId) || undefined,
+    startTime: norm(target.startTime),
+    endTime: norm(target.endTime),
+    status: target.status,
+  };
+
+  setPopupWindows((prev) => [
+    ...prev,
+    {
+      id: `${Date.now()}-${prev.length + 1}-${normalizedTarget.shiftId || normalizedTarget.clientName}`,
+      target: normalizedTarget,
+      initial: { x: childX, y: baseY, w: baseW, h: baseH },
+    },
+  ]);
+}
 
   // Load menu data when menu opens
   useEffect(() => {
-    if (!menuOpen) return;
+  if (!menuOpen) {
+    if (popupOnly) onPopupOnlyClose?.();
+    return;
+  }
 
-    setCaregiverSearch("");
-    setShowDesc(false);
-    setSortMode("smart");
+  setCaregiverSearch("");
+  setShowDesc(false);
+  setSortMode("smart");
 
-    loadClientHistory();
-    loadWeekSchedule();
-    loadAvailability();
-    loadCaregivers();
-    loadClients();
+  loadClientHistory();
+  loadWeekSchedule();
+  loadAvailability();
+  loadCaregivers();
+  loadClients();
 
-    setDriveError("");
-    setDriveLoading(false);
-    setDriveByCaregiverKey({});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [menuOpen]);
+  setDriveError("");
+  setDriveLoading(false);
+  setDriveByCaregiverKey({});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [menuOpen, popupOnly, onPopupOnlyClose, clientName]);
 
-  // ESC closes panel
-  useEffect(() => {
-    if (!menuOpen) return;
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") setMenuOpen(false);
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [menuOpen]);
+  // ESC closes this panel
+useEffect(() => {
+  if (!menuOpen) return;
+
+  function onKey(e: KeyboardEvent) {
+    if (e.key !== "Escape") return;
+    setMenuOpen(false);
+  }
+
+  window.addEventListener("keydown", onKey);
+  return () => window.removeEventListener("keydown", onKey);
+}, [menuOpen]);
 
   /** ---------- Click / dblclick ---------- */
   const clickTimerRef = useRef<number | null>(null);
@@ -2546,7 +2674,7 @@ const total =
   const initialMenuLoading = menuOpen && (weekSchedLoading || availLoading || cgLoading || clientsLoading);
 
   /** ---------- Render ---------- */
- function onKeyDownCard(e: React.KeyboardEvent) {
+function onKeyDownCard(e: React.KeyboardEvent) {
   if (disabled) return;
   if (e.key === "Enter") {
     e.preventDefault();
@@ -2560,6 +2688,7 @@ const total =
 
 return (
     <>
+     {!popupOnly ? (
      <div
   role="button"
   tabIndex={disabled ? -1 : 0}
@@ -2805,18 +2934,145 @@ return (
           )}
               </div>
       </div>
+      ) : null}
 
       {/* ---------- SHIFT MENU (FloatingPanel) ---------- */}
 <FloatingPanel
   open={menuOpen}
-  onClose={() => setMenuOpen(false)}
+  onClose={() => {
+    setMenuOpen(false);
+    if (popupOnly) onPopupOnlyClose?.();
+  }}
   title={
-    shiftSummary
-      ? `Shift Info • ${clientName} • ${shiftSummary.start}-${shiftSummary.end} • ${shiftSummary.caregiver || "Open"}`
-      : `Shift Info • ${clientName}`
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: 10,
+        width: "100%",
+        minWidth: 0,
+      }}
+    >
+      <div
+        style={{
+          minWidth: 0,
+          flex: "1 1 auto",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          fontWeight: 950,
+          color: "#111827",
+        }}
+        title={
+          shiftSummary
+            ? `Shift Info • ${clientName} • ${shiftSummary.start}-${shiftSummary.end} • ${shiftSummary.caregiver || "Open"}`
+            : `Shift Info • ${clientName}`
+        }
+      >
+        {shiftSummary
+          ? `Shift Info • ${clientName} • ${shiftSummary.start}-${shiftSummary.end} • ${shiftSummary.caregiver || "Open"}`
+          : `Shift Info • ${clientName}`}
+      </div>
+
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          flex: "0 0 auto",
+          paddingRight: 6,
+        }}
+      >
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+          }}
+          style={{
+            border: isGlass
+              ? "1px solid rgba(255,255,255,0.32)"
+              : "1px solid rgba(15,23,42,0.16)",
+            background: popupButtonBg,
+            borderRadius: 999,
+            padding: "7px 11px",
+            fontWeight: 950,
+            cursor: "default",
+            color: "#0b1220",
+            fontSize: 12,
+            whiteSpace: "nowrap",
+            opacity: 0.45,
+            backdropFilter: popupLightBlur,
+            WebkitBackdropFilter: popupLightBlur,
+            boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.18)" : "none",
+          }}
+          title="This popup stays on its original shift"
+          disabled={true}
+        >
+          Original
+        </button>
+
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setClearMode((v) => !v);
+          }}
+          style={{
+            border: isGlass
+              ? "1px solid rgba(255,255,255,0.32)"
+              : "1px solid rgba(15,23,42,0.16)",
+            background: popupButtonBg,
+            borderRadius: 999,
+            padding: "7px 11px",
+            fontWeight: 950,
+            cursor: "pointer",
+            color: "#0b1220",
+            fontSize: 12,
+            whiteSpace: "nowrap",
+            backdropFilter: popupLightBlur,
+            WebkitBackdropFilter: popupLightBlur,
+            boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.18)" : "none",
+          }}
+          title="Toggle clear mode"
+        >
+          {clearMode ? "Solid mode" : "Clear mode"}
+        </button>
+
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setShowDesc((vv) => !vv);
+          }}
+          style={{
+            border: isGlass
+              ? "1px solid rgba(255,255,255,0.32)"
+              : "1px solid rgba(15,23,42,0.16)",
+            background: popupButtonBg,
+            borderRadius: 999,
+            padding: "7px 11px",
+            fontWeight: 950,
+            cursor: "pointer",
+            color: "#0b1220",
+            fontSize: 12,
+            whiteSpace: "nowrap",
+            backdropFilter: popupLightBlur,
+            WebkitBackdropFilter: popupLightBlur,
+            boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.18)" : "none",
+          }}
+          title="Toggle description"
+        >
+          {showDesc ? "Hide description" : "Case description"}
+        </button>
+
+        {initialMenuLoading ? <TinySpinner label="Loading…" /> : null}
+      </div>
+    </div>
   }
-  storageKey={`shift-menu:${week}:${a1Key}`}
-  initial={{ w: 720, h: 520 }}
+  storageKey={currentPanelStorageKey}
+  initial={panelInitial ?? { w: 720, h: 520 }}
+  clearMode={clearMode}
 >
   <div
     style={{
@@ -2824,7 +3080,9 @@ return (
       overflowY: "auto",
       overflowX: "hidden",
       padding: 10,
-      background: clearMode ? "rgba(255,255,255,0.02)" : "#f8fbff",
+      background: popupShellBg,
+      backdropFilter: popupBlur,
+      WebkitBackdropFilter: popupBlur,
     }}
   >
     <div style={{ display: "grid", gap: 10 }}>
@@ -2836,13 +3094,14 @@ return (
 
       <div
         style={{
-          border: "1px solid rgba(17,24,39,0.10)",
+          border: popupStrongBorder,
           borderRadius: 14,
-          background: clearMode ? "rgba(224,242,254,0.08)" : "#e0f2fe",
+          background: popupSectionBg,
           color: "#111827",
           overflow: "hidden",
-          backdropFilter: clearMode ? "blur(2px)" : "none",
-          WebkitBackdropFilter: clearMode ? "blur(2px)" : "none",
+          boxShadow: popupShadow,
+          backdropFilter: popupBlur,
+          WebkitBackdropFilter: popupBlur,
         }}
       >
         <div
@@ -2853,10 +3112,14 @@ return (
             display: "grid",
             gap: 8,
             padding: 10,
-            borderBottom: "1px solid rgba(17,24,39,0.06)",
-            background: clearMode ? "rgba(224,242,254,0.10)" : "#d7eefc",
-            backdropFilter: clearMode ? "blur(2px)" : "none",
-            WebkitBackdropFilter: clearMode ? "blur(2px)" : "none",
+            borderBottom: isGlass
+              ? "1px solid rgba(255,255,255,0.18)"
+              : "1px solid rgba(17,24,39,0.06)",
+            background: isGlass
+              ? "rgba(255,255,255,0.025)"
+              : "#d7eefc",
+            backdropFilter: popupBlur,
+            WebkitBackdropFilter: popupBlur,
           }}
         >
           <div
@@ -2891,9 +3154,12 @@ return (
                       minHeight: 32,
                       padding: "6px 10px",
                       borderRadius: 10,
-                      border: "1px solid rgba(17,24,39,0.10)",
-                      background: clearMode ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.62)",
+                      border: popupStrongBorder,
+                      background: popupSoftBg,
                       color: "#0b1220",
+                      backdropFilter: popupLightBlur,
+                      WebkitBackdropFilter: popupLightBlur,
+                      boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.16)" : "none",
                     }}
                   >
                     <span
@@ -2928,9 +3194,12 @@ return (
                       minHeight: 32,
                       padding: "6px 10px",
                       borderRadius: 10,
-                      border: "1px solid rgba(17,24,39,0.10)",
-                      background: clearMode ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.62)",
+                      border: popupStrongBorder,
+                      background: popupSoftBg,
                       color: "#0b1220",
+                      backdropFilter: popupLightBlur,
+                      WebkitBackdropFilter: popupLightBlur,
+                      boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.16)" : "none",
                     }}
                   >
                     <span
@@ -2965,9 +3234,12 @@ return (
                       minHeight: 32,
                       padding: "6px 10px",
                       borderRadius: 10,
-                      border: "1px solid rgba(17,24,39,0.10)",
-                      background: clearMode ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.62)",
+                      border: popupStrongBorder,
+                      background: popupSoftBg,
                       color: "#0b1220",
+                      backdropFilter: popupLightBlur,
+                      WebkitBackdropFilter: popupLightBlur,
+                      boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.16)" : "none",
                     }}
                     title="Currently scheduled caregiver for this shift"
                   >
@@ -3010,9 +3282,12 @@ return (
                   minHeight: 34,
                   padding: "7px 10px",
                   borderRadius: 10,
-                  border: "1px solid rgba(17,24,39,0.10)",
-                  background: clearMode ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.62)",
+                  border: popupStrongBorder,
+                  background: popupSoftBg,
                   color: "#0b1220",
+                  backdropFilter: popupLightBlur,
+                  WebkitBackdropFilter: popupLightBlur,
+                  boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.16)" : "none",
                 }}
               >
                 <span
@@ -3049,75 +3324,21 @@ return (
                 </span>
               </div>
             </div>
-
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                flexWrap: "wrap",
-                justifyContent: "flex-end",
-                flex: "0 0 auto",
-              }}
-            >
-              <button
-                type="button"
-                onClick={() => setClearMode((v) => !v)}
-                style={{
-                  border: "1px solid rgba(15,23,42,0.16)",
-                  background: clearMode ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.82)",
-                  borderRadius: 999,
-                  padding: "7px 11px",
-                  fontWeight: 950,
-                  cursor: "pointer",
-                  color: "#0b1220",
-                  fontSize: 12,
-                  whiteSpace: "nowrap",
-                  backdropFilter: clearMode ? "blur(1px)" : "none",
-                  WebkitBackdropFilter: clearMode ? "blur(1px)" : "none",
-                }}
-                title="Toggle clear mode"
-              >
-                {clearMode ? "Solid mode" : "Clear mode"}
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setShowDesc((vv) => !vv)}
-                style={{
-                  border: "1px solid rgba(15,23,42,0.16)",
-                  background: clearMode ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.82)",
-                  borderRadius: 999,
-                  padding: "7px 11px",
-                  fontWeight: 950,
-                  cursor: "pointer",
-                  color: "#0b1220",
-                  fontSize: 12,
-                  whiteSpace: "nowrap",
-                  backdropFilter: clearMode ? "blur(1px)" : "none",
-                  WebkitBackdropFilter: clearMode ? "blur(1px)" : "none",
-                }}
-                title="Toggle description"
-              >
-                {showDesc ? "Hide description" : "Case description"}
-              </button>
-
-              {initialMenuLoading ? <TinySpinner label="Loading…" /> : null}
-            </div>
           </div>
 
           {showDesc ? (
             <div
               style={{
-                border: "1px solid rgba(15,23,42,0.10)",
+                border: popupBorder,
                 borderRadius: 12,
                 padding: 10,
-                background: clearMode ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.88)",
+                background: popupSectionBg,
                 color: "#0b1220",
                 fontWeight: 850,
                 whiteSpace: "pre-wrap",
-                backdropFilter: clearMode ? "blur(2px)" : "none",
-                WebkitBackdropFilter: clearMode ? "blur(2px)" : "none",
+                backdropFilter: popupLightBlur,
+                WebkitBackdropFilter: popupLightBlur,
+                boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.16)" : "none",
               }}
             >
               {norm(clientDescription) ? clientDescription : "No description on file."}
@@ -3153,16 +3374,19 @@ return (
                 style={{
                   width: 170,
                   maxWidth: "100%",
-                  border: "1px solid rgba(15,23,42,0.12)",
+                  border: isGlass
+                    ? "1px solid rgba(255,255,255,0.28)"
+                    : "1px solid rgba(15,23,42,0.12)",
                   borderRadius: 10,
                   padding: "7px 10px",
                   fontSize: 12,
                   outline: "none",
-                  background: clearMode ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.82)",
+                  background: popupButtonBg,
                   fontWeight: 800,
                   color: "#111827",
-                  backdropFilter: clearMode ? "blur(1px)" : "none",
-                  WebkitBackdropFilter: clearMode ? "blur(1px)" : "none",
+                  backdropFilter: popupLightBlur,
+                  WebkitBackdropFilter: popupLightBlur,
+                  boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.16)" : "none",
                 }}
               />
 
@@ -3170,17 +3394,20 @@ return (
                 value={sortMode}
                 onChange={(e) => setSortMode(e.target.value as SortMode)}
                 style={{
-                  border: "1px solid rgba(15,23,42,0.12)",
+                  border: isGlass
+                    ? "1px solid rgba(255,255,255,0.28)"
+                    : "1px solid rgba(15,23,42,0.12)",
                   borderRadius: 10,
                   padding: "7px 10px",
                   fontSize: 12,
                   outline: "none",
-                  background: clearMode ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.82)",
+                  background: popupButtonBg,
                   fontWeight: 850,
                   color: "#111827",
                   minWidth: 170,
-                  backdropFilter: clearMode ? "blur(1px)" : "none",
-                  WebkitBackdropFilter: clearMode ? "blur(1px)" : "none",
+                  backdropFilter: popupLightBlur,
+                  WebkitBackdropFilter: popupLightBlur,
+                  boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.16)" : "none",
                 }}
               >
                 <option value="smart">Smart (score)</option>
@@ -3203,10 +3430,10 @@ return (
               alignItems: "center",
             }}
           >
-            <Pill>{caregivers.length} shown</Pill>
-            <Pill>Active this week: {stats.total}</Pill>
-            <Pill>Conflicts: {stats.conflicts}</Pill>
-            {availTabName ? <Pill>Source: {availTabName}</Pill> : null}
+            <Pill clearMode={clearMode}>{caregivers.length} shown</Pill>
+            <Pill clearMode={clearMode}>Active this week: {stats.total}</Pill>
+            <Pill clearMode={clearMode}>Conflicts: {stats.conflicts}</Pill>
+            {availTabName ? <Pill clearMode={clearMode}>Source: {availTabName}</Pill> : null}
 
             {histLoading ? <TinySpinner label="History…" /> : null}
             {driveLoading ? <TinySpinner label="Drive times…" /> : null}
@@ -3252,14 +3479,14 @@ return (
                 <div
                   key={i}
                   style={{
-                    background: clearMode ? "rgba(255,255,255,0.04)" : "#ffffff",
+                    background: popupCardBg,
                     borderRadius: 14,
-                    border: "1px solid rgba(15,23,42,0.10)",
-                    boxShadow: "0 6px 18px rgba(15,23,42,0.06)",
+                    border: popupBorder,
+                    boxShadow: popupShadow,
                     padding: 12,
                     color: "#111827",
-                    backdropFilter: clearMode ? "blur(1px)" : "none",
-                    WebkitBackdropFilter: clearMode ? "blur(1px)" : "none",
+                    backdropFilter: popupLightBlur,
+                    WebkitBackdropFilter: popupLightBlur,
                   }}
                 >
                   <SkeletonLine w="40%" />
@@ -3309,13 +3536,15 @@ return (
                   <div
                     key={cg.key}
                     style={{
-                      background: clearMode ? "rgba(255,255,255,0.04)" : "#ffffff",
-                      border: "1px solid rgba(15,23,42,0.10)",
+                      background: popupCardBg,
+                      border: popupBorder,
                       borderRadius: 12,
                       padding: "10px 12px",
-                      boxShadow: "0 3px 10px rgba(15,23,42,0.04)",
-                      backdropFilter: clearMode ? "blur(1px)" : "none",
-                      WebkitBackdropFilter: clearMode ? "blur(1px)" : "none",
+                      boxShadow: isGlass
+                        ? "inset 0 1px 0 rgba(255,255,255,0.16), 0 8px 20px rgba(15,23,42,0.10)"
+                        : "0 3px 10px rgba(15,23,42,0.04)",
+                      backdropFilter: popupLightBlur,
+                      WebkitBackdropFilter: popupLightBlur,
                     }}
                   >
                     <div
@@ -3350,11 +3579,15 @@ return (
                             fontWeight: 1000,
                             padding: "6px 12px",
                             borderRadius: 999,
-                            background: clearMode ? "rgba(2,132,199,0.08)" : "rgba(2,132,199,0.12)",
-                            border: "1px solid rgba(2,132,199,0.18)",
+                            background: isGlass ? "rgba(2,132,199,0.10)" : "rgba(2,132,199,0.12)",
+                            border: isGlass
+                              ? "1px solid rgba(255,255,255,0.24)"
+                              : "1px solid rgba(2,132,199,0.18)",
                             color: "#0b1220",
                             whiteSpace: "nowrap",
                             lineHeight: 1,
+                            backdropFilter: popupLightBlur,
+                            WebkitBackdropFilter: popupLightBlur,
                           }}
                           title={buildScoreTooltip(cg)}
                         >
@@ -3373,14 +3606,18 @@ return (
                           width: 38,
                           height: 38,
                           borderRadius: 12,
-                          border: "1px solid rgba(59,130,246,0.18)",
-                          background: clearMode ? "rgba(59,130,246,0.05)" : "rgba(59,130,246,0.10)",
+                          border: isGlass
+                            ? "1px solid rgba(255,255,255,0.24)"
+                            : "1px solid rgba(59,130,246,0.18)",
+                          background: isGlass ? "rgba(59,130,246,0.08)" : "rgba(59,130,246,0.10)",
                           color: "#2563eb",
                           display: "inline-flex",
                           alignItems: "center",
                           justifyContent: "center",
                           cursor: !messagesUI || !norm(cg.id) ? "not-allowed" : "pointer",
                           opacity: !messagesUI || !norm(cg.id) ? 0.55 : 1,
+                          backdropFilter: popupLightBlur,
+                          WebkitBackdropFilter: popupLightBlur,
                         }}
                       >
                         <MessageBubbleIcon size={20} />
@@ -3388,121 +3625,121 @@ return (
                     </div>
 
                     <div
-  style={{
-    marginTop: 8,
-    display: "flex",
-    flexWrap: "wrap",
-    gap: 6,
-    alignItems: "center",
-  }}
->
-  {cg.availabilityMatchType === "exact" || cg.availabilityMatchType === "strong" ? (
-    <ScoreChip
-      label="Fits Availability"
-      tone="good"
-      title={`Availability match: ${cg.availabilityMatchLabel}`}
-    />
-  ) : cg.availabilityMatchType === "partial" ? (
-    <ScoreChip
-      label="Partial Availability Match"
-      tone="warn"
-      title={`Availability match: ${cg.availabilityMatchLabel}`}
-    />
-  ) : showAvailabilityReviewBadge ? (
-    <ScoreChip
-      label="Review availability"
-      tone="warn"
-      title={`Posted availability needs human review: ${cg.availRaw || "Unclear entry"}`}
-    />
-  ) : !norm(cg.availRaw) ? (
-    <ScoreChip
-      label="No Availability"
-      tone="bad"
-      title="No availability was posted for this caregiver for this day."
-    />
-  ) : cg.availabilityMatchType === "none" ? (
-    <ScoreChip
-      label="Does not fit availability"
-      tone="bad"
-      title={`Availability match: ${cg.availabilityMatchLabel || "No match"}`}
-    />
-  ) : null}
+                      style={{
+                        marginTop: 8,
+                        display: "flex",
+                        flexWrap: "wrap",
+                        gap: 6,
+                        alignItems: "center",
+                      }}
+                    >
+                      {cg.availabilityMatchType === "exact" || cg.availabilityMatchType === "strong" ? (
+                        <ScoreChip
+                          label="Fits Availability"
+                          tone="good"
+                          title={`Availability match: ${cg.availabilityMatchLabel}`}
+                        />
+                      ) : cg.availabilityMatchType === "partial" ? (
+                        <ScoreChip
+                          label="Partial Availability Match"
+                          tone="warn"
+                          title={`Availability match: ${cg.availabilityMatchLabel}`}
+                        />
+                      ) : showAvailabilityReviewBadge ? (
+                        <ScoreChip
+                          label="Review availability"
+                          tone="warn"
+                          title={`Posted availability needs human review: ${cg.availRaw || "Unclear entry"}`}
+                        />
+                      ) : !norm(cg.availRaw) ? (
+                        <ScoreChip
+                          label="No Availability"
+                          tone="bad"
+                          title="No availability was posted for this caregiver for this day."
+                        />
+                      ) : cg.availabilityMatchType === "none" ? (
+                        <ScoreChip
+                          label="Does not fit availability"
+                          tone="bad"
+                          title={`Availability match: ${cg.availabilityMatchLabel || "No match"}`}
+                        />
+                      ) : null}
 
-  <ScoreChip
-    label={cg.hasConflict ? "Conflict" : "No Conflict"}
-    tone={cg.hasConflict ? "bad" : "good"}
-    title={
-      cg.hasConflict
-        ? `Overlap: ${Math.round(cg.conflictMinutes || 0)} minutes`
-        : "No overlap"
-    }
-  />
+                      <ScoreChip
+                        label={cg.hasConflict ? "Conflict" : "No Conflict"}
+                        tone={cg.hasConflict ? "bad" : "good"}
+                        title={
+                          cg.hasConflict
+                            ? `Overlap: ${Math.round(cg.conflictMinutes || 0)} minutes`
+                            : "No overlap"
+                        }
+                      />
 
-  <ScoreChip
-    label={`History: ${cg.historyCount}`}
-    tone={cg.historyCount > 0 ? "good" : "neutral"}
-    title={
-      cg.historyCount === 1
-        ? "1 prior shift"
-        : `${cg.historyCount} prior shifts`
-    }
-  />
+                      <ScoreChip
+                        label={`History: ${cg.historyCount}`}
+                        tone={cg.historyCount > 0 ? "good" : "neutral"}
+                        title={
+                          cg.historyCount === 1
+                            ? "1 prior shift"
+                            : `${cg.historyCount} prior shifts`
+                        }
+                      />
 
-  <ScoreChip
-    label={`Drive time: ${driveLabel}`}
-    tone={
-      cg.driveTimeMinutes == null
-        ? "neutral"
-        : cg.driveTimeMinutes <= 20
-          ? "good"
-          : cg.driveTimeMinutes <= 30
-            ? "warn"
-            : "bad"
-    }
-    title={
-      cg.driveTimeText ||
-      (cg.driveTimeMinutes != null
-        ? `Drive time: ${cg.driveTimeMinutes} min`
-        : clientDestination
-          ? "Drive time unavailable (missing caregiver address or API returned no result)"
-          : "Drive time unavailable (missing client address)")
-    }
-  />
+                      <ScoreChip
+                        label={`Drive time: ${driveLabel}`}
+                        tone={
+                          cg.driveTimeMinutes == null
+                            ? "neutral"
+                            : cg.driveTimeMinutes <= 20
+                              ? "good"
+                              : cg.driveTimeMinutes <= 30
+                                ? "warn"
+                                : "bad"
+                        }
+                        title={
+                          cg.driveTimeText ||
+                          (cg.driveTimeMinutes != null
+                            ? `Drive time: ${cg.driveTimeMinutes} min`
+                            : clientDestination
+                              ? "Drive time unavailable (missing caregiver address or API returned no result)"
+                              : "Drive time unavailable (missing client address)")
+                        }
+                      />
 
-  <ScoreChip
-    label={`Desired: ${desiredLabel}`}
-    tone="neutral"
-    title={
-      gapValue == null
-        ? `Desired hours: ${desiredLabel}`
-        : `Desired (${desiredTarget}) - Total (${cg.totalHours.toFixed(1)}) = Gap ${gapValue.toFixed(1)}h`
-    }
-  />
+                      <ScoreChip
+                        label={`Desired: ${desiredLabel}`}
+                        tone="neutral"
+                        title={
+                          gapValue == null
+                            ? `Desired hours: ${desiredLabel}`
+                            : `Desired (${desiredTarget}) - Total (${cg.totalHours.toFixed(1)}) = Gap ${gapValue.toFixed(1)}h`
+                        }
+                      />
 
-  <ScoreChip
-    label={`Total hours: ${cg.totalHours.toFixed(1)}`}
-    tone={
-      cg.totalHours > 40
-        ? "bad"
-        : cg.totalHours >= 35
-          ? "warn"
-          : "neutral"
-    }
-    title="Total scheduled hours this week"
-  />
+                      <ScoreChip
+                        label={`Total hours: ${cg.totalHours.toFixed(1)}`}
+                        tone={
+                          cg.totalHours > 40
+                            ? "bad"
+                            : cg.totalHours >= 35
+                              ? "warn"
+                              : "neutral"
+                        }
+                        title="Total scheduled hours this week"
+                      />
 
-  {(cg.totalHours > 40 || cg.totalHours + shiftDurationHours(start, end) > 40) ? (
-    <ScoreChip
-      label="Over 40 Hours"
-      tone="bad"
-      title={
-        cg.totalHours > 40
-          ? `Already above 40 hours at ${cg.totalHours.toFixed(1)}h`
-          : `This shift would bring them to ${(cg.totalHours + shiftDurationHours(start, end)).toFixed(1)}h`
-      }
-    />
-  ) : null}
-</div>
+                      {(cg.totalHours > 40 || cg.totalHours + shiftDurationHours(start, end) > 40) ? (
+                        <ScoreChip
+                          label="Over 40 Hours"
+                          tone="bad"
+                          title={
+                            cg.totalHours > 40
+                              ? `Already above 40 hours at ${cg.totalHours.toFixed(1)}h`
+                              : `This shift would bring them to ${(cg.totalHours + shiftDurationHours(start, end)).toFixed(1)}h`
+                          }
+                        />
+                      ) : null}
+                    </div>
 
                     <div
                       style={{
@@ -3533,12 +3770,15 @@ return (
 
                       <div
                         style={{
-                          border: "1px solid rgba(17,24,39,0.08)",
+                          border: isGlass
+                            ? "1px solid rgba(255,255,255,0.24)"
+                            : "1px solid rgba(17,24,39,0.08)",
                           borderRadius: 10,
                           padding: "8px 10px",
-                          background: clearMode ? "rgba(255,255,255,0.03)" : "rgba(255,255,255,0.62)",
-                          backdropFilter: clearMode ? "blur(1px)" : "none",
-                          WebkitBackdropFilter: clearMode ? "blur(1px)" : "none",
+                          background: popupSoftBg,
+                          backdropFilter: popupLightBlur,
+                          WebkitBackdropFilter: popupLightBlur,
+                          boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.14)" : "none",
                         }}
                       >
                         <AvailabilityCell value={cg.availRaw || "—"} />
@@ -3560,51 +3800,113 @@ return (
                         Schedule this day
                       </div>
 
-                      {cg.dayShifts.length ? (
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                          {cg.dayShifts.map((s, idx) => {
-                            const st = normalizeShiftStatusFromText(s.status);
-                            return (
-                              <span
-                                key={`${s.shiftId || idx}-${s.client}-${s.startTime}-${s.endTime}`}
-                                title={`${s.client} • ${s.startTime}-${s.endTime}${s.status ? ` • ${st}` : ""}`}
-                                style={{
-                                  display: "inline-flex",
-                                  alignItems: "center",
-                                  gap: 6,
-                                  maxWidth: "100%",
-                                  padding: "4px 8px",
-                                  borderRadius: 999,
-                                  fontSize: 11,
-                                  fontWeight: 900,
-                                  lineHeight: 1.1,
-                                  background: clearMode ? "rgba(248,250,252,0.04)" : "rgba(248,250,252,0.95)",
-                                  border: "1px solid rgba(148,163,184,0.18)",
-                                  color: "#111827",
-                                }}
-                              >
-                                <span
-                                  style={{
-                                    maxWidth: 180,
-                                    overflow: "hidden",
-                                    textOverflow: "ellipsis",
-                                    whiteSpace: "nowrap",
-                                  }}
-                                >
-                                  {s.client}
-                                </span>
-                                <span style={{ opacity: 0.75 }}>
-                                  {s.startTime}-{s.endTime}
-                                </span>
-                              </span>
-                            );
-                          })}
-                        </div>
-                      ) : (
-                        <div style={{ fontSize: 12, fontWeight: 850, color: "#64748b" }}>
-                          No shifts
-                        </div>
-                      )}
+                   {cg.dayShifts.length ? (
+  <div style={{ display: "grid", gap: 8 }}>
+    {cg.dayShifts.map((s, idx) => {
+      const st = normalizeShiftStatusFromText(s.status);
+
+      const target: PopupShiftTarget = {
+        shiftId: s.shiftId,
+        dateStr: s.date,
+        clientName: s.client,
+        caregiverName: s.caregiver,
+        caregiverId: s.caregiverId || undefined,
+        startTime: s.startTime,
+        endTime: s.endTime,
+        status: st,
+      };
+
+      return (
+       <div
+  key={`${s.shiftId || idx}-${s.client}-${s.startTime}-${s.endTime}`}
+  style={{
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    minWidth: 0,
+    padding: "9px 12px",
+    borderRadius: 12,
+    background: isGlass
+      ? "rgba(255,255,255,0.035)"
+      : "rgba(255,255,255,0.92)",
+    border: isGlass
+      ? "1px solid rgba(255,255,255,0.18)"
+      : "1px solid rgba(17,24,39,0.10)",
+    backdropFilter: popupLightBlur,
+    WebkitBackdropFilter: popupLightBlur,
+    boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.14)" : "none",
+  }}
+>
+  <div style={{ minWidth: 0, display: "grid", gap: 2 }}>
+    <div
+      style={{
+        fontSize: 12,
+        fontWeight: 950,
+        color: "#0b1220",
+        minWidth: 0,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+      }}
+      title={s.client}
+    >
+      {s.client}
+    </div>
+
+    <div
+      style={{
+        fontSize: 11,
+        fontWeight: 850,
+        color: "#475569",
+        display: "flex",
+        flexWrap: "wrap",
+        gap: 6,
+      }}
+    >
+      <span>{s.startTime}-{s.endTime}</span>
+      <span>•</span>
+      <span>{s.status}</span>
+    </div>
+  </div>
+
+  <button
+    type="button"
+    onClick={(e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openNestedShiftMenu(target);
+    }}
+    style={{
+      width: 34,
+      height: 34,
+      borderRadius: 999,
+      border: popupStrongBorder,
+      background: popupButtonBg,
+      color: "#0b1220",
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
+      cursor: "pointer",
+      flex: "0 0 auto",
+      backdropFilter: popupLightBlur,
+      WebkitBackdropFilter: popupLightBlur,
+      boxShadow: popupShadow,
+    }}
+    title={`Open shift info for ${s.client} ${s.startTime}-${s.endTime}`}
+    aria-label={`Open shift info for ${s.client} ${s.startTime}-${s.endTime}`}
+  >
+    <LightbulbIcon size={15} />
+  </button>
+</div>
+      );
+    })}
+  </div>
+) : (
+  <div style={{ fontSize: 12, fontWeight: 850, color: "#64748b" }}>
+    No shifts
+  </div>
+)}
                     </div>
                   </div>
                 );
@@ -3622,6 +3924,43 @@ return (
     </div>
   </div>
 </FloatingPanel>
+{popupWindows.map((popup, idx) => (
+  <ShiftCard
+    key={popup.id}
+    a1Key={`${a1Key}:popup:${popup.id}`}
+    value=""
+    status={popup.target.status}
+    disabled={true}
+    onRequestEdit={() => {}}
+    expanded={false}
+    onToggleExpanded={() => {}}
+    dateStrForDow={popup.target.dateStr}
+    clientName={popup.target.clientName}
+    shiftInfo={shiftInfo}
+    rowIsEmpty={false}
+    cellBg={cellBg}
+    sheetColors={sheetColors}
+    week={week}
+    hasEditHistory={false}
+    onOpenEditHistory={onOpenEditHistory}
+    messagesUI={messagesUI}
+    defaultMessageCategory={defaultMessageCategory}
+    clientHistoryEndpoint={clientHistoryEndpoint}
+    scheduleEndpoint={scheduleEndpoint}
+    availabilityEndpoint={availabilityEndpoint}
+    caregiversEndpoint={caregiversEndpoint}
+    clientsEndpoint={clientsEndpoint}
+    driveTimeEndpoint={driveTimeEndpoint}
+    clientDescription={clientDescription}
+    popupOnly={true}
+    popupTarget={popup.target}
+    panelStorageKey={`${currentPanelStorageKey}:child:${popup.id}:${idx}`}
+    panelInitial={popup.initial}
+    onPopupOnlyClose={() => {
+      setPopupWindows((prev) => prev.filter((w) => w.id !== popup.id));
+    }}
+  />
+))}
     </>
   );
 }

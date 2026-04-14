@@ -1,4 +1,3 @@
-// app/schedule/components/FloatingPanel.tsx
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
@@ -34,6 +33,7 @@ export default function FloatingPanel({
   children,
   zIndex = 9999,
   rightActions,
+  clearMode = false,
 }: {
   open: boolean;
   onClose: () => void;
@@ -45,6 +45,7 @@ export default function FloatingPanel({
   zIndex?: number;
   rightActions?: React.ReactNode;
   children: React.ReactNode;
+  clearMode?: boolean;
 }) {
   const defaultRect: Rect = useMemo(() => {
     const vw = typeof window !== "undefined" ? window.innerWidth : 1200;
@@ -70,7 +71,46 @@ export default function FloatingPanel({
     oy: number;
   } | null>(null);
 
-  // Load saved position/size when opened
+  const shellBg = clearMode
+    ? "rgba(255,255,255,0.04)"
+    : "white";
+
+  const shellBorder = clearMode
+    ? "1px solid rgba(255,255,255,0.18)"
+    : "1px solid rgba(15,23,42,0.14)";
+
+  const shellShadow = clearMode
+    ? "0 18px 60px rgba(0,0,0,0.18)"
+    : "0 18px 60px rgba(0,0,0,0.28)";
+
+  const shellBackdrop = clearMode
+    ? "blur(.5px) saturate(125%)"
+    : "none";
+
+  const headerBg = clearMode
+    ? "linear-gradient(180deg, rgba(96,165,250,0.26), rgba(59,130,246,0.18))"
+    : "linear-gradient(180deg, rgba(96,165,250,0.96), rgba(59,130,246,0.92))";
+
+  const headerBorder = clearMode
+    ? "1px solid rgba(255,255,255,0.14)"
+    : "1px solid rgba(15,23,42,0.12)";
+
+  const bodyBg = clearMode
+    ? "rgba(255,255,255,0.02)"
+    : "white";
+
+  const bodyBackdrop = clearMode
+    ? "blur(.5px) saturate(120%)"
+    : "none";
+
+  const closeButtonBg = clearMode
+    ? "rgba(255,255,255,0.10)"
+    : "rgba(255,255,255,0.55)";
+
+  const closeButtonBorder = clearMode
+    ? "1px solid rgba(255,255,255,0.18)"
+    : "1px solid rgba(15,23,42,0.18)";
+
   useEffect(() => {
     if (!open) return;
 
@@ -91,13 +131,11 @@ export default function FloatingPanel({
     }
   }, [open, storageKey, defaultRect, minW, minH]);
 
-  // Save when rect changes (while open)
   useEffect(() => {
     if (!open) return;
     localStorage.setItem(storageKey, JSON.stringify(rect));
   }, [open, storageKey, rect]);
 
-  // Keep rect clamped on viewport resize (so it never drifts off-screen)
   useEffect(() => {
     if (!open) return;
 
@@ -118,7 +156,6 @@ export default function FloatingPanel({
     return () => window.removeEventListener("resize", onResize);
   }, [open, minW, minH]);
 
-  // ESC closes
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -128,12 +165,6 @@ export default function FloatingPanel({
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
-  /**
-   * ✅ FIX: Stop "panel keeps expanding"
-   * - Use border-box sizing so borders don't change measured width/height.
-   * - Measure with getBoundingClientRect() (matches the rendered box).
-   * - Ignore tiny 1px jitters to prevent feedback loops.
-   */
   useEffect(() => {
     if (!open) return;
     const el = panelRef.current;
@@ -172,12 +203,8 @@ export default function FloatingPanel({
     };
   }, [open, minW, minH]);
 
-  // Drag handlers
   function onHeaderPointerDown(e: React.PointerEvent) {
-    // Only left click / primary pointer
     if (e.button !== 0) return;
-
-    // ✅ Don't start dragging if the user is interacting with a control in the header.
     if (isInteractiveTarget(e.target)) return;
 
     e.preventDefault();
@@ -225,28 +252,22 @@ export default function FloatingPanel({
         zIndex,
         borderRadius: 16,
         overflow: "hidden",
-        boxShadow: "0 18px 60px rgba(0,0,0,0.28)",
-        border: "1px solid rgba(15,23,42,0.14)",
-        background: "white",
-
-        // ✅ CRITICAL: prevents border/scrollbar from causing ResizeObserver feedback growth
+        boxShadow: shellShadow,
+        border: shellBorder,
+        background: shellBg,
+        backdropFilter: shellBackdrop,
+        WebkitBackdropFilter: shellBackdrop,
         boxSizing: "border-box",
-
-        // Native resizing applies to the outer panel so it truly changes size
         resize: "both",
         minWidth: minW,
         minHeight: minH,
-
-        // keeps resize handle visible on mac/chrome
         maxWidth: "calc(100vw - 24px)",
         maxHeight: "calc(100vh - 24px)",
       }}
-      // stop accidental clicks behind it (and prevent click leak-through)
       onMouseDown={(e) => e.stopPropagation()}
       onPointerDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
     >
-      {/* Header (drag handle) */}
       <div
         onPointerDown={onHeaderPointerDown}
         onPointerMove={onHeaderPointerMove}
@@ -259,9 +280,11 @@ export default function FloatingPanel({
           alignItems: "center",
           justifyContent: "space-between",
           gap: 10,
-          background: "linear-gradient(180deg, rgba(96,165,250,0.96), rgba(59,130,246,0.92))",
+          background: headerBg,
           color: "#0b1220",
-          borderBottom: "1px solid rgba(15,23,42,0.12)",
+          borderBottom: headerBorder,
+          backdropFilter: shellBackdrop,
+          WebkitBackdropFilter: shellBackdrop,
         }}
         title="Drag to move • Resize from bottom-right corner"
       >
@@ -279,15 +302,12 @@ export default function FloatingPanel({
         </div>
 
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          {/* If you render buttons in rightActions, they won't trigger drag because of isInteractiveTarget() */}
           {rightActions ?? null}
 
-          {/* Close */}
           <button
             type="button"
             data-no-drag
             onPointerDown={(e) => {
-              // ✅ Prevent the header from capturing pointer on press
               e.stopPropagation();
             }}
             onClick={(e) => {
@@ -296,13 +316,15 @@ export default function FloatingPanel({
               onClose();
             }}
             style={{
-              border: "1px solid rgba(15,23,42,0.18)",
-              background: "rgba(255,255,255,0.55)",
+              border: closeButtonBorder,
+              background: closeButtonBg,
               borderRadius: 10,
               padding: "6px 10px",
               fontWeight: 950,
               cursor: "pointer",
               color: "#0b1220",
+              backdropFilter: clearMode ? "blur(6px) saturate(120%)" : "none",
+              WebkitBackdropFilter: clearMode ? "blur(6px) saturate(120%)" : "none",
             }}
             aria-label="Close"
             title="Close"
@@ -312,18 +334,18 @@ export default function FloatingPanel({
         </div>
       </div>
 
-      {/* Body (scroll area) */}
       <div
         style={{
           height: `calc(100% - 44px)`,
           overflow: "auto",
-          background: "white",
+          background: bodyBg,
+          backdropFilter: bodyBackdrop,
+          WebkitBackdropFilter: bodyBackdrop,
         }}
       >
         {children}
       </div>
 
-      {/* Resize handle hint (visual) */}
       <div
         style={{
           position: "absolute",
@@ -331,7 +353,7 @@ export default function FloatingPanel({
           bottom: 6,
           width: 14,
           height: 14,
-          opacity: 0.45,
+          opacity: clearMode ? 0.22 : 0.45,
           pointerEvents: "none",
           background:
             "linear-gradient(135deg, rgba(15,23,42,0) 40%, rgba(15,23,42,0.35) 40%, rgba(15,23,42,0.35) 55%, rgba(15,23,42,0) 55%)",

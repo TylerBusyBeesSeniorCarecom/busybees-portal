@@ -36,6 +36,9 @@ const UI = {
   borderSoft: "#e5e7eb",
   text: "#111827",
   textDim: "#6b7280",
+  accent: "#f4b400",
+  accentSoft: "#fff7d6",
+  accentText: "#7a4b00",
 };
 
 function DropdownMenu({
@@ -466,40 +469,35 @@ export default function TopNav({
   }, []);
 
   const pageItems: NavItem[] = useMemo(
-  () => [
-    {
-      label: "Schedule",
-      href: (w) => buildHrefWithWeek("/schedule", w),
-      match: (p) => p === "/schedule",
-    },
-    {
-      label: "Supraesophageal Ganglion",
-      href: (_w) => "/supraesophageal-ganglion",
-      match: (p) => p.startsWith("/supraesophageal-ganglion"),
-    },
-    {
-      label: "Availability",
-      href: (w) => buildHrefWithWeek("/availability", w),
-      match: (p) => p.startsWith("/availability"),
-    },
-    {
-      label: "Billing & Payroll",
-      href: (w) => buildHrefWithWeek("/billing-payroll", w),
-      match: (p) => p.startsWith("/billing-payroll"),
-    },
-    {
-      label: "History",
-      href: (w) => buildHrefWithWeek("/history", w),
-      match: (p) => p.startsWith("/history"),
-    },
-    {
-      label: "Applicants",
-      href: (_w) => "/schedule/applicants",
-      match: (p) => p.startsWith("/schedule/applicants"),
-    },
-  ],
-  []
-);
+    () => [
+      {
+        label: "Schedule",
+        href: (w) => buildHrefWithWeek("/schedule", w),
+        match: (p) => p === "/schedule",
+      },
+      {
+        label: "Availability",
+        href: (w) => buildHrefWithWeek("/availability", w),
+        match: (p) => p.startsWith("/availability"),
+      },
+      {
+        label: "Billing & Payroll",
+        href: (w) => buildHrefWithWeek("/billing-payroll", w),
+        match: (p) => p.startsWith("/billing-payroll"),
+      },
+      {
+        label: "History",
+        href: (w) => buildHrefWithWeek("/history", w),
+        match: (p) => p.startsWith("/history"),
+      },
+      {
+        label: "Applicants",
+        href: (_w) => "/schedule/applicants",
+        match: (p) => p.startsWith("/schedule/applicants"),
+      },
+    ],
+    []
+  );
 
   const tools: NavItem[] = useMemo(
     () => [
@@ -523,9 +521,9 @@ export default function TopNav({
     gap: 8,
     padding: "8px 12px",
     borderRadius: 999,
-    border: `1px solid ${active ? "#111827" : UI.border}`,
-    background: active ? "#111827" : "rgba(255,255,255,0.82)",
-    color: active ? "#fff" : UI.text,
+    border: `1px solid ${active ? UI.accent : UI.border}`,
+    background: active ? UI.accentSoft : "rgba(255,255,255,0.82)",
+    color: active ? UI.accentText : UI.text,
     fontSize: 13,
     fontWeight: 950,
     textDecoration: "none",
