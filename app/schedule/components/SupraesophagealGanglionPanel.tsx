@@ -56,6 +56,7 @@ type AvailabilityRow = {
   caregiverName: string;
   caregiverId: string;
   desiredHours: string;
+  notes: string;
   byDow: Record<number, string>;
 };
 
@@ -64,7 +65,9 @@ type CaregiverProfile = {
   nameOnSchedule: string;
   name: string;
   status?: string;
+  certification?: string | null;
   certifications?: string | string[] | null;
+  address?: string | null;
 };
 
 type ScheduleShiftRow = {
@@ -101,13 +104,17 @@ type ShiftInsightCandidate = {
   key: string;
   caregiverId: string;
   caregiverName: string;
+  certification: string;
   availabilityRaw: string;
   availabilityLabel: string;
+  availabilityNotes: string;
   desiredHours: string;
   totalHours: number;
-  dayShiftCount: number;
+  dayShifts: ScheduleShiftRow[];
   historyCount: number;
   conflictMinutes: number;
+  driveTimeMinutes: number | null;
+  driveTimeText: string | null;
   totalScore: number;
   breakdown: {
     availability: number;
@@ -157,6 +164,24 @@ const UI = {
   blue: "#2b6fd6",
   purple: "#7a3db8",
 };
+
+const DAY_FILTERS = [
+  { value: "all", label: "All Days" },
+  { value: "sunday", label: "Sunday" },
+  { value: "monday", label: "Monday" },
+  { value: "tuesday", label: "Tuesday" },
+  { value: "wednesday", label: "Wednesday" },
+  { value: "thursday", label: "Thursday" },
+  { value: "friday", label: "Friday" },
+  { value: "saturday", label: "Saturday" },
+] as const;
+
+const SHIFT_SORTS = [
+  { value: "day", label: "Day" },
+  { value: "client", label: "Client" },
+  { value: "avg_low", label: "Average Score (Low-High)" },
+  { value: "priority", label: "Priority" },
+] as const;
 
 function norm(v: any) {
   return (v ?? "").toString().trim();
@@ -466,6 +491,94 @@ function statusColors(status: ShiftStatusLabel) {
   return { bg: "#ffffff", color: UI.text, border: UI.borderSoft };
 }
 
+function displayStatusLabel(status: ShiftStatusLabel) {
+  return status === "Needs Attention" ? "Open" : status;
+}
+
+function shiftPriorityRank(status: ShiftStatusLabel) {
+  const display = displayStatusLabel(status);
+  if (display === "Open") return 0;
+  if (display === "Pending Client Approval") return 1;
+  if (display === "Considering") return 2;
+  if (display === "Offered") return 3;
+  if (display === "Scheduled") return 4;
+  if (display === "Finished") return 5;
+  return 6;
+}
+
+function sanitizeCertificationValue(raw: string | string[] | null | undefined): string {
+  const parts: string[] = Array.isArray(raw)
+    ? raw.map((item: string) => norm(item))
+    : norm(raw)
+        .split(",")
+        .map((item: string) => norm(item));
+
+  return parts
+    .filter(Boolean)
+    .filter((item: string) => {
+      const lowered = item.toLowerCase();
+      return lowered !== "none" && lowered !== "n/a" && lowered !== "na" && lowered !== "no";
+    })
+    .join(", ");
+}
+
+type DriveTimeApiResponse = {
+  ok: boolean;
+  minutes?: number;
+  durationText?: string;
+  text?: string;
+  error?: string;
+};
+
+const DRIVE_CACHE_MS = 10 * 60 * 1000;
+const driveTimeCache = new Map<string, { ts: number; minutes: number | null; text: string | null }>();
+
+function driveCacheKey(origin: string, destination: string) {
+  return `${normalizeKey(origin)}|${normalizeKey(destination)}`;
+}
+
+async function fetchDriveTime(
+  endpoint: string,
+  origin: string,
+  destination: string,
+  signal?: AbortSignal
+): Promise<{ minutes: number | null; text: string | null }> {
+  const o = norm(origin);
+  const d = norm(destination);
+  if (!o || !d) return { minutes: null, text: null };
+
+  const key = driveCacheKey(o, d);
+  const cached = driveTimeCache.get(key);
+  if (cached && Date.now() - cached.ts < DRIVE_CACHE_MS) {
+    return { minutes: cached.minutes, text: cached.text };
+  }
+
+  const qs = new URLSearchParams({ origin: o, destination: d });
+  const url = `${endpoint}?${qs.toString()}`;
+  const res = await fetch(url, {
+    method: "GET",
+    cache: "no-store",
+    signal,
+    headers: { Accept: "application/json" },
+  });
+  const rawText = await res.text();
+
+  let json: DriveTimeApiResponse | null = null;
+  try {
+    json = rawText ? (JSON.parse(rawText) as DriveTimeApiResponse) : null;
+  } catch {
+    throw new Error(`Non-JSON response (${res.status}) from ${url}: ${rawText.slice(0, 180)}`);
+  }
+
+  if (!res.ok) throw new Error(json?.error || `Drive time request failed (${res.status})`);
+  if (!json?.ok) throw new Error(json?.error || "Drive time request failed");
+
+  const minutes = typeof json.minutes === "number" && Number.isFinite(json.minutes) ? json.minutes : null;
+  const label = norm(json.durationText) || norm(json.text) || (minutes != null ? `${Math.round(minutes)} min` : null);
+  driveTimeCache.set(key, { ts: Date.now(), minutes, text: label });
+  return { minutes, text: label };
+}
+
 function safeNumber(n: any) {
   const x = typeof n === "number" ? n : parseFloat((n ?? "").toString());
   return Number.isFinite(x) ? x : 0;
@@ -712,7 +825,9 @@ async function fetchCaregivers() {
     nameOnSchedule: norm(item?.nameOnSchedule),
     name: norm(item?.name),
     status: norm(item?.status),
+    certification: norm(item?.certification) || null,
     certifications: item?.certifications ?? null,
+    address: norm(item?.address) || norm(item?.location) || null,
   })) as CaregiverProfile[];
 }
 
@@ -823,8 +938,15 @@ export default function SupraesophagealGanglionPanel({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
+  const [selectedDayFilter, setSelectedDayFilter] = useState<(typeof DAY_FILTERS)[number]["value"]>("all");
+  const [shiftSort, setShiftSort] = useState<(typeof SHIFT_SORTS)[number]["value"]>("day");
   const [peekMode, setPeekMode] = useState(false);
   const [selectedShiftKey, setSelectedShiftKey] = useState<string | null>(null);
+  const [clientInfoOpen, setClientInfoOpen] = useState(false);
+  const [shiftsCollapsed, setShiftsCollapsed] = useState(false);
+  const [driveByCandidateKey, setDriveByCandidateKey] = useState<Record<string, { minutes: number | null; text: string | null }>>({});
+  const [driveLoading, setDriveLoading] = useState(false);
+  const [driveError, setDriveError] = useState("");
   const [panelPos, setPanelPos] = useState({ x: 930, y: 92 });
   const panelSize = { width: 760, height: 800 };
 
@@ -833,6 +955,7 @@ export default function SupraesophagealGanglionPanel({
     offsetX: 0,
     offsetY: 0,
   });
+  const driveAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -908,6 +1031,7 @@ export default function SupraesophagealGanglionPanel({
     const iName = headerIndex(headers, ["caregiver name"]);
     const iId = headerIndex(headers, ["caregiver id"]);
     const iDesired = headerIndex(headers, ["desired hours"]);
+    const iNotes = headerIndex(headers, ["notes", "note"]);
     const dayColumns = headers
       .map((header, idx) => ({ idx, dow: (() => {
         const raw = header.toLowerCase().split("(")[0].trim();
@@ -932,6 +1056,7 @@ export default function SupraesophagealGanglionPanel({
           caregiverName,
           caregiverId,
           desiredHours: iDesired >= 0 ? norm(row[iDesired]) : "",
+          notes: iNotes >= 0 ? norm(row[iNotes]) : "",
           byDow,
         } as AvailabilityRow;
       })
@@ -1076,6 +1201,7 @@ export default function SupraesophagealGanglionPanel({
 
     const built = rawShifts
       .filter((shift) => {
+        if (selectedDayFilter !== "all" && normalizeKey(shift.dayLabel) !== selectedDayFilter) return false;
         if (!searchLower) return true;
         return (
           shift.clientName.toLowerCase().includes(searchLower) ||
@@ -1170,13 +1296,17 @@ export default function SupraesophagealGanglionPanel({
               key: `${shift.key}-${scheduleKey}`,
               caregiverId,
               caregiverName,
+              certification: sanitizeCertificationValue(profile?.certifications ?? profile?.certification ?? ""),
               availabilityRaw,
               availabilityLabel: availabilityResult.label,
+              availabilityNotes: availability?.notes || "",
               desiredHours: availability?.desiredHours || "",
               totalHours,
-              dayShiftCount: dayShifts.length,
+              dayShifts,
               historyCount,
               conflictMinutes,
+              driveTimeMinutes: null,
+              driveTimeText: null,
               totalScore,
               breakdown,
             } as ShiftInsightCandidate;
@@ -1202,9 +1332,26 @@ export default function SupraesophagealGanglionPanel({
         };
       })
       .sort((a, b) => {
-        const aNeeds = a.statusLabel === "Needs Attention" ? 0 : 1;
-        const bNeeds = b.statusLabel === "Needs Attention" ? 0 : 1;
-        if (aNeeds !== bNeeds) return aNeeds - bNeeds;
+        if (shiftSort === "client") {
+          return fullNameSortKey(a.clientName).localeCompare(fullNameSortKey(b.clientName));
+        }
+        if (shiftSort === "avg_low") {
+          const aAvg = a.avgScore ?? Number.POSITIVE_INFINITY;
+          const bAvg = b.avgScore ?? Number.POSITIVE_INFINITY;
+          if (aAvg !== bAvg) return aAvg - bAvg;
+          const da = buildScheduledDate(a.dateLabel, a.startTime)?.getTime() ?? 0;
+          const db = buildScheduledDate(b.dateLabel, b.startTime)?.getTime() ?? 0;
+          if (da !== db) return da - db;
+          return fullNameSortKey(a.clientName).localeCompare(fullNameSortKey(b.clientName));
+        }
+        if (shiftSort === "priority") {
+          const pr = shiftPriorityRank(a.statusLabel) - shiftPriorityRank(b.statusLabel);
+          if (pr !== 0) return pr;
+          const da = buildScheduledDate(a.dateLabel, a.startTime)?.getTime() ?? 0;
+          const db = buildScheduledDate(b.dateLabel, b.startTime)?.getTime() ?? 0;
+          if (da !== db) return da - db;
+          return fullNameSortKey(a.clientName).localeCompare(fullNameSortKey(b.clientName));
+        }
         const da = buildScheduledDate(a.dateLabel, a.startTime)?.getTime() ?? 0;
         const db = buildScheduledDate(b.dateLabel, b.startTime)?.getTime() ?? 0;
         if (da !== db) return da - db;
@@ -1215,6 +1362,8 @@ export default function SupraesophagealGanglionPanel({
   }, [
     gridData,
     search,
+    selectedDayFilter,
+    shiftSort,
     availabilityRows,
     caregiverProfiles,
     scheduleRows,
@@ -1242,12 +1391,85 @@ export default function SupraesophagealGanglionPanel({
     () => (selectedShift ? clientsByName[normalizeKey(selectedShift.clientName)] || null : null),
     [clientsByName, selectedShift]
   );
+  const clientDestination = useMemo(
+    () => norm(selectedClientProfile?.address || selectedClientProfile?.location),
+    [selectedClientProfile]
+  );
+  const selectedShiftCandidates = useMemo(() => selectedShift?.candidates ?? [], [selectedShift]);
 
-  const overallAverage = useMemo(() => {
-    const vals = shifts.map((shift) => shift.avgScore).filter((value): value is number => value != null);
-    if (!vals.length) return null;
-    return vals.reduce((sum, value) => sum + value, 0) / vals.length;
-  }, [shifts]);
+  useEffect(() => {
+    if (!open || !selectedShiftCandidates.length || !clientDestination) return;
+
+    if (driveAbortRef.current) driveAbortRef.current.abort();
+    const ac = new AbortController();
+    driveAbortRef.current = ac;
+
+    const addrByKey: Record<string, string> = {};
+    for (const c of caregiverProfiles) {
+      const addr = norm(c.address);
+      if (!addr) continue;
+      const id = normalizeKey(c.caregiverId);
+      const nm = normalizeKey(c.name);
+      const nos = normalizeKey(c.nameOnSchedule);
+      if (id) addrByKey[id] = addr;
+      if (nm) addrByKey[nm] = addr;
+      if (nos) addrByKey[nos] = addr;
+    }
+
+    const run = async () => {
+      setDriveLoading(true);
+      setDriveError("");
+      try {
+        const next: Record<string, { minutes: number | null; text: string | null }> = {};
+        const taskFns: Array<() => Promise<void>> = [];
+        let failed = 0;
+
+        for (const candidate of selectedShiftCandidates) {
+          const origin =
+            (candidate.caregiverId && addrByKey[normalizeKey(candidate.caregiverId)]) ||
+            addrByKey[normalizeKey(candidate.caregiverName)] ||
+            "";
+
+          if (!origin) {
+            next[candidate.key] = { minutes: null, text: null };
+            continue;
+          }
+
+          const cached = driveTimeCache.get(driveCacheKey(origin, clientDestination));
+          if (cached && Date.now() - cached.ts < DRIVE_CACHE_MS) {
+            next[candidate.key] = { minutes: cached.minutes, text: cached.text };
+            continue;
+          }
+
+          taskFns.push(async () => {
+            const dt = await fetchDriveTime("/api/drive-time", origin, clientDestination, ac.signal);
+            next[candidate.key] = { minutes: dt.minutes, text: dt.text };
+          });
+        }
+
+        const BATCH = 4;
+        for (let i = 0; i < taskFns.length; i += BATCH) {
+          if (ac.signal.aborted) return;
+          const results = await Promise.allSettled(taskFns.slice(i, i + BATCH).map((fn) => fn()));
+          failed += results.filter((r) => r.status === "rejected").length;
+          setDriveByCandidateKey((prev) => ({ ...prev, ...next }));
+        }
+
+        setDriveByCandidateKey((prev) => ({ ...prev, ...next }));
+        if (failed > 0) {
+          setDriveError(`Some drive times failed (${failed}/${taskFns.length}).`);
+        }
+      } catch (err: any) {
+        if (ac.signal.aborted) return;
+        setDriveError(err?.message || "Failed to load drive times");
+      } finally {
+        if (!ac.signal.aborted) setDriveLoading(false);
+      }
+    };
+
+    void run();
+    return () => ac.abort();
+  }, [open, selectedShiftCandidates, clientDestination, caregiverProfiles]);
 
   if (!open) return null;
 
@@ -1306,7 +1528,7 @@ export default function SupraesophagealGanglionPanel({
           <div>
             <div style={{ fontSize: 17, fontWeight: 1000, color: UI.text }}>🧠 Supraesophageal Ganglion</div>
             <div style={{ marginTop: 2, fontSize: 12, color: UI.textDim, fontWeight: 700 }}>
-              Shift workpad with scoring insight
+              Shift workpad for reviewing and assigning best fits
             </div>
           </div>
 
@@ -1340,32 +1562,95 @@ export default function SupraesophagealGanglionPanel({
 
         <div style={{ padding: "10px 10px 0 10px", borderBottom: `1px solid ${UI.borderSoft}`, display: "grid", gap: 10 }}>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8 }}>
-            <MiniStat label="Shifts" value={String(shifts.length)} />
+            <MiniStat label="Client Name" value={selectedShift?.clientName || "—"} />
+            <MiniStat label="Day" value={selectedShift?.dayLabel || "—"} />
             <MiniStat
-              label="Open"
-              value={String(shifts.filter((shift) => shift.statusLabel === "Needs Attention").length)}
+              label="Shift Time"
+              value={selectedShift ? `${selectedShift.startTime}-${selectedShift.endTime}` : "—"}
             />
-            <MiniStat label="Avg Score" value={overallAverage == null ? "—" : overallAverage.toFixed(1)} />
-            <MiniStat label="Selected" value={selectedShift ? selectedShift.clientName : "—"} />
+            <MiniStat label="Status" value={selectedShift ? displayStatusLabel(selectedShift.statusLabel) : "—"} />
           </div>
 
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search shifts, client, caregiver, status..."
-            style={{
-              width: "100%",
-              border: `1px solid ${UI.border}`,
-              borderRadius: 14,
-              padding: "10px 12px",
-              fontSize: 13,
-              fontWeight: 700,
-              outline: "none",
-              color: UI.text,
-              background: isGhost ? "rgba(255,255,255,0.18)" : "rgba(255,255,255,0.92)",
-            }}
-          />
+          <div style={{ display: "grid", gridTemplateColumns: "160px 190px minmax(0, 1fr) auto", gap: 10, alignItems: "center" }}>
+            <select
+              value={shiftSort}
+              onChange={(e) => setShiftSort(e.target.value as (typeof SHIFT_SORTS)[number]["value"])}
+              style={{
+                width: "100%",
+                border: `1px solid ${UI.border}`,
+                borderRadius: 14,
+                padding: "10px 12px",
+                fontSize: 13,
+                fontWeight: 800,
+                outline: "none",
+                color: UI.text,
+                background: isGhost ? "rgba(255,255,255,0.18)" : "rgba(255,255,255,0.92)",
+              }}
+            >
+              {SHIFT_SORTS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  Sort: {option.label}
+                </option>
+              ))}
+            </select>
+
+            <select
+              value={selectedDayFilter}
+              onChange={(e) => setSelectedDayFilter(e.target.value as (typeof DAY_FILTERS)[number]["value"])}
+              style={{
+                width: "100%",
+                border: `1px solid ${UI.border}`,
+                borderRadius: 14,
+                padding: "10px 12px",
+                fontSize: 13,
+                fontWeight: 800,
+                outline: "none",
+                color: UI.text,
+                background: isGhost ? "rgba(255,255,255,0.18)" : "rgba(255,255,255,0.92)",
+              }}
+            >
+              {DAY_FILTERS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search shifts, client, caregiver, status..."
+              style={{
+                width: "100%",
+                border: `1px solid ${UI.border}`,
+                borderRadius: 14,
+                padding: "10px 12px",
+                fontSize: 13,
+                fontWeight: 700,
+                outline: "none",
+                color: UI.text,
+                background: isGhost ? "rgba(255,255,255,0.18)" : "rgba(255,255,255,0.92)",
+              }}
+            />
+
+            <button
+              type="button"
+              onClick={() => setShiftsCollapsed((prev) => !prev)}
+              style={{
+                border: `1px solid ${UI.border}`,
+                background: "#fff",
+                color: UI.text,
+                borderRadius: 12,
+                padding: "10px 12px",
+                fontWeight: 900,
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {shiftsCollapsed ? "Show Shifts" : "Hide Shifts"}
+            </button>
+          </div>
         </div>
 
         <div
@@ -1373,7 +1658,7 @@ export default function SupraesophagealGanglionPanel({
             flex: 1,
             minHeight: 0,
             display: "grid",
-            gridTemplateColumns: "minmax(0, 1.08fr) minmax(0, 0.92fr)",
+            gridTemplateColumns: shiftsCollapsed ? "52px minmax(0, 1fr)" : "minmax(0, 1.02fr) minmax(0, 0.98fr)",
             gap: 0,
           }}
         >
@@ -1381,13 +1666,42 @@ export default function SupraesophagealGanglionPanel({
             style={{
               minHeight: 0,
               overflowY: "auto",
-              padding: 10,
+              padding: shiftsCollapsed ? 8 : 10,
               display: "grid",
-              gap: 8,
+              gap: shiftsCollapsed ? 0 : 8,
               borderRight: `1px solid ${UI.borderSoft}`,
             }}
           >
-            {loading ? (
+            {shiftsCollapsed ? (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  justifyContent: "center",
+                  paddingTop: 6,
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => setShiftsCollapsed(false)}
+                  style={{
+                    writingMode: "vertical-rl",
+                    transform: "rotate(180deg)",
+                    border: `1px solid ${UI.border}`,
+                    background: "#fff",
+                    color: UI.text,
+                    borderRadius: 12,
+                    padding: "10px 8px",
+                    fontSize: 12,
+                    fontWeight: 900,
+                    cursor: "pointer",
+                    minHeight: 140,
+                  }}
+                >
+                  Show Shifts
+                </button>
+              </div>
+            ) : loading ? (
               <PanelMessage isGhost={isGhost}>Loading shift workpad…</PanelMessage>
             ) : error ? (
               <PanelMessage isGhost={isGhost} danger>{error}</PanelMessage>
@@ -1416,8 +1730,12 @@ export default function SupraesophagealGanglionPanel({
                   >
                     <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
                       <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: 15, fontWeight: 1000, color: statusTone.color }}>
+                          {shift.startTime} - {shift.endTime}
+                        </div>
                         <div
                           style={{
+                            marginTop: 4,
                             fontSize: 15,
                             fontWeight: 1000,
                             color: UI.text,
@@ -1430,35 +1748,6 @@ export default function SupraesophagealGanglionPanel({
                         </div>
                         <div style={{ marginTop: 3, fontSize: 12, color: UI.textDim, fontWeight: 800 }}>
                           {[shift.dayLabel, shift.dateLabel].filter(Boolean).join(" • ")}
-                        </div>
-                      </div>
-
-                      <span
-                        style={{
-                          background: "#fff",
-                          color: statusTone.color,
-                          borderRadius: 999,
-                          padding: "4px 8px",
-                          fontWeight: 950,
-                          fontSize: 10.5,
-                          whiteSpace: "nowrap",
-                        }}
-                      >
-                        {shift.statusLabel}
-                      </span>
-                    </div>
-
-                    <div
-                      style={{
-                        display: "grid",
-                        gridTemplateColumns: "minmax(0, 1fr) repeat(5, auto)",
-                        gap: 10,
-                        alignItems: "center",
-                      }}
-                    >
-                      <div style={{ minWidth: 0 }}>
-                        <div style={{ fontSize: 15, fontWeight: 1000, color: statusTone.color }}>
-                          {shift.startTime} - {shift.endTime}
                         </div>
                         <div
                           style={{
@@ -1474,12 +1763,21 @@ export default function SupraesophagealGanglionPanel({
                           {shift.caregiverName || "Open shift"}
                         </div>
                       </div>
+                    </div>
 
+                    <div
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(3, auto)",
+                        gap: 10,
+                        alignItems: "center",
+                        justifyContent: "start",
+                      }}
+                    >
                       <MetricPill label="Hours" value={shift.hours.toFixed(1)} />
                       <MetricPill label="Overlap" value={String(shift.overlapCount)} />
                       <MetricPill label="Avg" value={shift.avgScore == null ? "—" : shift.avgScore.toFixed(1)} />
-                      <MetricPill label="Top" value={shift.topScore == null ? "—" : String(shift.topScore)} />
-                      <MetricPill label="Fits" value={String(shift.candidateCount)} />
+                      <MetricPill label="Status" value={displayStatusLabel(shift.statusLabel)} />
                     </div>
                   </button>
                 );
@@ -1521,7 +1819,7 @@ export default function SupraesophagealGanglionPanel({
                         whiteSpace: "nowrap",
                       }}
                     >
-                      {selectedShift.statusLabel}
+                      {displayStatusLabel(selectedShift.statusLabel)}
                     </span>
                   </div>
 
@@ -1535,15 +1833,52 @@ export default function SupraesophagealGanglionPanel({
                     <InfoRow label="Current caregiver" value={selectedShift.caregiverName || "Open"} />
                     <InfoRow label="Other shifts at same time" value={String(selectedShift.overlapCount)} />
                     <InfoRow label="Average fit score" value={selectedShift.avgScore == null ? "—" : selectedShift.avgScore.toFixed(1)} />
-                    <InfoRow label="Location" value={norm(selectedClientProfile?.location) || "—"} />
-                    <InfoRow label="Rate" value={norm(selectedClientProfile?.rate) || "—"} />
                   </div>
 
-                  {norm(selectedClientProfile?.description) ? (
-                    <div style={{ fontSize: 12.5, color: UI.textDim, fontWeight: 700, lineHeight: 1.45 }}>
-                      {selectedClientProfile?.description}
-                    </div>
-                  ) : null}
+                  <div
+                    style={{
+                      border: `1px solid ${UI.borderSoft}`,
+                      borderRadius: 12,
+                      overflow: "hidden",
+                      background: "rgba(255,255,255,0.72)",
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setClientInfoOpen((prev) => !prev)}
+                      style={{
+                        width: "100%",
+                        border: "none",
+                        background: "transparent",
+                        color: UI.text,
+                        padding: "10px 11px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 10,
+                        cursor: "pointer",
+                        fontSize: 13,
+                        fontWeight: 900,
+                        textAlign: "left",
+                      }}
+                    >
+                      <span>Client Info</span>
+                      <span style={{ color: UI.textDim, fontSize: 12 }}>{clientInfoOpen ? "Hide" : "Show"}</span>
+                    </button>
+
+                    {clientInfoOpen ? (
+                      <div style={{ padding: "0 11px 11px 11px", display: "grid", gap: 6 }}>
+                        <InfoRow label="Location" value={norm(selectedClientProfile?.location) || "—"} />
+                        <InfoRow label="Rate" value={norm(selectedClientProfile?.rate) || "—"} />
+                        <InfoRow label="Address" value={norm(selectedClientProfile?.address) || "—"} />
+                        {norm(selectedClientProfile?.description) ? (
+                          <div style={{ fontSize: 12.5, color: UI.textDim, fontWeight: 700, lineHeight: 1.45 }}>
+                            {selectedClientProfile?.description}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
                 </section>
 
                 <section style={detailCardStyle(isGhost)}>
@@ -1551,67 +1886,146 @@ export default function SupraesophagealGanglionPanel({
                     Best fit breakdown
                   </div>
 
+                  {driveError ? (
+                    <div style={{ fontSize: 12, color: UI.red, fontWeight: 800 }}>{driveError}</div>
+                  ) : null}
+
                   {!selectedShift.candidates.length ? (
                     <div style={{ fontSize: 12.5, color: UI.textDim, fontWeight: 700 }}>
                       No caregiver candidates were available for this shift.
                     </div>
                   ) : (
                     <div style={{ display: "grid", gap: 8 }}>
-                      {selectedShift.candidates.slice(0, 12).map((candidate, index) => (
+                      {selectedShift.candidates.slice(0, 12).map((candidate, index) => {
+                        const driveInfo = driveByCandidateKey[candidate.key];
+                        const driveLabel =
+                          driveLoading && !driveInfo
+                            ? "…"
+                            : driveInfo?.minutes != null
+                            ? `${Math.round(driveInfo.minutes)} min`
+                            : norm(driveInfo?.text) || "—";
+
+                        return (
                         <div
                           key={candidate.key}
                           style={{
                             border: `1px solid ${index === 0 ? "rgba(244,197,66,0.50)" : UI.borderSoft}`,
                             background: index === 0 ? "rgba(255,247,214,0.78)" : "rgba(255,255,255,0.86)",
                             borderRadius: 12,
-                            padding: "10px 11px",
+                            padding: "12px",
                             display: "grid",
-                            gap: 8,
+                            gap: 10,
                           }}
                         >
-                          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "flex-start" }}>
                             <div style={{ minWidth: 0 }}>
                               <div style={{ fontSize: 14, fontWeight: 1000, color: UI.text }}>
                                 {index + 1}. {candidate.caregiverName}
                               </div>
                               <div style={{ marginTop: 2, fontSize: 11.5, color: UI.textDim, fontWeight: 800 }}>
-                                {candidate.dayShiftCount} shift{candidate.dayShiftCount === 1 ? "" : "s"} that day • {candidate.totalHours.toFixed(1)}h this week
+                                {candidate.dayShifts.length} shift{candidate.dayShifts.length === 1 ? "" : "s"} that day • {candidate.totalHours.toFixed(1)}h this week
                               </div>
                             </div>
                             <div
                               style={{
-                                minWidth: 54,
-                                textAlign: "center",
-                                borderRadius: 999,
-                                background: "#fff",
-                                border: `1px solid ${UI.border}`,
-                                padding: "5px 8px",
-                                fontSize: 13,
-                                fontWeight: 1000,
-                                color: UI.navy,
+                                minWidth: 78,
+                                borderRadius: 12,
+                                background: "rgba(255,255,255,0.88)",
+                                border: `1px solid ${UI.borderSoft}`,
+                                padding: "7px 10px",
+                                textAlign: "right",
                               }}
                             >
-                              {candidate.totalScore}
+                              <div style={{ fontSize: 10.5, fontWeight: 900, color: UI.textDim, textTransform: "uppercase" }}>
+                                Fit Score
+                              </div>
+                              <div style={{ marginTop: 2, fontSize: 16, fontWeight: 1000, color: UI.navy }}>
+                                {candidate.totalScore}
+                              </div>
                             </div>
                           </div>
 
-                          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                            <ScoreToken label={`Availability ${candidate.breakdown.availability}`} tone={candidate.breakdown.availability >= 30 ? "good" : candidate.breakdown.availability > 0 ? "warn" : "bad"} />
-                            <ScoreToken label={`Conflict ${candidate.breakdown.conflict}`} tone={candidate.conflictMinutes === 0 ? "good" : "bad"} />
-                            <ScoreToken label={`History ${candidate.breakdown.history}`} tone={candidate.historyCount > 0 ? "good" : "neutral"} />
-                            <ScoreToken label={`Desired ${candidate.breakdown.desired_hours}`} tone={candidate.breakdown.desired_hours > 0 ? "good" : "neutral"} />
-                            <ScoreToken label={`40+ ${candidate.breakdown.hours_penalty}`} tone={candidate.breakdown.hours_penalty < 0 ? "bad" : "neutral"} />
+                          <div
+                            style={{
+                              border: `1px solid ${UI.borderSoft}`,
+                              borderRadius: 12,
+                              background: "rgba(255,255,255,0.62)",
+                              padding: "10px 11px",
+                              display: "grid",
+                              gap: 8,
+                            }}
+                          >
+                            <div style={{ fontSize: 11, fontWeight: 950, color: UI.textDim, textTransform: "uppercase" }}>
+                              Scheduling Breakdown
+                            </div>
+
+                            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 10 }}>
+                              <InfoRow label="Posted availability" value={candidate.availabilityRaw || "—"} compact />
+                              <InfoRow label="Availability match" value={candidate.availabilityLabel || "—"} compact />
+                              <InfoRow
+                                label="Client history"
+                                value={
+                                  candidate.historyCount
+                                    ? `${candidate.historyCount} prior shift${candidate.historyCount === 1 ? "" : "s"}`
+                                    : "No prior shifts"
+                                }
+                                compact
+                              />
+                              <InfoRow label="Drive time" value={driveLabel} compact />
+                              <InfoRow label="Conflict" value={candidate.conflictMinutes > 0 ? "Yes" : "No"} compact />
+                              <InfoRow
+                                label="Conflict overlap"
+                                value={candidate.conflictMinutes ? `${Math.round(candidate.conflictMinutes)} min` : "None"}
+                                compact
+                              />
+                              <InfoRow label="Desired hours" value={candidate.desiredHours || "—"} compact />
+                              <InfoRow label="Total hours" value={`${candidate.totalHours.toFixed(1)}h`} compact />
+                              <InfoRow label="Certification" value={candidate.certification || "—"} compact />
+                              <InfoRow label="Notes" value={candidate.availabilityNotes || "—"} compact />
+                            </div>
                           </div>
 
-                          <div style={{ display: "grid", gap: 4 }}>
-                            <InfoRow label="Availability match" value={candidate.availabilityLabel} compact />
-                            <InfoRow label="Posted availability" value={candidate.availabilityRaw || "—"} compact />
-                            <InfoRow label="Client history" value={`${candidate.historyCount} prior shift${candidate.historyCount === 1 ? "" : "s"}`} compact />
-                            <InfoRow label="Conflict overlap" value={`${candidate.conflictMinutes} min`} compact />
-                            <InfoRow label="Desired hours" value={candidate.desiredHours || "—"} compact />
+                          <div
+                            style={{
+                              border: `1px solid ${UI.borderSoft}`,
+                              borderRadius: 12,
+                              background: "rgba(255,255,255,0.62)",
+                              padding: "10px 11px",
+                              display: "grid",
+                              gap: 6,
+                            }}
+                          >
+                            <div style={{ fontSize: 11, fontWeight: 950, color: UI.textDim, textTransform: "uppercase" }}>
+                              Shifts That Day
+                            </div>
+                            {candidate.dayShifts.length ? (
+                              candidate.dayShifts.map((shift) => (
+                                <div
+                                  key={`${candidate.key}-${shift.shiftId || `${shift.client}-${shift.startTime}-${shift.endTime}`}`}
+                                  style={{
+                                    border: `1px solid ${UI.borderSoft}`,
+                                    borderRadius: 10,
+                                    padding: "7px 9px",
+                                    background: "rgba(255,255,255,0.72)",
+                                    display: "grid",
+                                    gap: 2,
+                                  }}
+                                >
+                                  <div style={{ fontSize: 12, color: UI.text, fontWeight: 800 }}>
+                                    {shift.client}
+                                  </div>
+                                  <div style={{ fontSize: 11.5, color: UI.textDim, fontWeight: 700 }}>
+                                    {shift.startTime}-{shift.endTime} • {norm(shift.status) || "—"}
+                                  </div>
+                                </div>
+                              ))
+                            ) : (
+                              <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 700 }}>No other shifts that day.</div>
+                            )}
                           </div>
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
                 </section>
@@ -1621,7 +2035,7 @@ export default function SupraesophagealGanglionPanel({
                     Workpad notes
                   </div>
                   <div style={{ fontSize: 12.5, color: UI.textDim, fontWeight: 700, lineHeight: 1.45 }}>
-                    This first pass makes the ganglion panel shift-first and pulls in the same scoring categories used in the shift popup for availability, conflicts, history, desired hours, and weekly load. Drive time is not yet included in this panel’s score.
+                    The ganglion panel now shows the same scheduling context used in the shift popup so you can compare candidate availability, conflicts, drive time, hours, certification, and same-day assignments without leaving the workpad.
                   </div>
                 </section>
               </>
@@ -1674,60 +2088,39 @@ function InfoRow({
   return (
     <div
       style={{
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: compact ? "center" : "flex-start",
-        gap: 10,
+        display: "grid",
+        gap: compact ? 4 : 6,
+        alignContent: "start",
+        minWidth: 0,
         fontSize: compact ? 11.5 : 12.5,
+        padding: compact ? "8px 9px" : "0",
+        borderRadius: compact ? 10 : 0,
+        border: compact ? `1px solid ${UI.borderSoft}` : "none",
+        background: compact ? "rgba(255,255,255,0.72)" : "transparent",
       }}
     >
-      <div style={{ color: UI.textDim, fontWeight: 900 }}>{label}</div>
-      <div style={{ color: UI.text, fontWeight: 800, textAlign: "right" }}>{value}</div>
-    </div>
-  );
-}
-
-function ScoreToken({
-  label,
-  tone,
-}: {
-  label: string;
-  tone: "good" | "warn" | "bad" | "neutral";
-}) {
-  let background = "rgba(248,250,252,0.96)";
-  let border = "rgba(148,163,184,0.18)";
-  let color = "#475569";
-  if (tone === "good") {
-    background = "rgba(240,253,244,0.96)";
-    border = "rgba(34,197,94,0.18)";
-    color = "#166534";
-  } else if (tone === "warn") {
-    background = "rgba(255,251,235,0.96)";
-    border = "rgba(245,158,11,0.18)";
-    color = "#92400e";
-  } else if (tone === "bad") {
-    background = "rgba(254,242,242,0.96)";
-    border = "rgba(239,68,68,0.18)";
-    color = "#991b1b";
-  }
-  return (
-    <div
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        minHeight: 30,
-        padding: "6px 9px",
-        borderRadius: 999,
-        fontSize: 11,
-        fontWeight: 900,
-        lineHeight: 1.1,
-        whiteSpace: "nowrap",
-        background,
-        border: `1px solid ${border}`,
-        color,
-      }}
-    >
-      {label}
+      <div
+        style={{
+          color: UI.textDim,
+          fontWeight: 900,
+          textTransform: compact ? "uppercase" : "none",
+          letterSpacing: compact ? 0.2 : 0,
+          fontSize: compact ? 10.5 : 12.5,
+        }}
+      >
+        {label}
+      </div>
+      <div
+        style={{
+          color: UI.text,
+          fontWeight: 800,
+          textAlign: "left",
+          wordBreak: "break-word",
+          lineHeight: 1.35,
+        }}
+      >
+        {value}
+      </div>
     </div>
   );
 }

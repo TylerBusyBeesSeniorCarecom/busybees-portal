@@ -85,6 +85,18 @@ type CaregiversApiResponse = {
   error?: string;
 };
 
+const SCHEDULE_CELL_DRAG_MIME = "application/x-busybees-schedule-cell";
+
+type ScheduleCellDragPayload = {
+  sourceA1: string;
+  sourceValue: string;
+  clientName: string;
+  dateStr: string;
+  dayLabel: string;
+  week: WeekKind;
+  mode: "copy" | "move";
+};
+
 /** ---------- Types from /api/employees (Applicants) ---------- */
 
 type ApplicantsApiResponse = {
@@ -2710,6 +2722,8 @@ const [unpublishedModalOpen, setUnpublishedModalOpen] = useState(false);
   const [inlineEditCursor, setInlineEditCursor] = useState(0);
   const [inlineEditSuggestionIndex, setInlineEditSuggestionIndex] = useState(0);
   const [dragOverA1, setDragOverA1] = useState<string | null>(null);
+  const [dragSourceA1, setDragSourceA1] = useState<string | null>(null);
+  const [shiftClipboard, setShiftClipboard] = useState<ScheduleCellDragPayload | null>(null);
 
   // allow independent cell save states
   const [savingA1Set, setSavingA1Set] = useState<Set<string>>(new Set());
@@ -4991,7 +5005,7 @@ const weekProgress = useMemo(() => {
     dayLabel: string;
     weekOf?: string;
     backgroundRefresh?: boolean;
-  }) {
+  }): Promise<boolean> {
   const {
     a1,
     newVal,
@@ -5017,7 +5031,7 @@ const weekProgress = useMemo(() => {
 
     if (norm(oldVal) === norm(newVal)) {
     cancelInlineEdit(a1);
-    return;
+    return true;
   }
 
      if (draftMode) {
@@ -5042,7 +5056,7 @@ const weekProgress = useMemo(() => {
       dayLabel,
     });
 
-    return;
+    return true;
   }
 
   const oldTimeRange = parseFirstTimeRange(oldVal);
@@ -5213,6 +5227,7 @@ markCellHasEditHistory({
       title: toastModel.title,
       lines: toastModel.lines,
     });
+    return true;
   } catch (err: any) {
     // rollback if actual save or log failed
     setData((prev) => {
@@ -5256,6 +5271,7 @@ markCellHasEditHistory({
         "The cell was restored to its previous value.",
       ],
     });
+    return false;
   } finally {
     unmarkCellSaving(a1);
   }
@@ -5539,7 +5555,111 @@ async function handleOpenEditHistory(payload: EditHistoryOpenPayload) {
     setShiftRateError(err?.message || "Failed to save shift rate.");
   } finally {
     setShiftRateSaving(false);
+    }
   }
+
+function beginScheduleCellDrag(args: {
+  dragEvent: React.DragEvent<HTMLElement>;
+  a1: string;
+  value: string;
+  clientName: string;
+  dateStr: string;
+  dayLabel: string;
+  mode: "copy" | "move";
+}) {
+  const { dragEvent, a1, value, clientName, dateStr, dayLabel, mode } = args;
+  const sourceValue = norm(value);
+  if (!sourceValue) {
+    dragEvent.preventDefault();
+    return;
+  }
+
+  const payload: ScheduleCellDragPayload = {
+    sourceA1: a1,
+    sourceValue,
+    clientName,
+    dateStr,
+    dayLabel,
+    week,
+    mode,
+  };
+
+  dragEvent.dataTransfer.effectAllowed = mode === "copy" ? "copy" : "move";
+  dragEvent.dataTransfer.setData(SCHEDULE_CELL_DRAG_MIME, JSON.stringify(payload));
+  dragEvent.dataTransfer.setData("text/plain", sourceValue);
+  setDragSourceA1(a1);
+}
+
+async function applyShiftValueToCell(args: {
+  a1: string;
+  newValue: string;
+  originalValue: string;
+  clientName: string;
+  dateStrForDow: string;
+  dayLabel: string;
+}): Promise<boolean> {
+  const { a1, newValue, originalValue, clientName, dateStrForDow, dayLabel } = args;
+
+  if (draftMode) {
+    setDraftCell({
+      a1,
+      week,
+      originalValue,
+      draftValue: newValue,
+      clientName,
+      dateStr: dateStrForDow,
+      dayLabel,
+    });
+
+    showDraftShiftFeedback({
+      a1,
+      oldValue: originalValue,
+      newValue,
+      clientName,
+      shiftDateForSave: dateStrForDow,
+      dayLabel,
+    });
+    return true;
+  }
+
+  return saveInlineEdit({
+    a1,
+    newVal: newValue,
+    clientName,
+    shiftDateForSave: dateStrForDow,
+    dayLabel,
+    weekOf: weekStartYmd,
+  });
+}
+
+async function pasteCopiedShiftIntoCell(args: {
+  a1: string;
+  clientName: string;
+  dateStrForDow: string;
+  dayLabel: string;
+  originalCellValue: string;
+}) {
+  const { a1, clientName, dateStrForDow, dayLabel, originalCellValue } = args;
+  if (!shiftClipboard) return;
+  if (shiftClipboard.sourceA1 === a1 && shiftClipboard.week === week) return;
+  const pasted = await applyShiftValueToCell({
+    a1,
+    newValue: shiftClipboard.sourceValue,
+    originalValue: originalCellValue,
+    clientName,
+    dateStrForDow,
+    dayLabel,
+  });
+  if (!pasted) return;
+
+  setShiftClipboard(null);
+
+  setSaveToast({
+    id: Date.now(),
+    kind: "success",
+    title: draftMode ? "Shift copied to draft" : "Shift pasted",
+    lines: [`${clientName} • ${dayLabel}`],
+  });
 }
 
 async function handleCaregiverDropToShift(args: {
@@ -5554,6 +5674,59 @@ async function handleCaregiverDropToShift(args: {
 
   dropEvent.preventDefault();
   setDragOverA1(null);
+  setDragSourceA1(null);
+
+  try {
+    const scheduleCellJson = dropEvent.dataTransfer.getData(SCHEDULE_CELL_DRAG_MIME);
+    const scheduleCellPayload = scheduleCellJson
+      ? (JSON.parse(scheduleCellJson) as ScheduleCellDragPayload)
+      : null;
+
+    const draggedCellValue = norm(scheduleCellPayload?.sourceValue);
+    if (scheduleCellPayload && draggedCellValue) {
+      if (scheduleCellPayload.sourceA1 === a1 && scheduleCellPayload.week === week) return;
+      const appliedToTarget = await applyShiftValueToCell({
+        a1,
+        newValue: draggedCellValue,
+        originalValue: originalCellValue,
+        clientName,
+        dateStrForDow,
+        dayLabel,
+      });
+      if (!appliedToTarget) return;
+
+      if (scheduleCellPayload.mode !== "copy") {
+        const clearedSource = await applyShiftValueToCell({
+          a1: scheduleCellPayload.sourceA1,
+          newValue: "",
+          originalValue: scheduleCellPayload.sourceValue,
+          clientName: scheduleCellPayload.clientName,
+          dateStrForDow: scheduleCellPayload.dateStr,
+          dayLabel: scheduleCellPayload.dayLabel,
+        });
+        if (!clearedSource) return;
+      }
+
+      setSaveToast({
+        id: Date.now(),
+        kind: "success",
+        title:
+          scheduleCellPayload?.mode === "copy"
+            ? draftMode
+              ? "Shift copied to draft"
+              : "Shift copied"
+            : draftMode
+            ? "Shift moved in draft"
+            : "Shift moved",
+        lines: [
+          `${scheduleCellPayload?.clientName || "Source shift"} ${scheduleCellPayload?.mode === "copy" ? "copied" : "moved"} into ${clientName} • ${dayLabel}.`,
+        ],
+      });
+      return;
+    }
+  } catch {
+    // fall through to caregiver drop handling
+  }
 
   let payload: any = null;
 
@@ -5594,36 +5767,13 @@ async function handleCaregiverDropToShift(args: {
     return;
   }
 
-  if (draftMode) {
-    setDraftCell({
-      a1,
-      week,
-      originalValue: originalCellValue,
-      draftValue: newValue,
-      clientName,
-      dateStr: dateStrForDow,
-      dayLabel,
-    });
-
-    showDraftShiftFeedback({
-      a1,
-      oldValue: originalCellValue,
-      newValue,
-      clientName,
-      shiftDateForSave: dateStrForDow,
-      dayLabel,
-    });
-
-    return;
-  }
-
-  await saveInlineEdit({
+  await applyShiftValueToCell({
     a1,
-    newVal: newValue,
+    newValue,
+    originalValue: originalCellValue,
     clientName,
-    shiftDateForSave: dateStrForDow,
+    dateStrForDow,
     dayLabel,
-    weekOf: weekStartYmd,
   });
 }
     return (
@@ -6336,6 +6486,7 @@ async function handleCaregiverDropToShift(args: {
         }}
       />
     </div>
+
 </div>
 
     {draftMode ? (
@@ -8896,17 +9047,31 @@ async function handleCaregiverDropToShift(args: {
                                 return (
                                   <td
                                     key={a1 || `${r.row}_${dow}`}
-                                    onClick={() => {
-                                      if (!bulkMode || !a1) return;
+                                    onClick={async () => {
+                                      if (!a1) return;
 
-                                      toggleBulkCellSelection({
-                                        a1,
-                                        week,
-                                        clientName: name,
-                                        dateStr: dateStrForDow,
-                                        dayLabel,
-                                        originalValue: displayValue,
-                                      });
+                                      if (bulkMode) {
+                                        toggleBulkCellSelection({
+                                          a1,
+                                          week,
+                                          clientName: name,
+                                          dateStr: dateStrForDow,
+                                          dayLabel,
+                                          originalValue: displayValue,
+                                        });
+                                        return;
+                                      }
+
+                                      if (shiftClipboard && !isSaving) {
+                                        await pasteCopiedShiftIntoCell({
+                                          a1,
+                                          clientName: name,
+                                          dateStrForDow,
+                                          dayLabel,
+                                          originalCellValue: originalValue,
+                                        });
+                                        return;
+                                      }
                                     }}
                                     onDoubleClick={() => {
                                       if (bulkMode) return;
@@ -8950,6 +9115,8 @@ async function handleCaregiverDropToShift(args: {
                                       background:
                                         dragOverA1 === a1
                                           ? "#dbeafe"
+                                          : dragSourceA1 === a1
+                                          ? "#eff6ff"
                                           : isBulkSelected
                                           ? "#fef3c7"
                                           : isDraftChanged
@@ -8964,6 +9131,8 @@ async function handleCaregiverDropToShift(args: {
                                       boxShadow:
                                         dragOverA1 === a1
                                           ? "inset 0 0 0 3px #2563eb"
+                                          : dragSourceA1 === a1
+                                          ? "inset 0 0 0 2px #60a5fa"
                                           : isBulkSelected
                                           ? "inset 0 0 0 3px #f59e0b"
                                           : isDraftChanged
@@ -8972,6 +9141,8 @@ async function handleCaregiverDropToShift(args: {
                                       outline:
                                         dragOverA1 === a1
                                           ? "2px dashed #60a5fa"
+                                          : dragSourceA1 === a1
+                                          ? "2px solid rgba(96,165,250,0.6)"
                                           : isBulkSelected
                                           ? "2px solid #fbbf24"
                                           : "1px dashed rgba(59,130,246,0.18)",
@@ -9173,6 +9344,47 @@ async function handleCaregiverDropToShift(args: {
                                         >
                                           <button
                                             type="button"
+                                            onClick={() => {
+                                              const copiedValue = draftByA1[a1] ?? "";
+                                              if (!norm(copiedValue)) return;
+
+                                              const payload: ScheduleCellDragPayload = {
+                                                sourceA1: a1,
+                                                sourceValue: copiedValue,
+                                                clientName: name,
+                                                dateStr: dateStrForDow,
+                                                dayLabel,
+                                                week,
+                                                mode: "copy",
+                                              };
+
+                                              setShiftClipboard(payload);
+                                              cancelInlineEdit(a1);
+                                              setSaveToast({
+                                                id: Date.now(),
+                                                kind: "success",
+                                                title: "Shift copied",
+                                                lines: ["Click any cell to paste it right away."],
+                                              });
+                                            }}
+                                            disabled={isSaving || !norm(draftByA1[a1] ?? "")}
+                                            style={{
+                                              border: "1px solid #2563eb",
+                                              background: "#eff6ff",
+                                              color: "#1d4ed8",
+                                              borderRadius: 8,
+                                              padding: "6px 10px",
+                                              cursor:
+                                                isSaving || !norm(draftByA1[a1] ?? "") ? "default" : "pointer",
+                                              fontWeight: 900,
+                                              fontSize: 12,
+                                            }}
+                                          >
+                                            Copy
+                                          </button>
+
+                                          <button
+                                            type="button"
                                             onClick={() => cancelInlineEdit(a1)}
                                             disabled={isSaving}
                                             style={{
@@ -9230,7 +9442,40 @@ async function handleCaregiverDropToShift(args: {
                                         </div>
                                       </div>
                                     ) : (
-                                      <ShiftCard
+                                      <div
+                                        draggable={Boolean(a1) && !bulkMode && !isSaving && Boolean(displayValue)}
+                                        onDragStart={(e) => {
+                                          if (!a1 || !displayValue || bulkMode || isSaving) {
+                                            e.preventDefault();
+                                            return;
+                                          }
+                                          beginScheduleCellDrag({
+                                            dragEvent: e,
+                                            a1,
+                                            value: displayValue,
+                                            clientName: name,
+                                            dateStr: dateStrForDow,
+                                            dayLabel,
+                                            mode: "move",
+                                          });
+                                        }}
+                                        onDragEnd={() => {
+                                          setDragSourceA1(null);
+                                          setDragOverA1(null);
+                                        }}
+                                        style={{
+                                          cursor:
+                                            Boolean(a1) && !bulkMode && !isSaving && Boolean(displayValue)
+                                              ? "grab"
+                                              : "default",
+                                        }}
+                                        title={
+                                          Boolean(a1) && !bulkMode && Boolean(displayValue)
+                                            ? "Drag to move this shift into another cell"
+                                            : undefined
+                                        }
+                                      >
+                                        <ShiftCard
   a1Key={a1 || `${r.row}_${dow}`}
   value={displayValue}
   status={cellStatus}
@@ -9264,6 +9509,7 @@ async function handleCaregiverDropToShift(args: {
   requests={ghostShiftsForCell}
   unpublishedCount={unpublishedCount}
 />
+                                      </div>
                                     )}
                                   </td>
                                 );

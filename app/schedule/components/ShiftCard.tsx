@@ -1422,6 +1422,7 @@ onOpenEditHistory,
   panelStorageKey?: string;
   panelInitial?: Partial<{ x: number; y: number; w: number; h: number }>;
 }) {
+const [showHoverHistoryIcon, setShowHoverHistoryIcon] = useState(false);
 const value =
   popupOnly && popupTarget
     ? `${popupTarget.caregiverName || "Open"}, ${popupTarget.startTime}-${popupTarget.endTime}`
@@ -2759,6 +2760,14 @@ return (
     e.preventDefault();
     handleDoubleClick(e);
   }}
+  onMouseEnter={() => setShowHoverHistoryIcon(true)}
+  onMouseLeave={() => setShowHoverHistoryIcon(false)}
+  onFocus={() => setShowHoverHistoryIcon(true)}
+  onBlur={(e) => {
+    const nextTarget = e.relatedTarget as Node | null;
+    if (nextTarget && e.currentTarget.contains(nextTarget)) return;
+    setShowHoverHistoryIcon(false);
+  }}
   onKeyDown={onKeyDownCard}
   style={{
     width: "100%",
@@ -2820,10 +2829,13 @@ return (
       color: fg,
       border: "1px solid rgba(255,255,255,0.5)",
       filter: "drop-shadow(0 1px 0 rgba(0,0,0,0.25))",
-      cursor: "pointer",
+      cursor: showHoverHistoryIcon ? "pointer" : "default",
       userSelect: "none",
       padding: 0,
       zIndex: 5,
+      opacity: showHoverHistoryIcon ? 1 : 0,
+      pointerEvents: showHoverHistoryIcon ? "auto" : "none",
+      transition: "opacity 120ms ease",
     }}
     aria-label="View edit history and rate"
     title="View edit history and rate"
@@ -2844,7 +2856,7 @@ return (
                 fontWeight: 900,
                 color: "#9ca3af",
                 userSelect: "none",
-                paddingLeft: showHistoryIcon ? 18 : 0,
+                paddingLeft: showHistoryIcon && showHoverHistoryIcon ? 18 : 0,
               }}
             >
               —
@@ -2940,7 +2952,7 @@ return (
                   fontSize: 12,
                   fontWeight: 950,
                   letterSpacing: 0.2,
-                  paddingLeft: showHistoryIcon ? 22 : 0,
+                  paddingLeft: showHistoryIcon && showHoverHistoryIcon ? 22 : 0,
                 }}
               >
                 {displayTime}
@@ -2953,7 +2965,7 @@ return (
                   whiteSpace: "nowrap",
                   overflow: "hidden",
                   textOverflow: "ellipsis",
-                  paddingLeft: showHistoryIcon ? 22 : 0,
+                  paddingLeft: showHistoryIcon && showHoverHistoryIcon ? 22 : 0,
                 }}
               >
                 {displayCaregiver}
