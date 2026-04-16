@@ -160,6 +160,7 @@ type CaregiverProfile = {
   nameOnSchedule: string;
   name: string;
   status?: string;
+  certification?: string | null;
   certifications?: string | string[] | null;
   address?: string | null;
 };
@@ -232,6 +233,22 @@ function containsCI(haystack: string, needle: string) {
 function normalizeCellText(raw: unknown): string {
   const s = String(raw ?? "");
   return s.replace(/[“”]/g, '"');
+}
+
+function sanitizeCertificationValue(raw: string | string[] | null | undefined): string {
+  const parts = Array.isArray(raw)
+    ? raw.map((item) => norm(item))
+    : norm(raw)
+        .split(",")
+        .map((item) => norm(item));
+
+  return parts
+    .filter(Boolean)
+    .filter((item) => {
+      const lowered = item.toLowerCase();
+      return lowered !== "none" && lowered !== "n/a" && lowered !== "na" && lowered !== "no";
+    })
+    .join(", ");
 }
 
 /** Parse "Name, 7:00AM-10:00AM" or "7:00AM-10:00AM" */
@@ -1354,6 +1371,7 @@ onOpenEditHistory,
   driveTimeEndpoint = "/api/drive-time",
 
   clientDescription = "",
+  unpublishedCount = 0,
   popupOnly = false,
   popupTarget = null,
   onPopupOnlyClose,
@@ -1397,6 +1415,7 @@ onOpenEditHistory,
   driveTimeEndpoint?: string;
 
   clientDescription?: string;
+  unpublishedCount?: number;
   popupOnly?: boolean;
   popupTarget?: PopupShiftTarget | null;
   onPopupOnlyClose?: () => void;
@@ -1530,12 +1549,15 @@ const showHistoryIcon =
   !isRequestedEmpty &&
   !isCancelled &&
   Boolean(shiftId);
+  const isUnpublished = unpublishedCount > 0 && !isEmpty && !isCancelled && !isRequested;
    const border = isEmpty
     ? "none"
     : isRequested
       ? "2px dashed rgba(234,88,12,0.85)" // ✅ dashed outline
       : isCancelled
         ? "1px solid #cbd5e1"
+        : isUnpublished
+          ? "3px solid #1d4ed8"
         : hasLocationIssue || hasClockIssue || isPastNoClocks
           ? "2px solid #ef4444"
           : hasClockGood
@@ -1547,6 +1569,8 @@ const showHistoryIcon =
       ? "0 0 0 2px rgba(234,88,12,0.10)" // ✅ subtle glow
       : isCancelled
         ? "0 1px 0 rgba(0,0,0,0.06)"
+        : isUnpublished
+          ? "0 0 0 3px rgba(37,99,235,0.28), 0 0 18px rgba(59,130,246,0.18)"
         : hasLocationIssue || hasClockIssue || isPastNoClocks
           ? "0 0 0 2px rgba(239,68,68,0.18)"
           : hasClockGood
@@ -1556,7 +1580,7 @@ const showHistoryIcon =
   const inText = clockDisplayLabelForPastOrProgress("in", tState, clockEval);
   const outText = clockDisplayLabelForPastOrProgress("out", tState, clockEval);
 
-  const showClockRow = expanded && !isEmpty && !isCancelled && tState !== "future" && tState !== "unknown";
+const showClockRow = expanded && !isEmpty && !isCancelled && tState !== "future" && tState !== "unknown";
   const showCombinedNoClock = !isEmpty && !isCancelled && tState === "past" && !clockEval.clockIn && !clockEval.clockOut;
 
  /** ---------- Shift Menu (FloatingPanel) state ---------- */
@@ -1640,6 +1664,7 @@ const popupLightBlur = isGlass ? "none" : "none";
   const [caregiverSearch, setCaregiverSearch] = useState("");
   type SortMode =
     | "smart"
+    | "cert_desc"
     | "history_desc"
     | "drive_asc"
     | "name_asc"
@@ -1900,7 +1925,8 @@ clientHistoryCache.set(key, { ts: Date.now(), data: cleaned });
         nameOnSchedule: norm(c?.nameOnSchedule),
         name: norm(c?.name),
         status: norm(c?.status),
-        certifications: c?.certifications ?? null,
+        certification: norm(c?.certification) || null,
+        certifications: c?.certifications ?? c?.certification ?? null,
         address: norm(c?.address) || null,
       }));
 
@@ -2209,7 +2235,22 @@ useEffect(() => {
     return out;
   }, [weekSchedule]);
 
-  // ✅ Active caregiver keys: anyone appearing on schedule this week (non-open)
+  /** ---------- Availability parsing (enrichment only) ---------- */
+  const availHeaders = useMemo(() => (availValues?.[0] ?? []).map((h) => norm(h)), [availValues]);
+  const availRowsAll = useMemo(() => (availValues?.length ? availValues.slice(1) : []), [availValues]);
+
+  const caregiverNameIdx = useMemo(() => availHeaders.findIndex((h) => h.toLowerCase() === "caregiver name"), [availHeaders]);
+  const caregiverIdIdx = useMemo(() => availHeaders.findIndex((h) => h.toLowerCase() === "caregiver id"), [availHeaders]);
+  const desiredHoursIdx = useMemo(() => availHeaders.findIndex((h) => h.toLowerCase() === "desired hours"), [availHeaders]);
+  const notesIdx = useMemo(
+    () => availHeaders.findIndex((h) => h.toLowerCase() === "notes" || h.toLowerCase() === "note"),
+    [availHeaders]
+  );
+  const dayColIndexForSelectedDow = useMemo(() => {
+    return availHeaders.findIndex((h) => dayHeaderToDow(h) === selectedDow);
+  }, [availHeaders, selectedDow]);
+
+  // ✅ Candidate caregiver keys: anyone on the schedule this week OR present in availability.
   const activeKeys = useMemo(() => {
     const set = new Set<string>();
     for (const s of weekSchedule) {
@@ -2221,26 +2262,25 @@ useEffect(() => {
       if (key.toLowerCase() === "open") continue;
       set.add(key);
     }
+
+    for (const row of availRowsAll) {
+      const cgId = caregiverIdIdx >= 0 ? norm(row[caregiverIdIdx]) : "";
+      const cgName = caregiverNameIdx >= 0 ? norm(row[caregiverNameIdx]) : "";
+      const key = (cgId || cgName).trim();
+      if (!key) continue;
+      if (key.toLowerCase() === "open") continue;
+      set.add(key);
+    }
+
     return set;
-  }, [weekSchedule]);
+  }, [weekSchedule, availRowsAll, caregiverIdIdx, caregiverNameIdx]);
 
   const caregiverKeysSig = useMemo(() => {
     return Array.from(activeKeys).map((k) => k.trim()).filter(Boolean).sort().join("|");
   }, [activeKeys]);
 
-  /** ---------- Availability parsing (enrichment only) ---------- */
-  const availHeaders = useMemo(() => (availValues?.[0] ?? []).map((h) => norm(h)), [availValues]);
-  const availRowsAll = useMemo(() => (availValues?.length ? availValues.slice(1) : []), [availValues]);
-
-  const caregiverNameIdx = useMemo(() => availHeaders.findIndex((h) => h.toLowerCase() === "caregiver name"), [availHeaders]);
-  const caregiverIdIdx = useMemo(() => availHeaders.findIndex((h) => h.toLowerCase() === "caregiver id"), [availHeaders]);
-  const desiredHoursIdx = useMemo(() => availHeaders.findIndex((h) => h.toLowerCase() === "desired hours"), [availHeaders]);
-  const dayColIndexForSelectedDow = useMemo(() => {
-    return availHeaders.findIndex((h) => dayHeaderToDow(h) === selectedDow);
-  }, [availHeaders, selectedDow]);
-
   const availabilityRowByAnyKey = useMemo(() => {
-    const out: Record<string, { availRaw: string; desiredRaw: string; name: string; id: string }> = {};
+    const out: Record<string, { availRaw: string; desiredRaw: string; notes: string; name: string; id: string }> = {};
     if (!availRowsAll.length || caregiverNameIdx < 0) return out;
 
     for (const r of availRowsAll) {
@@ -2250,13 +2290,14 @@ useEffect(() => {
 
       const availRaw = dayColIndexForSelectedDow >= 0 ? norm(r[dayColIndexForSelectedDow]) : "";
       const desiredRaw = desiredHoursIdx >= 0 ? norm(r[desiredHoursIdx]) : "";
+      const notes = notesIdx >= 0 ? norm(r[notesIdx]) : "";
 
-      if (id) out[normalizeKey(id)] = { availRaw, desiredRaw, name, id };
-      if (name) out[normalizeKey(name)] = { availRaw, desiredRaw, name, id };
+      if (id) out[normalizeKey(id)] = { availRaw, desiredRaw, notes, name, id };
+      if (name) out[normalizeKey(name)] = { availRaw, desiredRaw, notes, name, id };
     }
 
     return out;
-  }, [availRowsAll, caregiverNameIdx, caregiverIdIdx, desiredHoursIdx, dayColIndexForSelectedDow]);
+  }, [availRowsAll, caregiverNameIdx, caregiverIdIdx, desiredHoursIdx, notesIdx, dayColIndexForSelectedDow]);
 
   /** ---------- Client destination address ---------- */
   const clientDestination = useMemo(() => {
@@ -2274,14 +2315,16 @@ useEffect(() => {
   const driveAbortRef = useRef<AbortController | null>(null);
 
   /** ---------- Caregiver rows (ONE LIST, always ACTIVE) ---------- */
-  type CaregiverRow = {
+type CaregiverRow = {
   key: string; // caregiverId || caregiverName (from schedule)
   name: string;
   id: string;
+  certification: string;
 
   desiredMeta: DesiredHoursMeta;
   availRaw: string;
   availLabel: string;
+  availNotes: string;
   availSource: string;
 
   availabilityMatchType: AvailabilityMatchType;
@@ -2325,6 +2368,7 @@ useEffect(() => {
   for (const key of activeList) {
       let name = key;
       let id = "";
+      let certification = "";
 
       const hit =
         weekSchedule.find((s) => norm(s.caregiverId) === key) ||
@@ -2340,6 +2384,7 @@ useEffect(() => {
       if (prof) {
         name = norm(prof.name) || name;
         id = norm(prof.caregiverId) || id;
+        certification = sanitizeCertificationValue(prof.certifications || prof.certification);
       }
 
       const av =
@@ -2350,6 +2395,7 @@ useEffect(() => {
 
      const availRaw = norm(av?.availRaw);
 const desiredRaw = norm(av?.desiredRaw);
+const availNotes = norm(av?.notes);
 const desiredMeta = parseDesiredHours(desiredRaw);
 
 const dayShifts = scheduleMap[key]?.[selectedDow] ?? [];
@@ -2412,10 +2458,12 @@ const total =
   key,
   name,
   id,
+  certification,
 
   desiredMeta,
   availRaw,
   availLabel: norm(i?.caregiverAvailabilityLabel) || availabilityResult.label,
+  availNotes,
   availSource: norm(i?.caregiverAvailabilitySource),
 
   availabilityMatchType: availabilityResult.type,
@@ -2584,12 +2632,21 @@ const total =
   if (target == null) return Number.NEGATIVE_INFINITY;
   return target - c.totalHours;
 };
+    const certRank = (c: CaregiverRow) => (sanitizeCertificationValue(c.certification) ? 1 : 0);
 
     base.sort((a, b) => {
       const nameA = a.name.toLowerCase();
       const nameB = b.name.toLowerCase();
 
       if (sortMode === "name_asc") return nameA.localeCompare(nameB);
+
+      if (sortMode === "cert_desc") {
+        const aCert = certRank(a);
+        const bCert = certRank(b);
+        if (bCert !== aCert) return bCert - aCert;
+        if (b.scoreTotal !== a.scoreTotal) return b.scoreTotal - a.scoreTotal;
+        return nameA.localeCompare(nameB);
+      }
 
       if (sortMode === "history_desc") {
         if (b.historyCount !== a.historyCount) return b.historyCount - a.historyCount;
@@ -2878,7 +2935,7 @@ return (
                 </span>
               )}
 
-                            <div
+              <div
                 style={{
                   fontSize: 12,
                   fontWeight: 950,
@@ -2984,34 +3041,6 @@ return (
           paddingRight: 6,
         }}
       >
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-          }}
-          style={{
-            border: isGlass
-              ? "1px solid rgba(255,255,255,0.32)"
-              : "1px solid rgba(15,23,42,0.16)",
-            background: popupButtonBg,
-            borderRadius: 999,
-            padding: "7px 11px",
-            fontWeight: 950,
-            cursor: "default",
-            color: "#0b1220",
-            fontSize: 12,
-            whiteSpace: "nowrap",
-            opacity: 0.45,
-            backdropFilter: popupLightBlur,
-            WebkitBackdropFilter: popupLightBlur,
-            boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.18)" : "none",
-          }}
-          title="This popup stays on its original shift"
-          disabled={true}
-        >
-          Original
-        </button>
-
         <button
           type="button"
           onClick={(e) => {
@@ -3411,6 +3440,7 @@ return (
                 }}
               >
                 <option value="smart">Smart (score)</option>
+                <option value="cert_desc">Certification (yes → no)</option>
                 <option value="history_desc">History (high → low)</option>
                 <option value="drive_asc">Drive time (low → high)</option>
                 <option value="avail_filled_desc">Availability filled (yes → no)</option>
@@ -3431,7 +3461,7 @@ return (
             }}
           >
             <Pill clearMode={clearMode}>{caregivers.length} shown</Pill>
-            <Pill clearMode={clearMode}>Active this week: {stats.total}</Pill>
+            <Pill clearMode={clearMode}>On schedule or availability: {stats.total}</Pill>
             <Pill clearMode={clearMode}>Conflicts: {stats.conflicts}</Pill>
             {availTabName ? <Pill clearMode={clearMode}>Source: {availTabName}</Pill> : null}
 
@@ -3442,7 +3472,7 @@ return (
 
           {availValues.length > 0 && (caregiverNameIdx < 0 || dayColIndexForSelectedDow < 0) ? (
             <div style={{ fontSize: 12, fontWeight: 900, color: "#b45309" }}>
-              Heads up: availability headers didn’t match expected columns (Caregiver Name / day columns). We’ll still show all active caregivers.
+              Heads up: availability headers didn’t match expected columns (Caregiver Name / day columns). We’ll still show caregivers already on the schedule.
             </div>
           ) : null}
         </div>
@@ -3571,6 +3601,30 @@ return (
                         >
                           {cg.name}
                         </div>
+
+                        {sanitizeCertificationValue(cg.certification) ? (
+                          <span
+                            style={{
+                              flex: "0 0 auto",
+                              fontSize: 11,
+                              fontWeight: 1000,
+                              padding: "5px 9px",
+                              borderRadius: 999,
+                              background: isGlass ? "rgba(139,92,246,0.10)" : "rgba(139,92,246,0.12)",
+                              border: isGlass
+                                ? "1px solid rgba(255,255,255,0.24)"
+                                : "1px solid rgba(139,92,246,0.18)",
+                              color: "#6d28d9",
+                              whiteSpace: "nowrap",
+                              lineHeight: 1,
+                              backdropFilter: popupLightBlur,
+                              WebkitBackdropFilter: popupLightBlur,
+                            }}
+                            title={`Certification: ${sanitizeCertificationValue(cg.certification)}`}
+                          >
+                            {sanitizeCertificationValue(cg.certification)}
+                          </span>
+                        ) : null}
 
                         <span
                           style={{
@@ -3785,6 +3839,20 @@ return (
                         {(norm(cg.availLabel) || norm(cg.availSource)) && (
                           <AvailabilityPill label={cg.availLabel} source={cg.availSource} />
                         )}
+                        {norm(cg.availNotes) ? (
+                          <div
+                            style={{
+                              marginTop: 6,
+                              fontSize: 11,
+                              lineHeight: 1.35,
+                              color: "#475569",
+                              whiteSpace: "pre-wrap",
+                              wordBreak: "break-word",
+                            }}
+                          >
+                            <span style={{ fontWeight: 950, color: "#334155" }}>Notes:</span> {cg.availNotes}
+                          </div>
+                        ) : null}
                       </div>
                     </div>
 

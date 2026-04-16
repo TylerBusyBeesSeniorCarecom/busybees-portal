@@ -67,6 +67,12 @@ export async function GET() {
     const iName = idx("Name");
     const iStatus = idx("Status");
     const iCert = idx("Certification");
+    const iTeamLeader =
+      idx("Team Leader") >= 0
+        ? idx("Team Leader")
+        : idx("Team Lead") >= 0
+        ? idx("Team Lead")
+        : idx("Leader");
     const iRole = idx("Role");
     const iEmail = idx("Email");
     const iPhone = idx("Phone");
@@ -100,6 +106,7 @@ export async function GET() {
 
           status: iStatus >= 0 ? norm(r[iStatus]) : "",
           certification: iCert >= 0 ? norm(r[iCert]) : "",
+          teamLeader: iTeamLeader >= 0 ? norm(r[iTeamLeader]) : "",
           role: iRole >= 0 ? norm(r[iRole]) : "",
           email: iEmail >= 0 ? norm(r[iEmail]) : "",
           phone: iPhone >= 0 ? norm(r[iPhone]) : "",

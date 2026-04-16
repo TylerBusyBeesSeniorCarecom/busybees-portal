@@ -384,6 +384,18 @@ type ShiftRow = {
   dow: number; // 0=Sun ... 6=Sat
 };
 
+type PublishedShiftMeta = {
+  shiftId: string;
+  status: string;
+};
+
+type UnpublishedShiftDetail = {
+  clientName: string;
+  dateStr: string;
+  caregiverName: string;
+  status: BaseShiftStatus;
+};
+
 type ClockEntry = {
   clockInTime: string | null;
   clockOutTime: string | null;
@@ -601,6 +613,11 @@ function parseSearchTerms(raw: string): string[] {
     .filter(Boolean);
 }
 
+function isOpenShiftSearchTerm(term: string): boolean {
+  const t = normalizeKey(term).replace(/\s+/g, " ").trim();
+  return t === "open shifts" || t === "open shift";
+}
+
 function normalizeCellText(raw: unknown): string {
   const s = String(raw ?? "");
   return s.replace(/[“”]/g, '"');
@@ -764,6 +781,8 @@ function parseCaregiverNameFromAnyShiftText(cellValue: string): string {
   const v = norm(cellValue);
   if (!v) return "";
 
+  if (statusFromCellValue(v) === "canceled") return "";
+
   const s = normalizeCellText(v);
 
   // Filled: Tara K, 9:00AM-2:00PM
@@ -809,6 +828,49 @@ function parseFirstTimeRange(
     end: m[2].replace(/\s+/g, ""),
   };
 }
+
+function splitCellIntoShiftStrings(value: string): string[] {
+  return norm(value)
+    .split(/\n+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function isCancelledShiftText(value: string): boolean {
+  return normalizeCellText(value).includes("*");
+}
+
+function getVisibleUnfilledShiftLines(value: string): string[] {
+  return splitCellIntoShiftStrings(value).filter((shiftText) => {
+    if (isCancelledShiftText(shiftText)) return false;
+    const parsed = parseScheduleShiftCell(shiftText);
+    if (parsed.isCancelled) return false;
+    if (!parsed.startTime || !parsed.endTime) return false;
+    return parsed.baseStatus !== "Filled";
+  });
+}
+
+function desiredHoursRange(raw: string): { low: number; high: number } | null {
+  const value = norm(raw).toLowerCase();
+  if (!value) return null;
+  if (value.includes("as many as possible")) return { low: 40, high: 40 };
+
+  const rangeMatch = value.match(/(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)/);
+  if (rangeMatch) {
+    return {
+      low: Number(rangeMatch[1]) || 0,
+      high: Number(rangeMatch[2]) || 0,
+    };
+  }
+
+  const single = Number(value);
+  if (Number.isFinite(single) && single >= 0) {
+    return { low: single, high: single };
+  }
+
+  return null;
+}
+
 function buildConsideringShiftValueFromExisting(args: {
   existingValue: string;
   caregiverName: string;
@@ -820,6 +882,43 @@ function buildConsideringShiftValueFromExisting(args: {
   if (!timeRange) return null;
 
   return `(${caregiverName}, ${timeRange.start}-${timeRange.end}`;
+}
+
+function getInlineEditNameContext(value: string, cursor: number): {
+  lineStart: number;
+  lineEnd: number;
+  nameStart: number;
+  nameEnd: number;
+  prefix: string;
+  query: string;
+} | null {
+  const raw = String(value ?? "");
+  const safeCursor = Math.max(0, Math.min(cursor, raw.length));
+  const lineStart = raw.lastIndexOf("\n", Math.max(0, safeCursor - 1)) + 1;
+  const nextBreak = raw.indexOf("\n", safeCursor);
+  const lineEnd = nextBreak === -1 ? raw.length : nextBreak;
+  const lineText = raw.slice(lineStart, lineEnd);
+  const commaIdx = lineText.indexOf(",");
+  const editableEnd = commaIdx === -1 ? lineText.length : commaIdx;
+  const cursorInLine = safeCursor - lineStart;
+
+  if (cursorInLine > editableEnd) return null;
+
+  const editableText = lineText.slice(0, editableEnd);
+  const match = editableText.match(/^([\s\(\^"\$]*)(.*)$/);
+  const prefix = match?.[1] ?? "";
+  const query = match?.[2] ?? "";
+  const nameStart = lineStart + prefix.length;
+  const nameEnd = lineStart + editableEnd;
+
+  return {
+    lineStart,
+    lineEnd,
+    nameStart,
+    nameEnd,
+    prefix,
+    query: query.trim(),
+  };
 }
 /** ---------- Time helpers ---------- */
 
@@ -1608,6 +1707,10 @@ function compareDatesLoose(a: string, b: string) {
   return ta - tb;
 }
 
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function MessageBubbleIcon({ size = 18 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -1802,6 +1905,198 @@ function normalizeScheduleValues(values: RawValues): ShiftRow[] {
         dow: parseDateToDow(date),
       };
     });
+}
+
+function buildShiftLookupFromRows(rows: ShiftRow[]) {
+  const lookup: Record<string, string> = {};
+  for (const s of rows) {
+    const key = makeShiftLookupKey({
+      client: s.client,
+      date: s.date,
+      start: s.startTime,
+      end: s.endTime,
+      caregiver: s.caregiver || "",
+    });
+    if (s.shiftId) lookup[key] = s.shiftId;
+  }
+  return lookup;
+}
+
+function buildPublishedShiftMetaLookup(rows: ShiftRow[]) {
+  const lookup: Record<string, PublishedShiftMeta> = {};
+  for (const s of rows) {
+    const key = makeShiftLookupKey({
+      client: s.client,
+      date: s.date,
+      start: s.startTime,
+      end: s.endTime,
+      caregiver: s.caregiver || "",
+    });
+    lookup[key] = {
+      shiftId: s.shiftId,
+      status: s.status,
+    };
+  }
+  return lookup;
+}
+
+function baseStatusFromPublishedRowStatus(raw: string): BaseShiftStatus {
+  const s = norm(raw).toLowerCase();
+  if (!s) return "Unknown";
+  if (s.includes("pending")) return "PendingClientApproval";
+  if (s.includes("consider")) return "Considering";
+  if (s.includes("offer")) return "Offered";
+  if (s.includes("open")) return "Open";
+  if (s.includes("fill")) return "Filled";
+  return "Unknown";
+}
+
+function buildShiftRowsFromCellValue(args: {
+  value: string;
+  clientName: string;
+  dateStr: string;
+  idByNameOnSchedule: Record<string, string>;
+  preferredShiftIds?: string[];
+}): ShiftRow[] {
+  const lines = splitCellIntoShiftStrings(args.value);
+  const out: ShiftRow[] = [];
+  let preferredIndex = 0;
+
+  for (const line of lines) {
+    const parsed = parseScheduleShiftCell(line);
+    if (!parsed.startTime || !parsed.endTime) continue;
+
+    const caregiverName =
+      norm(parsed.caregiverName) || (parsed.baseStatus === "Open" ? "Open" : "");
+    const caregiverId = caregiverName
+      ? args.idByNameOnSchedule[normalizeKey(caregiverName)] || ""
+      : "";
+
+    out.push({
+      shiftId: args.preferredShiftIds?.[preferredIndex] || "",
+      date: args.dateStr,
+      client: args.clientName,
+      caregiver: caregiverName,
+      caregiverId,
+      startTime: parsed.startTime,
+      endTime: parsed.endTime,
+      status: parsed.baseStatus,
+      conflict: "",
+      dow: parseDateToDow(args.dateStr),
+    });
+
+    preferredIndex += 1;
+  }
+
+  return out;
+}
+
+function reconcileScheduleRowsForCell(args: {
+  currentRows: ShiftRow[];
+  clientName: string;
+  dateStr: string;
+  oldValue: string;
+  newValue: string;
+  idByNameOnSchedule: Record<string, string>;
+  preserveShiftIds?: string[];
+}) {
+  const oldRows = buildShiftRowsFromCellValue({
+    value: args.oldValue,
+    clientName: args.clientName,
+    dateStr: args.dateStr,
+    idByNameOnSchedule: args.idByNameOnSchedule,
+  });
+
+  const nextRows = buildShiftRowsFromCellValue({
+    value: args.newValue,
+    clientName: args.clientName,
+    dateStr: args.dateStr,
+    idByNameOnSchedule: args.idByNameOnSchedule,
+    preferredShiftIds: args.preserveShiftIds,
+  });
+
+  const oldKeyBag = new Map<string, number>();
+  for (const row of oldRows) {
+    const key = makeShiftLookupKey({
+      client: row.client,
+      date: row.date,
+      start: row.startTime,
+      end: row.endTime,
+      caregiver: row.caregiver || "",
+    });
+    oldKeyBag.set(key, (oldKeyBag.get(key) ?? 0) + 1);
+  }
+
+  const survivingRows = args.currentRows.filter((row) => {
+    if (normalizeKey(row.client) !== normalizeKey(args.clientName)) return true;
+    if (dateKey(row.date) !== dateKey(args.dateStr)) return true;
+
+    const rowKey = makeShiftLookupKey({
+      client: row.client,
+      date: row.date,
+      start: row.startTime,
+      end: row.endTime,
+      caregiver: row.caregiver || "",
+    });
+    const count = oldKeyBag.get(rowKey) ?? 0;
+    if (count <= 0) return true;
+    oldKeyBag.set(rowKey, count - 1);
+    return false;
+  });
+
+  return [...survivingRows, ...nextRows];
+}
+
+function countUnpublishedShiftsInCell(args: {
+  value: string;
+  clientName: string;
+  dateStr: string;
+  publishedLookup: Record<string, PublishedShiftMeta>;
+}) {
+  return getUnpublishedShiftDetailsInCell(args).length;
+}
+
+function getUnpublishedShiftDetailsInCell(args: {
+  value: string;
+  clientName: string;
+  dateStr: string;
+  publishedLookup: Record<string, PublishedShiftMeta>;
+}): UnpublishedShiftDetail[] {
+  const out: UnpublishedShiftDetail[] = [];
+
+  for (const shiftText of splitCellIntoShiftStrings(args.value)) {
+    if (isCancelledShiftText(shiftText)) continue;
+    const parsed = parseScheduleShiftCell(shiftText);
+    if (parsed.isCancelled) continue;
+    if (!parsed.startTime || !parsed.endTime) continue;
+
+    const caregiverName =
+      norm(parsed.caregiverName) || (parsed.baseStatus === "Open" ? "Open" : "");
+
+    const lookupKey = makeShiftLookupKey({
+      client: args.clientName,
+      date: args.dateStr,
+      start: parsed.startTime,
+      end: parsed.endTime,
+      caregiver: caregiverName,
+    });
+
+    const published = args.publishedLookup[lookupKey];
+    const publishedBaseStatus = published
+      ? baseStatusFromPublishedRowStatus(published.status)
+      : "Unknown";
+
+    if (!published || publishedBaseStatus === "Unknown" || publishedBaseStatus !== parsed.baseStatus) {
+      out.push({
+        clientName: args.clientName,
+        dateStr: args.dateStr,
+        caregiverName,
+        status: parsed.baseStatus,
+      });
+    }
+  }
+
+  return out;
 }
 
 function makeShiftLookupKey(args: {
@@ -2238,6 +2533,7 @@ const STICKY_DATE_ROW_TOP = STICKY_DAY_ROW_HEIGHT;
   const [locationMap, setLocationMap] = useState<LocationMap>({});
   const [shiftIdLookup, setShiftIdLookup] = useState<Record<string, string>>({});
   const [scheduleRows, setScheduleRows] = useState<ShiftRow[]>([]);
+  const [publishedScheduleRows, setPublishedScheduleRows] = useState<ShiftRow[]>([]);
 
   const shiftInfo = useShiftInfo({
     week,
@@ -2252,6 +2548,8 @@ const STICKY_DATE_ROW_TOP = STICKY_DAY_ROW_HEIGHT;
   const [idByNameOnSchedule, setIdByNameOnSchedule] = useState<Record<string, string>>({});
   const [caregiversLoading, setCaregiversLoading] = useState(false);
   const [caregiversError, setCaregiversError] = useState<string | null>(null);
+  const latestGridRequestRef = useRef(0);
+  const latestScheduleMapRequestRef = useRef(0);
 
   // ✅ applicants (from /api/employees)
   const [applicantsLoading, setApplicantsLoading] = useState(false);
@@ -2370,9 +2668,11 @@ const [onboardingOpen, setOnboardingOpen] = useState(false);
 });
 
 const [insertRowSaving, setInsertRowSaving] = useState(false);
+const [unpublishedModalOpen, setUnpublishedModalOpen] = useState(false);
   // filters
   const [selectedDow, setSelectedDow] = useState<number | null>(null);
   const [searchText, setSearchText] = useState("");
+  const [showUnfilledOnly, setShowUnfilledOnly] = useState(false);
   // expanded shift cards
   const [expandedA1ByWeek, setExpandedA1ByWeek] = useState<Record<WeekKind, Set<string>>>({
     cw: new Set(),
@@ -2406,6 +2706,9 @@ const [insertRowSaving, setInsertRowSaving] = useState(false);
       // inline cell editing
    const [editingA1, setEditingA1] = useState<string | null>(null);
   const [draftByA1, setDraftByA1] = useState<Record<string, string>>({});
+  const inlineEditTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const [inlineEditCursor, setInlineEditCursor] = useState(0);
+  const [inlineEditSuggestionIndex, setInlineEditSuggestionIndex] = useState(0);
   const [dragOverA1, setDragOverA1] = useState<string | null>(null);
 
   // allow independent cell save states
@@ -2472,8 +2775,6 @@ const selectedBulkCount = Object.keys(selectedBulkCells).length;
 }
 
 function closeInsertRowModal() {
-  if (insertRowSaving) return;
-
   setInsertRowModal({
     open: false,
     anchorRow: null,
@@ -2606,29 +2907,59 @@ const [availTabName, setAvailTabName] = useState<string>("");
   const [panelFilter, setPanelFilter] = useState<"all" | "certifiedActive" | "missingProfile">("all");
 
     async function loadGridForWeek(w: WeekKind) {
+    const requestId = ++latestGridRequestRef.current;
     const j = await fetchGrid(w);
+    if (requestId !== latestGridRequestRef.current) return j;
     setData(j);
+    return j;
   }
 
     async function refreshScheduleMapsForWeek(w: WeekKind) {
+    const requestId = ++latestScheduleMapRequestRef.current;
     const sched = await fetchScheduleMaps(w);
+    if (requestId !== latestScheduleMapRequestRef.current) return sched;
     setClockMap(sched.clockMap ?? {});
     setLocationMap(sched.locationMap ?? {});
     const rows = normalizeScheduleValues(sched.values ?? []);
+    setPublishedScheduleRows(rows);
     setScheduleRows(rows);
+    setShiftIdLookup(buildShiftLookupFromRows(rows));
+    return sched;
+  }
 
-    const lookup: Record<string, string> = {};
-    for (const s of rows) {
-      const key = makeShiftLookupKey({
-        client: s.client,
-        date: s.date,
-        start: s.startTime,
-        end: s.endTime,
-        caregiver: s.caregiver || "",
+  function syncLocalScheduleRowsForCell(args: {
+    clientName: string;
+    dateStr: string;
+    oldValue: string;
+    newValue: string;
+    preserveShiftIds?: string[];
+  }) {
+    setScheduleRows((prev) => {
+      const nextRows = reconcileScheduleRowsForCell({
+        currentRows: prev,
+        clientName: args.clientName,
+        dateStr: args.dateStr,
+        oldValue: args.oldValue,
+        newValue: args.newValue,
+        idByNameOnSchedule,
+        preserveShiftIds: args.preserveShiftIds,
       });
-      if (s.shiftId) lookup[key] = s.shiftId;
+      setShiftIdLookup(buildShiftLookupFromRows(nextRows));
+      return nextRows;
+    });
+  }
+
+  async function refreshScheduleStateInBackground(args?: { includeGrid?: boolean; includeGhosts?: boolean; includeEditLog?: boolean }) {
+    try {
+      await Promise.all([
+        args?.includeGrid ? loadGridForWeek(week) : Promise.resolve(),
+        refreshScheduleMapsForWeek(week),
+        args?.includeGhosts ? refreshGhostShiftsForWeek(week) : Promise.resolve(),
+        args?.includeEditLog ? refreshScheduleEditLogForWeek(week) : Promise.resolve(),
+      ]);
+    } catch (e) {
+      console.error("[CWWebSchedule] background refresh failed", e);
     }
-    setShiftIdLookup(lookup);
   }
 
     async function handlePublishSchedule() {
@@ -2694,8 +3025,11 @@ const [availTabName, setAvailTabName] = useState<string>("");
   }
 
   async function handleInsertRowSubmit() {
+    if (insertRowSaving) return;
+
     const insertAtRow = insertRowModal.insertAtRow;
     const clientName = norm(insertRowModal.clientName);
+    const currentWeek = week;
 
     if (!insertAtRow) {
       setSaveToast({
@@ -2717,62 +3051,87 @@ const [availTabName, setAvailTabName] = useState<string>("");
       return;
     }
 
-    try {
-      setInsertRowSaving(true);
+    setInsertRowSaving(true);
+    closeInsertRowModal();
+    setSaveToast({
+      id: Date.now(),
+      kind: "warning",
+      title: "Adding row",
+      lines: [`Adding ${clientName} near row ${insertAtRow} in the background.`],
+    });
 
-      const res = await fetch("/api/insert-row", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          sheetName: sheetLabelForWeek(week),
-          insertAtRow,
-          clientName,
-        }),
-      });
-
-      const text = await res.text();
-      let data: any = null;
-
+    void (async () => {
       try {
-        data = text ? JSON.parse(text) : null;
-      } catch {
-        throw new Error(`Non-JSON insert-row response (${res.status}): ${text.slice(0, 200)}`);
+        const res = await fetch("/api/insert-row", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            sheetName: sheetLabelForWeek(currentWeek),
+            insertAtRow,
+            clientName,
+          }),
+        });
+
+        const text = await res.text();
+        let data: any = null;
+
+        try {
+          data = text ? JSON.parse(text) : null;
+        } catch {
+          throw new Error(`Non-JSON insert-row response (${res.status}): ${text.slice(0, 200)}`);
+        }
+
+        if (!res.ok || !data?.success) {
+          throw new Error(data?.error || "Failed to insert row.");
+        }
+
+        let insertedRowVisible = false;
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          if (attempt > 0) await delay(250 * attempt);
+          const grid = await loadGridForWeek(currentWeek);
+          insertedRowVisible = Boolean(
+            grid?.ok &&
+              grid.body.rows.some(
+                (row) =>
+                  row.row === insertAtRow &&
+                  normalizeKey(row.clientName) === normalizeKey(clientName)
+              )
+          );
+          if (insertedRowVisible) break;
+        }
+
+        await Promise.all([
+          refreshScheduleMapsForWeek(currentWeek),
+          refreshGhostShiftsForWeek(currentWeek),
+          refreshScheduleEditLogForWeek(currentWeek),
+        ]);
+
+        if (!insertedRowVisible) {
+          throw new Error("Row insert was accepted, but the updated sheet did not appear yet. Please refresh once.");
+        }
+
+        setSaveToast({
+          id: Date.now(),
+          kind: "success",
+          title: "Row added",
+          lines: [
+            `Inserted row ${insertAtRow}.`,
+            `Client: ${clientName}`,
+          ],
+        });
+      } catch (err: any) {
+        setSaveToast({
+          id: Date.now(),
+          kind: "error",
+          title: "Add row failed",
+          lines: [err?.message || "Unable to insert the row."],
+        });
+      } finally {
+        setInsertRowSaving(false);
       }
-
-      if (!res.ok || !data?.success) {
-        throw new Error(data?.error || "Failed to insert row.");
-      }
-
-      await Promise.all([
-        loadGridForWeek(week),
-        refreshScheduleMapsForWeek(week),
-        refreshGhostShiftsForWeek(week),
-        refreshScheduleEditLogForWeek(week),
-      ]);
-
-      setSaveToast({
-        id: Date.now(),
-        kind: "success",
-        title: "Row added",
-        lines: [
-          `Inserted row ${insertAtRow}.`,
-          `Client: ${clientName}`,
-        ],
-      });
-
-      closeInsertRowModal();
-    } catch (err: any) {
-      setSaveToast({
-        id: Date.now(),
-        kind: "error",
-        title: "Add row failed",
-        lines: [err?.message || "Unable to insert the row."],
-      });
-    } finally {
-      setInsertRowSaving(false);
-    }
+    })();
   }
 
   async function refreshGhostShiftsForWeek(w: WeekKind) {
@@ -2970,8 +3329,6 @@ async function handleSaveClientDescription() {
     let alive = true;
 
     async function runAvail() {
-      if (!panelOpen) return;
-
       try {
         setAvailLoading(true);
         setAvailError(null);
@@ -3003,7 +3360,7 @@ async function handleSaveClientDescription() {
     return () => {
       alive = false;
     };
-  }, [panelOpen, week]);
+  }, [week]);
 
     useEffect(() => {
   if (!saveToast) return;
@@ -3175,7 +3532,10 @@ const selectedCellHistoryRows = useMemo(() => {
 
     const rows = useMemo(() => {
     const terms = parseSearchTerms(searchText);
-    if (!terms.length) return rowsAll;
+    if (!terms.length && !showUnfilledOnly) return rowsAll;
+
+    const openShiftFilter = terms.some((term) => isOpenShiftSearchTerm(term));
+    const textTerms = terms.filter((term) => !isOpenShiftSearchTerm(term));
 
     return rowsAll.filter((r) => {
       const name = norm(r.clientName);
@@ -3199,13 +3559,22 @@ const selectedCellHistoryRows = useMemo(() => {
           : originalValue;
       });
 
+      const hasOpenShift = cellTexts.some((cellText) => getVisibleUnfilledShiftLines(cellText).length > 0);
+
+      if (showUnfilledOnly && !hasOpenShift) return false;
+      if (openShiftFilter && !hasOpenShift) return false;
+
+      if (!showUnfilledOnly && !openShiftFilter && !textTerms.length) return true;
+
       const searchableText = [name, clientLocation, clientDescription, clientRate, ...cellTexts]
         .filter(Boolean)
         .join("\n");
 
-      return terms.some((term) => containsCI(searchableText, term));
+      if (!textTerms.length) return true;
+
+      return textTerms.some((term) => containsCI(searchableText, term));
     });
-  }, [rowsAll, searchText, clientsByName, draftMode, getDraftValue, week]);
+  }, [rowsAll, searchText, clientsByName, draftMode, getDraftValue, showUnfilledOnly, week]);
 
   const dayHeaders = data?.headers?.dayHeaders ?? ["Client Name", ...DOW_LABELS];
   const dateHeaders = data?.headers?.dateHeaders ?? ["Date", "", "", "", "", "", "", ""];
@@ -3641,6 +4010,7 @@ function resetBulkSearchUi(mode: "caregiver" | "client" | "status" | "manual") {
   }, [rows, draftMode, getDraftValue, week]);
 
 const totals = useMemo(() => {
+  let totalScheduledHours = 0;
   let totalHours = 0;
   const clientSet = new Set<string>();
   const caregiverSet = new Set<string>();
@@ -3667,10 +4037,14 @@ const totals = useMemo(() => {
 
       if (!v) continue;
 
+      const tr = parseFirstTimeRange(v);
+      if (tr && statusFromCellValue(v) !== "canceled") {
+        totalScheduledHours += durationHoursFromStartEnd(tr.start, tr.end);
+      }
+
       const status = statusFromCellValue(v);
       if (status !== "filled") continue;
 
-      const tr = parseFirstTimeRange(v);
       if (!tr) continue;
 
       totalHours += durationHoursFromStartEnd(tr.start, tr.end);
@@ -3683,17 +4057,29 @@ const totals = useMemo(() => {
   return {
     clientCount: clientSet.size,
     caregiverCount: caregiverSet.size,
+    totalScheduledHours,
     totalHours,
   };
 }, [rows, selectedDow, draftMode, getDraftValue, week]);
 
+const publishedShiftMetaLookup = useMemo(
+  () => buildPublishedShiftMetaLookup(publishedScheduleRows),
+  [publishedScheduleRows]
+);
+
 const weekProgress = useMemo(() => {
   const items: Array<{
+    key: string;
+    dow: number;
     status: ShiftStatus;
     dateStr: string;
     start: string;
     end: string;
+    isPast: boolean;
+    isCurrent: boolean;
   }> = [];
+
+  const nowMs = Date.now();
 
   for (const r of rows) {
     for (let dow = 0; dow < 7; dow++) {
@@ -3721,65 +4107,105 @@ const weekProgress = useMemo(() => {
       const dateStr = norm(dateHeaders?.[dow + 1]);
       if (!timeRange || !dateStr) continue;
 
+      const startMin = parseTimeToMinutes(timeRange.start);
+      const endMin = parseTimeToMinutes(timeRange.end);
+      const scheduledStart = buildScheduledDate(dateStr, timeRange.start);
+      let scheduledEnd = buildScheduledDate(dateStr, timeRange.end);
+      if (
+        scheduledStart &&
+        scheduledEnd &&
+        startMin != null &&
+        endMin != null &&
+        endMin <= startMin
+      ) {
+        scheduledEnd = addDays(scheduledEnd, 1);
+      }
+
+      const startMs = scheduledStart?.getTime() ?? null;
+      const endMs = scheduledEnd?.getTime() ?? null;
+      const isPast = endMs != null && endMs <= nowMs;
+      const isCurrent = startMs != null && endMs != null && startMs <= nowMs && nowMs < endMs;
+
       items.push({
+        key: `${r.clientName}-${dow}-${c?.a1 || `${dateStr}-${timeRange.start}-${timeRange.end}`}`,
+        dow,
         status,
         dateStr,
         start: timeRange.start,
         end: timeRange.end,
+        isPast,
+        isCurrent,
       });
     }
   }
 
-  if (week === "nw") {
-    const counts: Partial<Record<ShiftStatus, number>> = {};
-    for (const item of items) counts[item.status] = (counts[item.status] || 0) + 1;
-    const total = items.length;
+  const sortedItems = items
+    .slice()
+    .sort((a, b) => {
+      if (a.dow !== b.dow) return a.dow - b.dow;
+      const aStart = parseTimeToMinutes(a.start) ?? 0;
+      const bStart = parseTimeToMinutes(b.start) ?? 0;
+      if (aStart !== bStart) return aStart - bStart;
+      return a.key.localeCompare(b.key);
+    });
 
-    const segments = (["filled", "considering", "offered", "pending", "open"] as ShiftStatus[])
-      .map((status) => ({
-        status,
-        count: counts[status] || 0,
-        color: SHEET_COLORS[status],
-      }))
-      .filter((segment) => segment.count > 0)
-      .map((segment) => ({
-        ...segment,
-        pct: total ? (segment.count / total) * 100 : 0,
-      }));
+  const FUTURE_FILLED_COLOR = "#86d39b";
+  const CURRENT_SHIFT_COLOR = "#22c55e";
+  const PAST_SHIFT_COLOR = "#166534";
+  const statusLabel = (status: ShiftStatus) => {
+    if (status === "pending") return "Pending";
+    if (status === "open") return "Open";
+    if (status === "offered") return "Offered";
+    if (status === "considering") return "Considering";
+    if (status === "filled") return "Filled";
+    return "Other";
+  };
+  const colorForItem = (item: (typeof sortedItems)[number]) => {
+    if (item.isCurrent) return CURRENT_SHIFT_COLOR;
+    if (item.isPast) return PAST_SHIFT_COLOR;
+    if (item.status === "filled") return FUTURE_FILLED_COLOR;
+    if (item.status === "offered") return SHEET_COLORS.offered;
+    if (item.status === "considering") return SHEET_COLORS.considering;
+    if (item.status === "pending") return SHEET_COLORS.pending;
+    if (item.status === "open") return SHEET_COLORS.open;
+    return UI.border;
+  };
 
-    return {
-      kind: "next" as const,
-      total,
-      worked: 0,
-      segments,
-    };
-  }
+  const segments = sortedItems.map((item) => ({
+    key: item.key,
+    status: item.status,
+    label: item.isCurrent ? "In Progress" : item.isPast ? "Worked" : statusLabel(item.status),
+    color: colorForItem(item),
+    count: 1,
+    pct: sortedItems.length ? 100 / sortedItems.length : 0,
+    isPast: item.isPast,
+    isCurrent: item.isCurrent,
+    dateStr: item.dateStr,
+    start: item.start,
+    end: item.end,
+  }));
 
-  const now = new Date();
-  let worked = 0;
-  for (const item of items) {
-    const startMin = parseTimeToMinutes(item.start);
-    const endMin = parseTimeToMinutes(item.end);
-    const scheduledStart = buildScheduledDate(item.dateStr, item.start);
-    let scheduledEnd = buildScheduledDate(item.dateStr, item.end);
-    if (
-      scheduledStart &&
-      scheduledEnd &&
-      startMin != null &&
-      endMin != null &&
-      endMin <= startMin
-    ) {
-      scheduledEnd = addDays(scheduledEnd, 1);
+  const legendCounts = new Map<string, { key: string; label: string; color: string; count: number }>();
+  for (const segment of segments) {
+    const legendKey = segment.isCurrent ? "current" : segment.isPast ? "worked" : segment.status;
+    const prev = legendCounts.get(legendKey);
+    if (prev) prev.count += 1;
+    else {
+      legendCounts.set(legendKey, {
+        key: legendKey,
+        label: segment.label,
+        color: segment.color,
+        count: 1,
+      });
     }
-
-    if (scheduledEnd && scheduledEnd.getTime() <= now.getTime()) worked += 1;
   }
 
   return {
-    kind: "current" as const,
-    total: items.length,
-    worked,
-    segments: [],
+    kind: week === "nw" ? ("next" as const) : ("current" as const),
+    total: sortedItems.length,
+    worked: sortedItems.filter((item) => item.isPast).length,
+    segments,
+    legend: Array.from(legendCounts.values()),
   };
 }, [rows, selectedDow, draftMode, getDraftValue, week, dateHeaders]);
 
@@ -3884,6 +4310,28 @@ const weekProgress = useMemo(() => {
 
     return { byId, byName };
   }, [availRowsAll, caregiverNameIdx, caregiverIdIdx, desiredHoursIdx, notesIdx, dayCols]);
+
+  const caregiverCapacity = useMemo(() => {
+    let low = 0;
+    let high = 0;
+    const seen = new Set<string>();
+
+    for (const r of availRowsAll) {
+      const caregiverName = caregiverNameIdx >= 0 ? norm(r[caregiverNameIdx]) : "";
+      const caregiverId = caregiverIdIdx >= 0 ? norm(r[caregiverIdIdx]) : "";
+      const desiredHours = desiredHoursIdx >= 0 ? norm(r[desiredHoursIdx]) : "";
+      const key = normalizeKey(caregiverId || caregiverName);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+
+      const range = desiredHoursRange(desiredHours);
+      if (!range) continue;
+      low += range.low;
+      high += range.high;
+    }
+
+    return { low, high };
+  }, [availRowsAll, caregiverNameIdx, caregiverIdIdx, desiredHoursIdx]);
   const effectiveScheduleItemsForPanel = useMemo(() => {
     const items: ScheduleItem[] = [];
 
@@ -3920,6 +4368,9 @@ const weekProgress = useMemo(() => {
               )
             : originalValue;
 
+        const status = statusFromCellValue(effectiveValue);
+        if (status === "none" || status === "canceled") continue;
+
         const caregiverName = parseCaregiverNameFromAnyShiftText(effectiveValue);
         const timeRange = parseFirstTimeRange(effectiveValue);
         const dateStr = norm(dateHeaders?.[dow + 1]);
@@ -3943,7 +4394,7 @@ const weekProgress = useMemo(() => {
           dow,
           startTime: timeRange.start,
           endTime: timeRange.end,
-          status: statusFromCellValue(effectiveValue),
+          status,
           flagged: liveMatch
             ? isFlaggedShiftFromScheduleRow(liveMatch, clockMap, locationMap)
             : false,
@@ -4010,6 +4461,31 @@ const weekProgress = useMemo(() => {
       status: c.status,
     }));
   }, [caregiversById]);
+
+  const inlineEditCaregiverNames = useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+
+    for (const prof of Object.values(caregiversById)) {
+      const name = norm(prof.nameOnSchedule) || norm(prof.name);
+      if (!name) continue;
+      const key = normalizeKey(name);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(name);
+    }
+
+    for (const name of scheduleCaregiverNames) {
+      const clean = norm(name);
+      if (!clean) continue;
+      const key = normalizeKey(clean);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(clean);
+    }
+
+    return out.sort((a, b) => fullNameSortKey(a).localeCompare(fullNameSortKey(b)));
+  }, [caregiversById, scheduleCaregiverNames]);
 
     /** ---------- Schedule summaries for caregiver panel ---------- */
   type ScheduleItem = {
@@ -4234,12 +4710,148 @@ const weekProgress = useMemo(() => {
     return caregiverPanelRowsAll.reduce((sum, r) => sum + r.flaggedCount, 0);
   }, [caregiverPanelRowsAll]);
 
+  const unpublishedShiftsTotal = useMemo(() => {
+    let count = 0;
+
+    for (const r of rows) {
+      const clientName = norm(r.clientName);
+      if (!clientName) continue;
+
+      for (const dow of visibleDows) {
+        const c = r.cells[dow];
+        const originalValue = norm(c?.value);
+        const value =
+          draftMode && c?.a1
+            ? norm(
+                getDraftValue({
+                  a1: c.a1,
+                  week,
+                  originalValue,
+                })
+              )
+            : originalValue;
+
+        const dateStrForDow = norm(dateHeaders?.[dow + 1]);
+        if (!value || !dateStrForDow) continue;
+
+        count += countUnpublishedShiftsInCell({
+          value,
+          clientName,
+          dateStr: dateStrForDow,
+          publishedLookup: publishedShiftMetaLookup,
+        });
+      }
+    }
+
+    return count;
+  }, [rows, visibleDows, draftMode, getDraftValue, week, dateHeaders, publishedShiftMetaLookup]);
+
+  const unpublishedShiftDetails = useMemo(() => {
+    const out: UnpublishedShiftDetail[] = [];
+
+    for (const r of rows) {
+      const clientName = norm(r.clientName);
+      if (!clientName) continue;
+
+      for (const dow of visibleDows) {
+        const c = r.cells[dow];
+        const originalValue = norm(c?.value);
+        const value =
+          draftMode && c?.a1
+            ? norm(
+                getDraftValue({
+                  a1: c.a1,
+                  week,
+                  originalValue,
+                })
+              )
+            : originalValue;
+
+        const dateStrForDow = norm(dateHeaders?.[dow + 1]);
+        if (!value || !dateStrForDow) continue;
+
+        out.push(
+          ...getUnpublishedShiftDetailsInCell({
+            value,
+            clientName,
+            dateStr: dateStrForDow,
+            publishedLookup: publishedShiftMetaLookup,
+          })
+        );
+      }
+    }
+
+    return out.sort((a, b) => {
+      const dateCmp = dateKey(a.dateStr).localeCompare(dateKey(b.dateStr));
+      if (dateCmp !== 0) return dateCmp;
+      const clientCmp = a.clientName.localeCompare(b.clientName);
+      if (clientCmp !== 0) return clientCmp;
+      return a.caregiverName.localeCompare(b.caregiverName);
+    });
+  }, [rows, visibleDows, draftMode, getDraftValue, week, dateHeaders, publishedShiftMetaLookup]);
+
+  const inlineEditNameContext = useMemo(() => {
+    if (!editingA1) return null;
+    return getInlineEditNameContext(draftByA1[editingA1] ?? "", inlineEditCursor);
+  }, [draftByA1, editingA1, inlineEditCursor]);
+
+  const inlineEditSuggestions = useMemo(() => {
+    if (!editingA1 || !inlineEditNameContext) return [];
+
+    const query = normalizeKey(inlineEditNameContext.query);
+    const ranked = inlineEditCaregiverNames
+      .map((name) => {
+        const key = normalizeKey(name);
+        const starts = query ? key.startsWith(query) : false;
+        const contains = query ? key.includes(query) : true;
+        return { name, key, starts, contains };
+      })
+      .filter((item) => (query ? item.contains : true))
+      .sort((a, b) => {
+        if (a.starts !== b.starts) return a.starts ? -1 : 1;
+        return fullNameSortKey(a.name).localeCompare(fullNameSortKey(b.name));
+      })
+      .map((item) => item.name);
+
+    return ranked.slice(0, 3);
+  }, [editingA1, inlineEditCaregiverNames, inlineEditNameContext]);
+
+  useEffect(() => {
+    setInlineEditSuggestionIndex(0);
+  }, [editingA1, inlineEditSuggestions.length]);
+
+  function applyInlineEditSuggestion(nameOnSchedule: string) {
+    if (!editingA1 || !inlineEditNameContext) return;
+
+    const currentValue = draftByA1[editingA1] ?? "";
+    const nextValue =
+      currentValue.slice(0, inlineEditNameContext.nameStart) +
+      nameOnSchedule +
+      currentValue.slice(inlineEditNameContext.nameEnd);
+    const nextCursor = inlineEditNameContext.nameStart + nameOnSchedule.length;
+
+    setDraftByA1((prev) => ({
+      ...prev,
+      [editingA1]: nextValue,
+    }));
+    setInlineEditCursor(nextCursor);
+
+    requestAnimationFrame(() => {
+      const el = inlineEditTextareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(nextCursor, nextCursor);
+    });
+  }
+
     function startInlineEdit(a1: string, currentValue: string) {
     setEditingA1(a1);
     setDraftByA1((prev) => ({
       ...prev,
       [a1]: currentValue,
     }));
+    setInlineEditCursor(currentValue.length);
+    setInlineEditSuggestionIndex(0);
   }
 
   function cancelInlineEdit(a1: string) {
@@ -4249,6 +4861,7 @@ const weekProgress = useMemo(() => {
       delete next[a1];
       return next;
     });
+    setInlineEditSuggestionIndex(0);
   }
  function openEditHistoryForCell(args: {
   a1: string;
@@ -4377,8 +4990,17 @@ const weekProgress = useMemo(() => {
     shiftDateForSave: string;
     dayLabel: string;
     weekOf?: string;
+    backgroundRefresh?: boolean;
   }) {
-  const { a1, newVal, clientName, shiftDateForSave, dayLabel, weekOf } = args;
+  const {
+    a1,
+    newVal,
+    clientName,
+    shiftDateForSave,
+    dayLabel,
+    weekOf,
+    backgroundRefresh = true,
+  } = args;
 
   let oldVal = "";
   const snapshot = data;
@@ -4523,6 +5145,14 @@ const weekProgress = useMemo(() => {
       return next;
     });
 
+    syncLocalScheduleRowsForCell({
+      clientName,
+      dateStr: shiftDateForSave,
+      oldValue: oldVal,
+      newValue: newVal,
+      preserveShiftIds: currentShiftId ? [currentShiftId] : [],
+    });
+
     // close editor immediately so scheduler can keep moving
     cancelInlineEdit(a1);
 
@@ -4555,19 +5185,19 @@ const weekProgress = useMemo(() => {
       accessPoint: "CWWebSchedule inline edit",
     });
 
-    markCellHasEditHistory({
+markCellHasEditHistory({
   week,
   a1,
   clientName,
   dateStr: shiftDateForSave,
 });
 
-// re-sync from source-of-truth sheet
-await Promise.all([
-  loadGridForWeek(week),
-  refreshScheduleMapsForWeek(week),
-  refreshScheduleEditLogForWeek(week),
-]);
+    if (backgroundRefresh) {
+      void refreshScheduleStateInBackground({
+        includeGrid: false,
+        includeEditLog: true,
+      });
+    }
     if (parsed.conflictMatches.length > 0) {
       setConflictHighlight({
         a1,
@@ -4601,6 +5231,14 @@ await Promise.all([
       }
 
       return next;
+    });
+
+    syncLocalScheduleRowsForCell({
+      clientName,
+      dateStr: shiftDateForSave,
+      oldValue: newVal,
+      newValue: oldVal,
+      preserveShiftIds: currentShiftId ? [currentShiftId] : [],
     });
 
     setEditingA1(a1);
@@ -4773,9 +5411,17 @@ async function applyBulkStatusChange(args: {
           shiftDateForSave: cell.dateStr,
           dayLabel: cell.dayLabel,
           weekOf: weekStartYmd,
+          backgroundRefresh: false,
         });
         successes.push(`${cell.clientName} • ${cell.dayLabel}`);
       }
+    }
+
+    if (!draftMode && successes.length) {
+      void refreshScheduleStateInBackground({
+        includeGrid: false,
+        includeEditLog: true,
+      });
     }
 
     setSaveToast({
@@ -5458,27 +6104,79 @@ async function handleCaregiverDropToShift(args: {
     <div
       style={{
         marginTop: 10,
-        display: "flex",
-        gap: 10,
-        alignItems: "center",
-        flexWrap: "wrap",
       }}
     >
-      <input
-        value={searchText ?? ""}
-        onChange={(e) => setSearchText(e.target.value)}
-        placeholder="Search clients/caregivers… use commas for multiple"
+      <div
         style={{
-          marginLeft: "auto",
-          width: 320,
+          background: UI.panelBg,
           border: `1px solid ${UI.border}`,
           borderRadius: 12,
           padding: "8px 10px",
-          fontSize: 13,
-          outline: "none",
-          background: UI.panelBg,
+          width: "100%",
         }}
-      />
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
+          <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>
+            {week === "nw" ? "Next Week Shift Timeline" : "Current Week Shift Timeline"}
+          </div>
+          <div style={{ fontSize: 12, fontWeight: 900, color: UI.text }}>
+            {week === "nw"
+              ? `${weekProgress.total} shifts`
+              : `${weekProgress.worked}/${weekProgress.total} worked`}
+          </div>
+        </div>
+
+        <div
+          style={{
+            marginTop: 8,
+            height: 14,
+            borderRadius: 999,
+            overflow: "hidden",
+            background: "#eef2f7",
+            border: `1px solid ${UI.borderSoft}`,
+            display: "flex",
+          }}
+        >
+          {weekProgress.total ? (
+            weekProgress.segments.map((segment) => (
+              <div
+                key={segment.key}
+                title={`${segment.label}: ${segment.dateStr} ${segment.start}-${segment.end}`}
+                style={{
+                  width: `${segment.pct}%`,
+                  background: segment.color,
+                }}
+              />
+            ))
+          ) : (
+            <div style={{ width: "100%", background: "#e5e7eb" }} />
+          )}
+        </div>
+
+        <div style={{ marginTop: 8, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+          {weekProgress.legend.length ? (
+            weekProgress.legend.map((segment) => (
+              <div
+                key={`legend_${segment.key}`}
+                style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 11, color: UI.textDim, fontWeight: 800 }}
+              >
+                <span
+                  style={{
+                    width: 10,
+                    height: 10,
+                    borderRadius: 999,
+                    background: segment.color,
+                    flex: "0 0 auto",
+                  }}
+                />
+                {segment.label} {segment.count}
+              </div>
+            ))
+          ) : (
+            <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>No scheduled shifts yet.</div>
+          )}
+        </div>
+      </div>
     </div>
 
     <div
@@ -5491,6 +6189,18 @@ async function handleCaregiverDropToShift(args: {
       }}
     >
      <div
+  style={{
+    background: UI.panelBg,
+    border: `1px solid ${UI.border}`,
+    borderRadius: 12,
+    padding: "8px 10px",
+  }}
+>
+  <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Total Hours</div>
+  <div style={{ fontSize: 16, fontWeight: 900 }}>{totals.totalScheduledHours.toFixed(1)}</div>
+</div>
+
+<div
   style={{
     background: UI.panelBg,
     border: `1px solid ${UI.border}`,
@@ -5534,8 +6244,10 @@ async function handleCaregiverDropToShift(args: {
     padding: "8px 10px",
   }}
 >
-  <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Flagged Shifts</div>
-  <div style={{ fontSize: 16, fontWeight: 900 }}>{flaggedShiftsTotal}</div>
+  <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Caregiver Capacity</div>
+  <div style={{ fontSize: 16, fontWeight: 900 }}>
+    {availLoading ? "…" : `${caregiverCapacity.low}-${caregiverCapacity.high}`}
+  </div>
 </div>
 
 <div
@@ -5544,87 +6256,31 @@ async function handleCaregiverDropToShift(args: {
     border: `1px solid ${UI.border}`,
     borderRadius: 12,
     padding: "8px 10px",
-    minWidth: 280,
-    flex: "1 1 320px",
   }}
 >
-  <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
-    <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>
-      {week === "nw" ? "Next Week Shift Status" : "Current Week Worked Progress"}
-    </div>
-    <div style={{ fontSize: 12, fontWeight: 900, color: UI.text }}>
-      {week === "nw"
-        ? `${weekProgress.total} shifts`
-        : `${weekProgress.worked}/${weekProgress.total} worked`}
-    </div>
-  </div>
-
-  <div
-    style={{
-      marginTop: 8,
-      height: 14,
-      borderRadius: 999,
-      overflow: "hidden",
-      background: "#eef2f7",
-      border: `1px solid ${UI.borderSoft}`,
-      display: "flex",
-    }}
-  >
-    {week === "nw" ? (
-      weekProgress.total ? (
-        weekProgress.segments.map((segment) => (
-          <div
-            key={segment.status}
-            title={`${segment.status}: ${segment.count}`}
-            style={{
-              width: `${segment.pct}%`,
-              background: segment.color,
-            }}
-          />
-        ))
-      ) : (
-        <div style={{ width: "100%", background: "#e5e7eb" }} />
-      )
-    ) : (
-      <div
-        style={{
-          width: `${weekProgress.total ? (weekProgress.worked / weekProgress.total) * 100 : 0}%`,
-          background: "#16a34a",
-        }}
-      />
-    )}
-  </div>
-
-  <div style={{ marginTop: 8, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
-    {week === "nw" ? (
-      weekProgress.segments.length ? (
-        weekProgress.segments.map((segment) => (
-          <div
-            key={`legend_${segment.status}`}
-            style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 11, color: UI.textDim, fontWeight: 800 }}
-          >
-            <span
-              style={{
-                width: 10,
-                height: 10,
-                borderRadius: 999,
-                background: segment.color,
-                flex: "0 0 auto",
-              }}
-            />
-            {segment.status === "pending" ? "Pending" : segment.status[0].toUpperCase() + segment.status.slice(1)} {segment.count}
-          </div>
-        ))
-      ) : (
-        <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>No scheduled shifts yet.</div>
-      )
-    ) : (
-      <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>
-        Worked shifts are counted when the scheduled shift end time is in the past.
-      </div>
-    )}
-  </div>
+  <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Flagged Shifts</div>
+  <div style={{ fontSize: 16, fontWeight: 900 }}>{flaggedShiftsTotal}</div>
 </div>
+
+<button
+  type="button"
+  onClick={() => {
+    if (!unpublishedShiftsTotal) return;
+    setUnpublishedModalOpen(true);
+  }}
+  style={{
+    background: UI.panelBg,
+    border: `1px solid ${UI.border}`,
+    borderRadius: 12,
+    padding: "8px 10px",
+    textAlign: "left",
+    cursor: unpublishedShiftsTotal ? "pointer" : "default",
+    opacity: unpublishedShiftsTotal ? 1 : 0.72,
+  }}
+>
+  <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>Unpublished Shifts</div>
+  <div style={{ fontSize: 16, fontWeight: 900 }}>{unpublishedShiftsTotal}</div>
+</button>
 
 <div
   style={{
@@ -5635,27 +6291,51 @@ async function handleCaregiverDropToShift(args: {
     flexWrap: "wrap",
   }}
 >
-  <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>Panel filter</div>
-  <select
-    value={panelFilter}
-    onChange={(e) => setPanelFilter(e.target.value as any)}
+  <button
+    type="button"
+    onClick={() => setShowUnfilledOnly((prev) => !prev)}
     style={{
       border: `1px solid ${UI.border}`,
       borderRadius: 12,
       padding: "8px 10px",
       fontSize: 13,
-      outline: "none",
-      background: UI.panelBg,
-      minWidth: 280,
-      fontWeight: 800,
+      background: showUnfilledOnly ? UI.accentSoft : UI.panelBg,
+      color: showUnfilledOnly ? UI.accentText : UI.text,
+      fontWeight: 900,
+      cursor: "pointer",
+      whiteSpace: "nowrap",
     }}
-    title="Filter the caregiver panel"
+    title={showUnfilledOnly ? "Show all shifts" : "Show only unfilled shifts"}
   >
-    <option value="all">Caregivers on schedule (active)</option>
-    <option value="certifiedActive">Caregivers with certification (active)</option>
-    <option value="missingProfile">On schedule, missing caregiver profile</option>
-  </select>
+    {showUnfilledOnly ? "Unfilled Shifts On" : "Unfilled Shifts"}
+  </button>
 </div>
+
+    <div
+      style={{
+        marginTop: 10,
+        display: "flex",
+        gap: 10,
+        alignItems: "center",
+        flexWrap: "wrap",
+      }}
+    >
+      <input
+        value={searchText ?? ""}
+        onChange={(e) => setSearchText(e.target.value)}
+        placeholder="Search clients/caregivers… use commas for multiple"
+        style={{
+          marginLeft: "auto",
+          width: 320,
+          border: `1px solid ${UI.border}`,
+          borderRadius: 12,
+          padding: "8px 10px",
+          fontSize: 13,
+          outline: "none",
+          background: UI.panelBg,
+        }}
+      />
+    </div>
 </div>
 
     {draftMode ? (
@@ -6767,6 +7447,50 @@ async function handleCaregiverDropToShift(args: {
           : "Add Below"}
       </button>
     </div>
+  </div>
+</Modal>
+  <Modal
+  open={unpublishedModalOpen}
+  title={`Unpublished Shifts • ${unpublishedShiftsTotal}`}
+  onClose={() => setUnpublishedModalOpen(false)}
+>
+  <div style={{ maxHeight: "70vh", overflowY: "auto", paddingRight: 6 }}>
+    {unpublishedShiftDetails.length === 0 ? (
+      <div style={{ fontSize: 13, color: UI.textDim }}>No unpublished shifts.</div>
+    ) : (
+      <div style={{ display: "grid", gap: 8 }}>
+        {unpublishedShiftDetails.map((item, idx) => (
+          <div
+            key={`${item.clientName}_${item.dateStr}_${item.caregiverName}_${item.status}_${idx}`}
+            style={{
+              border: `1px solid ${UI.borderSoft}`,
+              borderRadius: 12,
+              padding: "10px 12px",
+              background: "#ffffff",
+              display: "grid",
+              gap: 4,
+            }}
+          >
+            <div style={{ fontSize: 13, fontWeight: 950, color: UI.text }}>{item.clientName}</div>
+            <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 800 }}>
+              {formatBulkMessageDate(item.dateStr)}
+            </div>
+            <div style={{ fontSize: 12, color: UI.text, fontWeight: 850 }}>
+              Caregiver: {item.caregiverName || "Open"}
+            </div>
+            <div
+              style={{
+                fontSize: 12,
+                fontWeight: 900,
+                color: bulkStatusTone(item.status).text,
+              }}
+            >
+              Status: {item.status}
+            </div>
+          </div>
+        ))}
+      </div>
+    )}
   </div>
 </Modal>
   <Modal
@@ -7933,6 +8657,7 @@ async function handleCaregiverDropToShift(args: {
                           return (
                             <tr key={r.row}>
                               <td
+                                className={rowIsEmpty ? "cw-empty-client-cell" : "cw-client-cell"}
                                 style={{
                                   position: "sticky",
                                   left: 0,
@@ -7953,88 +8678,58 @@ async function handleCaregiverDropToShift(args: {
                                     : `Status: ${status} • Double click for profile`
                                 }
                               >
-                                                                <div
+                                <div
                                   style={{
-                                    display: "flex",
-                                    justifyContent: "space-between",
-                                    gap: 10,
-                                    alignItems: "baseline",
+                                    display: "grid",
+                                    gap: 6,
                                     minWidth: 0,
+                                    position: "relative",
+                                    minHeight: rowIsEmpty ? 28 : undefined,
                                   }}
                                 >
                                   <div
                                     style={{
                                       display: "flex",
                                       gap: 8,
-                                      alignItems: "baseline",
+                                      alignItems: "flex-start",
                                       minWidth: 0,
-                                      flex: "1 1 auto",
+                                      paddingRight: rowIsEmpty ? 0 : 28,
+                                      justifyContent: rowIsEmpty ? "center" : "flex-start",
                                     }}
                                   >
-                                    <div
-                                      role="button"
-                                      tabIndex={0}
-                                      onDoubleClick={() => openClientProfile(r.clientName || "")}
-                                      onKeyDown={(e) => {
-                                        if (e.key === "Enter" || e.key === " ") {
-                                          e.preventDefault();
-                                          openClientProfile(r.clientName || "");
-                                        }
-                                      }}
-                                      style={{
-                                        border: "none",
-                                        background: "transparent",
-                                        padding: 0,
-                                        margin: 0,
-                                        cursor: "pointer",
-                                        textAlign: "left",
-                                        color: "inherit",
-                                        font: "inherit",
-                                        fontWeight: 900,
-                                        overflow: "hidden",
-                                        textOverflow: "ellipsis",
-                                        whiteSpace: "nowrap",
-                                        minWidth: 0,
-                                        flex: "1 1 auto",
-                                        outline: "none",
-                                      }}
-                                      title="Double click (or Enter/Space) to open client profile"
-                                    >
-                                      {r.clientName || ""}
-                                    </div>
-
-                                  <button
-  type="button"
-  onClick={() =>
-    openInsertRowModal({
-      anchorRow: r.row,
-      anchorClientName: r.clientName || "",
-    })
-  }
-  title={`Add row near ${r.clientName || "this row"}`}
-  aria-label={`Add row near ${r.clientName || "this row"}`}
-  style={{
-    width: 22,
-    height: 22,
-    border: `1px solid ${UI.border}`,
-    background: "#fff8e1",
-    color: UI.text,
-    borderRadius: 999,
-    padding: 0,
-    fontSize: 14,
-    fontWeight: 1000,
-    cursor: "pointer",
-    lineHeight: "20px",
-    textAlign: "center",
-    flex: "0 0 auto",
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-  }}
->
-  +
-</button>
-
+                                    {!rowIsEmpty ? (
+                                      <div
+                                        role="button"
+                                        tabIndex={0}
+                                        onDoubleClick={() => openClientProfile(r.clientName || "")}
+                                        onKeyDown={(e) => {
+                                          if (e.key === "Enter" || e.key === " ") {
+                                            e.preventDefault();
+                                            openClientProfile(r.clientName || "");
+                                          }
+                                        }}
+                                        style={{
+                                          border: "none",
+                                          background: "transparent",
+                                          padding: 0,
+                                          margin: 0,
+                                          cursor: "pointer",
+                                          textAlign: "left",
+                                          color: "inherit",
+                                          font: "inherit",
+                                          fontWeight: 900,
+                                          whiteSpace: "normal",
+                                          wordBreak: "break-word",
+                                          lineHeight: 1.2,
+                                          minWidth: 0,
+                                          flex: "1 1 auto",
+                                          outline: "none",
+                                        }}
+                                        title="Double click (or Enter/Space) to open client profile"
+                                      >
+                                        {r.clientName || ""}
+                                      </div>
+                                    ) : null}
                                     {(() => {
                                       const ck = clientKey;
                                       const b = ck ? badgeByClientKey[ck] : null;
@@ -8090,6 +8785,45 @@ async function handleCaregiverDropToShift(args: {
                                     })()}
                                   </div>
 
+                                  <button
+                                    className="cw-row-add-button"
+                                    type="button"
+                                    onClick={() =>
+                                      openInsertRowModal({
+                                        anchorRow: r.row,
+                                        anchorClientName: r.clientName || "",
+                                      })
+                                    }
+                                    title={`Add row near ${r.clientName || "this row"}`}
+                                    aria-label={`Add row near ${r.clientName || "this row"}`}
+                                    style={{
+                                      position: rowIsEmpty ? "static" : "absolute",
+                                      top: rowIsEmpty ? undefined : 0,
+                                      right: rowIsEmpty ? undefined : 0,
+                                      width: 18,
+                                      height: 18,
+                                      border: `1px solid ${UI.border}`,
+                                      background: "#fff8e1",
+                                      color: UI.text,
+                                      borderRadius: 999,
+                                      padding: 0,
+                                      fontSize: 11,
+                                      fontWeight: 1000,
+                                      cursor: "pointer",
+                                      lineHeight: "16px",
+                                      textAlign: "center",
+                                      display: "inline-flex",
+                                      alignItems: "center",
+                                      justifyContent: "center",
+                                      margin: rowIsEmpty ? "0 auto" : 0,
+                                      opacity: 0,
+                                      pointerEvents: "none",
+                                      transition: "opacity 120ms ease",
+                                    }}
+                                  >
+                                    +
+                                  </button>
+
                                   {showClientHours ? (
                                     <span
                                       style={{
@@ -8120,6 +8854,23 @@ async function handleCaregiverDropToShift(args: {
                                         })
                                       )
                                     : originalValue;
+                                const visibleShiftLines = showUnfilledOnly
+                                  ? getVisibleUnfilledShiftLines(value)
+                                  : null;
+                                const displayValue = showUnfilledOnly
+                                  ? visibleShiftLines?.join("\n") || ""
+                                  : value;
+                                const dateStrForDow = norm(dateHeaders?.[dow + 1]);
+                                const dayLabel = dayHeaders?.[dow + 1] || DOW_LABELS[dow];
+                                const unpublishedCount =
+                                  displayValue && dateStrForDow && name
+                                    ? countUnpublishedShiftsInCell({
+                                        value: displayValue,
+                                        clientName: name,
+                                        dateStr: dateStrForDow,
+                                        publishedLookup: publishedShiftMetaLookup,
+                                      })
+                                    : 0;
 
                                 const isDraftChanged =
                                   draftMode && a1
@@ -8130,9 +8881,7 @@ async function handleCaregiverDropToShift(args: {
                                     : false;
 
                                 const isSaving = a1 ? isCellSaving(a1) : false;
-                                const cellStatus = statusFromCellValue(value);
-                                const dateStrForDow = norm(dateHeaders?.[dow + 1]);
-                                const dayLabel = dayHeaders?.[dow + 1] || DOW_LABELS[dow];
+                                const cellStatus = statusFromCellValue(displayValue);
 
                                 const isExpanded = Boolean(a1) && expandedA1.has(a1);
                                 const isEditing = Boolean(a1) && editingA1 === a1;
@@ -8156,7 +8905,7 @@ async function handleCaregiverDropToShift(args: {
                                         clientName: name,
                                         dateStr: dateStrForDow,
                                         dayLabel,
-                                        originalValue: value,
+                                        originalValue: displayValue,
                                       });
                                     }}
                                     onDoubleClick={() => {
@@ -8278,20 +9027,55 @@ async function handleCaregiverDropToShift(args: {
                                         </div>
 
                                         <textarea
+                                          ref={inlineEditTextareaRef}
                                           value={draftByA1[a1] ?? ""}
-                                          onChange={(e) =>
+                                          onChange={(e) => {
                                             setDraftByA1((prev) => ({
                                               ...prev,
                                               [a1]: e.target.value,
-                                            }))
-                                          }
+                                            }));
+                                            setInlineEditCursor(e.target.selectionStart ?? e.target.value.length);
+                                          }}
                                           rows={4}
                                           autoFocus
                                           disabled={isSaving}
+                                          onClick={(e) => {
+                                            setInlineEditCursor(e.currentTarget.selectionStart ?? 0);
+                                          }}
+                                          onKeyUp={(e) => {
+                                            setInlineEditCursor(e.currentTarget.selectionStart ?? 0);
+                                          }}
                                           onKeyDown={(e) => {
                                             if (e.key === "Escape") {
                                               e.preventDefault();
                                               cancelInlineEdit(a1);
+                                            }
+
+                                            if (inlineEditSuggestions.length && e.key === "ArrowDown") {
+                                              e.preventDefault();
+                                              setInlineEditSuggestionIndex((prev) =>
+                                                prev >= inlineEditSuggestions.length - 1 ? 0 : prev + 1
+                                              );
+                                            }
+
+                                            if (inlineEditSuggestions.length && e.key === "ArrowUp") {
+                                              e.preventDefault();
+                                              setInlineEditSuggestionIndex((prev) =>
+                                                prev <= 0 ? inlineEditSuggestions.length - 1 : prev - 1
+                                              );
+                                            }
+
+                                            if (
+                                              inlineEditSuggestions.length &&
+                                              e.key === "Tab" &&
+                                              !e.shiftKey
+                                            ) {
+                                              e.preventDefault();
+                                              applyInlineEditSuggestion(
+                                                inlineEditSuggestions[
+                                                  Math.min(inlineEditSuggestionIndex, inlineEditSuggestions.length - 1)
+                                                ]
+                                              );
                                             }
 
                                             if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
@@ -8321,6 +9105,63 @@ async function handleCaregiverDropToShift(args: {
                                             whiteSpace: "pre-wrap",
                                           }}
                                         />
+
+                                        {inlineEditSuggestions.length ? (
+                                          <div
+                                            style={{
+                                              border: `1px solid ${UI.border}`,
+                                              borderRadius: 10,
+                                              background: "#ffffff",
+                                              overflow: "hidden",
+                                              boxShadow: "0 8px 20px rgba(15,23,42,0.08)",
+                                            }}
+                                          >
+                                            <div
+                                              style={{
+                                                padding: "7px 10px",
+                                                fontSize: 11,
+                                                fontWeight: 900,
+                                                color: UI.textDim,
+                                                borderBottom: `1px solid ${UI.borderSoft}`,
+                                                background: "#f8fafc",
+                                              }}
+                                            >
+                                              Caregiver suggestions
+                                            </div>
+
+                                            <div style={{ display: "grid" }}>
+                                              {inlineEditSuggestions.map((suggestion, suggestionIdx) => {
+                                                const isActive = suggestionIdx === inlineEditSuggestionIndex;
+                                                return (
+                                                  <button
+                                                    key={`${a1}_${suggestion}`}
+                                                    type="button"
+                                                    onMouseDown={(e) => {
+                                                      e.preventDefault();
+                                                      applyInlineEditSuggestion(suggestion);
+                                                    }}
+                                                    style={{
+                                                      border: "none",
+                                                      borderTop:
+                                                        suggestionIdx === 0
+                                                          ? "none"
+                                                          : `1px solid ${UI.borderSoft}`,
+                                                      background: isActive ? "#eff6ff" : "#ffffff",
+                                                      color: UI.text,
+                                                      textAlign: "left",
+                                                      padding: "8px 10px",
+                                                      fontSize: 12,
+                                                      fontWeight: isActive ? 900 : 800,
+                                                      cursor: "pointer",
+                                                    }}
+                                                  >
+                                                    {suggestion}
+                                                  </button>
+                                                );
+                                              })}
+                                            </div>
+                                          </div>
+                                        ) : null}
 
                                         <div
                                           style={{
@@ -8384,14 +9225,14 @@ async function handleCaregiverDropToShift(args: {
                                             lineHeight: 1.35,
                                           }}
                                         >
-                                          Double click a shift to edit • Esc = cancel • Ctrl/Cmd + Enter ={" "}
+                                          Double click a shift to edit • Tab = autocomplete caregiver • Esc = cancel • Ctrl/Cmd + Enter ={" "}
                                           {draftMode ? "save to draft" : "save"}
                                         </div>
                                       </div>
                                     ) : (
                                       <ShiftCard
   a1Key={a1 || `${r.row}_${dow}`}
-  value={value}
+  value={displayValue}
   status={cellStatus}
   disabled={isSaving}
   onRequestEdit={() => {
@@ -8421,6 +9262,7 @@ async function handleCaregiverDropToShift(args: {
   messagesUI={messagesUI}
   clientDescription={clientDescription}
   requests={ghostShiftsForCell}
+  unpublishedCount={unpublishedCount}
 />
                                     )}
                                   </td>
@@ -8463,6 +9305,14 @@ async function handleCaregiverDropToShift(args: {
           .scheduleLayout {
             width: 100%;
             min-width: 0;
+          }
+
+          .cw-empty-client-cell:hover .cw-row-add-button,
+          .cw-empty-client-cell:focus-within .cw-row-add-button,
+          .cw-client-cell:hover .cw-row-add-button,
+          .cw-client-cell:focus-within .cw-row-add-button {
+            opacity: 1 !important;
+            pointer-events: auto !important;
           }
         `}</style>
       </>

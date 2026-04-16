@@ -37,6 +37,17 @@ type ThreadResponse = {
   messages: ThreadMessage[];
 };
 
+type PersistedConversationsCache = {
+  viewerId: string;
+  savedAt: number;
+  conversations: Conversation[];
+};
+
+type PersistedThreadCache = {
+  savedAt: number;
+  threads: ThreadResponse[];
+};
+
 type IncomingAlert = {
   id: string;
   caregiverId: string;
@@ -183,7 +194,12 @@ const DEFAULT_WIN: WinState = { x: 24, y: 90, w: 520, h: 720 };
 const WIN_STORAGE_KEY = "messages_window_v1";
 const DOCKED_STORAGE_KEY = "messages_window_docked_v1";
 const CLEAR_STORAGE_KEY = "messages_window_clear_v1";
+const CONVERSATIONS_CACHE_KEY = "messages_conversations_cache_v1";
+const THREAD_CACHE_STORAGE_KEY = "messages_thread_cache_v1";
 const THREAD_CACHE_LIMIT = 24;
+const CONVERSATIONS_CACHE_TTL_MS = 2 * 60 * 1000;
+const THREAD_CACHE_TTL_MS = 15 * 60 * 1000;
+const ENRICHMENT_TTL_MS = 5 * 60 * 1000;
 
 function receiptSummary(receipts: { id: string; name: string; time: string }[]) {
   const arr = Array.isArray(receipts) ? receipts : [];
@@ -192,6 +208,71 @@ function receiptSummary(receipts: { id: string; name: string; time: string }[]) 
   const head = names.slice(0, 2).join(", ");
   const more = names.length > 2 ? ` +${names.length - 2}` : "";
   return `Read by ${head}${more}`;
+}
+
+function readPersistedConversations(viewerId: string): Conversation[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(CONVERSATIONS_CACHE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as PersistedConversationsCache;
+    if (!parsed || parsed.viewerId !== viewerId) return [];
+    if (Date.now() - Number(parsed.savedAt || 0) > CONVERSATIONS_CACHE_TTL_MS) return [];
+    return Array.isArray(parsed.conversations) ? parsed.conversations : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePersistedConversations(viewerId: string, conversations: Conversation[]) {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(
+      CONVERSATIONS_CACHE_KEY,
+      JSON.stringify({
+        viewerId,
+        savedAt: Date.now(),
+        conversations,
+      } satisfies PersistedConversationsCache)
+    );
+  } catch {}
+}
+
+function readPersistedThreadCache(): Map<string, ThreadResponse> {
+  const out = new Map<string, ThreadResponse>();
+  if (typeof window === "undefined") return out;
+  try {
+    const raw = localStorage.getItem(THREAD_CACHE_STORAGE_KEY);
+    if (!raw) return out;
+    const parsed = JSON.parse(raw) as PersistedThreadCache;
+    if (!parsed || Date.now() - Number(parsed.savedAt || 0) > THREAD_CACHE_TTL_MS) return out;
+    const threads = Array.isArray(parsed.threads) ? parsed.threads : [];
+    for (const thread of threads) {
+      const cid = String(thread?.caregiverId || "").trim();
+      if (!cid) continue;
+      out.set(cid, {
+        caregiverId: cid,
+        caregiverName: String(thread?.caregiverName || cid),
+        messages: Array.isArray(thread?.messages) ? thread.messages : [],
+      });
+    }
+  } catch {
+    return out;
+  }
+  return out;
+}
+
+function writePersistedThreadCache(cache: Map<string, ThreadResponse>) {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(
+      THREAD_CACHE_STORAGE_KEY,
+      JSON.stringify({
+        savedAt: Date.now(),
+        threads: Array.from(cache.values()),
+      } satisfies PersistedThreadCache)
+    );
+  } catch {}
 }
 
 function Spinner({ size = 14 }: { size?: number }) {
@@ -347,6 +428,7 @@ export default function MessagesPopup() {
   const threadInFlight = useRef(false);
   const threadCacheRef = useRef<Map<string, ThreadResponse>>(new Map());
   const threadPrefetchingRef = useRef<Set<string>>(new Set());
+  const threadRequestRef = useRef<Map<string, Promise<ThreadResponse | null>>>(new Map());
 
   // composer
   const [category, setCategory] = useState<"General" | "Scheduling" | "Payroll">("General");
@@ -406,6 +488,8 @@ export default function MessagesPopup() {
     nw: {},
   });
   const [certByCaregiverId, setCertByCaregiverId] = useState<Record<string, string>>({});
+  const [teamLeaderByCaregiverId, setTeamLeaderByCaregiverId] = useState<Record<string, string>>({});
+  const enrichmentLoadedAtRef = useRef(0);
 
   function clampToViewport(next: WinState): WinState {
     const pad = 8;
@@ -518,6 +602,7 @@ export default function MessagesPopup() {
       next.delete(oldest);
     }
     threadCacheRef.current = next;
+    writePersistedThreadCache(next);
   }
 
   function primeThreadFromCache(caregiverId: string) {
@@ -531,6 +616,32 @@ export default function MessagesPopup() {
     return true;
   }
 
+  async function fetchThreadShared(caregiverId: string) {
+    const cid = String(caregiverId || "").trim();
+    if (!cid) return null;
+
+    const existing = threadRequestRef.current.get(cid);
+    if (existing) return existing;
+
+    const request = (async () => {
+      const res: ThreadResponse = await apiGet({ action: "getThread", caregiverId: cid });
+      const normalized: ThreadResponse = {
+        caregiverId: res?.caregiverId || cid,
+        caregiverName: res?.caregiverName || cid,
+        messages: Array.isArray(res?.messages) ? res.messages : [],
+      };
+      storeThreadCache(cid, normalized);
+      return normalized;
+    })()
+      .catch(() => null)
+      .finally(() => {
+        threadRequestRef.current.delete(cid);
+      });
+
+    threadRequestRef.current.set(cid, request);
+    return request;
+  }
+
   async function prefetchThread(caregiverId: string) {
     const cid = String(caregiverId || "").trim();
     if (!cid) return;
@@ -539,13 +650,7 @@ export default function MessagesPopup() {
 
     threadPrefetchingRef.current.add(cid);
     try {
-      const res: ThreadResponse = await apiGet({ action: "getThread", caregiverId: cid });
-      if (!res) return;
-      storeThreadCache(cid, {
-        caregiverId: res.caregiverId || cid,
-        caregiverName: res.caregiverName || cid,
-        messages: Array.isArray(res.messages) ? res.messages : [],
-      });
+      await fetchThreadShared(cid);
     } catch {
       // ignore
     } finally {
@@ -587,6 +692,11 @@ export default function MessagesPopup() {
       setClearMode(localStorage.getItem(CLEAR_STORAGE_KEY) === "1");
     } catch {}
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // hydrate thread cache once so threads can open immediately after a reload
+  useEffect(() => {
+    threadCacheRef.current = readPersistedThreadCache();
   }, []);
 
   // persist window
@@ -755,6 +865,7 @@ export default function MessagesPopup() {
 
       const next = (res?.conversations || []) as Conversation[];
       setConvs(next);
+      writePersistedConversations(vId, next);
       syncUnreadSnapshot(next, { notify: !!opts?.silent });
       setListReady(true);
     } finally {
@@ -774,20 +885,13 @@ export default function MessagesPopup() {
     if (!silent) setLoadingThread(true);
 
     try {
-      const res: ThreadResponse = await apiGet({ action: "getThread", caregiverId });
+      const res = await fetchThreadShared(caregiverId);
       if (req !== threadReqId.current) return;
+      if (!res) return;
 
-      const normalized: ThreadResponse = {
-        caregiverId: res?.caregiverId || caregiverId,
-        caregiverName: res?.caregiverName || caregiverId,
-        messages: Array.isArray(res?.messages) ? res.messages : [],
-      };
-
-      storeThreadCache(caregiverId, normalized);
-
-      setThread(normalized.messages);
-      setActiveCaregiverId((prev) => prev || normalized.caregiverId || caregiverId);
-      setActiveCaregiverName((prev) => prev || normalized.caregiverName || caregiverId);
+      setThread(res.messages);
+      setActiveCaregiverId((prev) => prev || res.caregiverId || caregiverId);
+      setActiveCaregiverName((prev) => prev || res.caregiverName || caregiverId);
       setThreadReady(true);
     } finally {
       if (req === threadReqId.current) {
@@ -928,7 +1032,28 @@ export default function MessagesPopup() {
     try {
       const res = await apiGetCaregivers();
 
-      // Support either {headers,rows} or {values} or {data:{values}}
+      // Support either {caregivers}, {headers,rows} or {values} or {data:{values}}
+      if (Array.isArray(res?.caregivers)) {
+        const certMap: Record<string, string> = {};
+        const leaderMap: Record<string, string> = {};
+
+        for (const item of res.caregivers) {
+          const cid = String(item?.caregiverId ?? "").trim();
+          if (!cid) continue;
+
+          const cert = String(item?.certification ?? item?.certifications ?? "").trim();
+          if (cert && cert.toLowerCase() !== "none") certMap[cid] = cert;
+
+          const teamLeader = String(item?.teamLeader ?? item?.teamlead ?? item?.leader ?? "").trim();
+          if (teamLeader) leaderMap[cid] = teamLeader;
+        }
+
+        setCertByCaregiverId(certMap);
+        setTeamLeaderByCaregiverId(leaderMap);
+        enrichmentLoadedAtRef.current = Date.now();
+        return;
+      }
+
       let headers: any[] = [];
       let rows: any[][] = [];
       if (Array.isArray(res?.headers) && Array.isArray(res?.rows)) {
@@ -946,26 +1071,31 @@ export default function MessagesPopup() {
 
       const iId = findAnyHeaderIndex(headers, ["Caregiver ID", "Caregiver Id", "ID"]);
       const iCert = findAnyHeaderIndex(headers, ["Certification", "Certifications", "Cert"]);
-      if (iId < 0 || iCert < 0) return;
+      const iTeamLeader = findAnyHeaderIndex(headers, ["Team Leader", "Team Lead", "Leader"]);
+      if (iId < 0) return;
 
-      const map: Record<string, string> = {};
+      const certMap: Record<string, string> = {};
+      const leaderMap: Record<string, string> = {};
       for (const r of rows) {
         const cid = String(r[iId] ?? "").trim();
         if (!cid) continue;
-        const cert = String(r[iCert] ?? "").trim();
-        if (!cert) continue;
-        if (cert.toLowerCase() === "none") continue;
-        map[cid] = cert;
+        const cert = iCert >= 0 ? String(r[iCert] ?? "").trim() : "";
+        if (cert && cert.toLowerCase() !== "none") certMap[cid] = cert;
+        const teamLeader = iTeamLeader >= 0 ? String(r[iTeamLeader] ?? "").trim() : "";
+        if (teamLeader) leaderMap[cid] = teamLeader;
       }
-      setCertByCaregiverId(map);
+      setCertByCaregiverId(certMap);
+      setTeamLeaderByCaregiverId(leaderMap);
     } catch {
       // ignore
     }
+    enrichmentLoadedAtRef.current = Date.now();
   }
 
   // when open: refresh enrichment (don’t block UI)
   useEffect(() => {
     if (!open) return;
+    if (Date.now() - enrichmentLoadedAtRef.current < ENRICHMENT_TTL_MS) return;
     refreshConversationEnrichment();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, viewerId]);
@@ -977,12 +1107,14 @@ export default function MessagesPopup() {
       localStorage.setItem("messages_viewer_id", viewerId);
     } catch {}
 
-    threadCacheRef.current = new Map();
     threadPrefetchingRef.current = new Set();
+    threadRequestRef.current = new Map();
     unreadSnapshotRef.current = {};
     unreadSnapshotReadyRef.current = false;
     setIncomingAlerts([]);
-    setListReady(false);
+    const cachedConversations = readPersistedConversations(viewerId);
+    setConvs(cachedConversations);
+    setListReady(cachedConversations.length > 0);
     setThreadReady(false);
     goToInbox();
     loadConversations(viewerId);
@@ -1813,10 +1945,8 @@ export default function MessagesPopup() {
                     const cwAvail = availSubmitted.cw.has(cid);
                     const nwAvail = availSubmitted.nw.has(cid);
 
-                    const cwHours = hoursByCaregiver.cw[cid] || 0;
-                    const nwHours = hoursByCaregiver.nw[cid] || 0;
-
                     const cert = certByCaregiverId[cid] || "";
+                    const teamLeader = teamLeaderByCaregiverId[cid] || "";
 
                     return (
                       <button
@@ -1918,16 +2048,6 @@ export default function MessagesPopup() {
                                 title={nwAvail ? "NW Availability submitted" : "NW Availability missing"}
                               />
 
-                              {(cwHours > 0 || nwHours > 0) ? (
-                                <Chip
-                                  label={`${cwHours || 0}h / ${nwHours || 0}h`}
-                                  color={UI.text}
-                                  border={"rgba(148,163,184,0.24)"}
-                                  bg={"rgba(15,23,42,0.04)"}
-                                  title="Scheduled hours (CW / NW)"
-                                />
-                              ) : null}
-
                               {cert ? (
                                 <Chip
                                   label={cert}
@@ -1937,6 +2057,14 @@ export default function MessagesPopup() {
                                   title="Certification"
                                 />
                               ) : null}
+
+                              <Chip
+                                label={teamLeader ? `Lead: ${teamLeader}` : "Unassigned"}
+                                color={teamLeader ? UI.text : UI.orange}
+                                border={teamLeader ? "rgba(148,163,184,0.24)" : "rgba(249,115,22,0.22)"}
+                                bg={teamLeader ? "rgba(15,23,42,0.04)" : "rgba(249,115,22,0.10)"}
+                                title={teamLeader ? "Team leader" : "No team leader assigned"}
+                              />
                             </div>
                           </div>
                         </div>
