@@ -832,7 +832,7 @@ function parseFirstTimeRange(
 function splitCellIntoShiftStrings(value: string): string[] {
   return norm(value)
     .split(/\n+/)
-    .map((part) => part.trim())
+    .map((part: string) => part.trim())
     .filter(Boolean);
 }
 

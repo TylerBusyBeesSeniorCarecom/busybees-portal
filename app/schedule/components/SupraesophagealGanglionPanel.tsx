@@ -432,7 +432,7 @@ function parseScheduleShiftCell(rawText: string): ParsedShift {
 function splitCellIntoShiftStrings(value: string) {
   return norm(value)
     .split(/\n+/)
-    .map((part) => part.trim())
+    .map((part: string) => part.trim())
     .filter(Boolean);
 }
 
@@ -596,7 +596,7 @@ function parseAvailabilityWindows(raw: string) {
     .replace(/,/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  const matches = Array.from(
+  const matches: RegExpMatchArray[] = Array.from(
     cleaned.matchAll(
       /(\d{1,2}(?::\d{2})?\s*[ap]m?|\d{1,2}(?::\d{2})?)\s*(?:-|to)\s*(\d{1,2}(?::\d{2})?\s*[ap]m?|\d{1,2}(?::\d{2})?)/gi
     )
@@ -1033,7 +1033,7 @@ export default function SupraesophagealGanglionPanel({
         const dateLabel = dateHeaders[cellIndex + 1] || "";
         const shiftStrings = splitCellIntoShiftStrings(cell.value);
 
-        shiftStrings.forEach((shiftText, shiftIndex) => {
+        shiftStrings.forEach((shiftText: string, shiftIndex: number) => {
           const parsed = parseScheduleShiftCell(shiftText);
           if (parsed.isCancelled || !parsed.startTime || !parsed.endTime || !dateLabel) return;
 

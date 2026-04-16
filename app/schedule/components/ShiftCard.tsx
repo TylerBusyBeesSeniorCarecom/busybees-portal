@@ -236,15 +236,15 @@ function normalizeCellText(raw: unknown): string {
 }
 
 function sanitizeCertificationValue(raw: string | string[] | null | undefined): string {
-  const parts = Array.isArray(raw)
-    ? raw.map((item) => norm(item))
+  const parts: string[] = Array.isArray(raw)
+    ? raw.map((item: string) => norm(item))
     : norm(raw)
         .split(",")
-        .map((item) => norm(item));
+        .map((item: string) => norm(item));
 
   return parts
     .filter(Boolean)
-    .filter((item) => {
+    .filter((item: string) => {
       const lowered = item.toLowerCase();
       return lowered !== "none" && lowered !== "n/a" && lowered !== "na" && lowered !== "no";
     })
