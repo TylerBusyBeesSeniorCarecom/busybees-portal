@@ -2,7 +2,6 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 
-type WeekKind = "cw" | "nw";
 type ViewMode = "billing" | "payroll";
 
 /** ---- /api/schedule raw values ---- */
@@ -39,6 +38,38 @@ type ScheduleMapsApiResponse = {
   clockMap?: Record<string, ClockEntry>;
   locationMap?: Record<string, LocationEntry>;
   error?: string;
+};
+
+type PayrollArchiveRow = Record<string, any>;
+
+type PayrollArchiveApiResponse = {
+  ok: boolean;
+  rows?: PayrollArchiveRow[];
+  error?: string;
+};
+
+type ArchiveShiftMeta = {
+  archiveId: string;
+  weekStartDate: string;
+  weekEndDate: string;
+  caregiverName: string;
+  nameOnSchedule: string;
+  clockInSite: string;
+  clockOutSite: string;
+  scheduledHours: number;
+  overtimeHours: number;
+  overtimePay: number;
+  totalPay: number;
+  edits: string;
+  lastEditedAt: string;
+  lastEditedBy: string;
+  approvalStatus: string;
+  reason: string;
+};
+
+type ArchivedWeekOption = {
+  weekStartDate: string;
+  weekEndDate: string;
 };
 
 /** ---- Clients API (/api/clients) ---- */
@@ -157,6 +188,7 @@ type RateRuleFormState = {
   priority: string;
   ruleName: string;
   ruleType: "Base" | "Addon";
+  targetScope: "client" | "caregiver";
   rateMode: "Set" | "Add";
   client: string;
   caregiverId: string;
@@ -243,6 +275,12 @@ function parseNumber(raw: string): number | null {
   if (!m) return null;
   const v = Number(m[0]);
   return isFinite(v) ? v : null;
+}
+
+function formatHoursLabel(hours: number) {
+  const rounded = Math.round(hours * 100) / 100;
+  const label = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
+  return `${label} ${rounded === 1 ? "hour" : "hours"}`;
 }
 
 function toIsoDate(d: Date) {
@@ -458,6 +496,163 @@ function fmtMDY(d: Date) {
   const dd = d.getDate();
   const yyyy = d.getFullYear();
   return `${mm}/${dd}/${yyyy}`;
+}
+
+function formatArchiveDate(raw: string) {
+  const value = norm(raw);
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const yyyy = d.getUTCFullYear();
+  return `${mm}/${dd}/${yyyy}`;
+}
+
+function formatArchiveTime(raw: string) {
+  const value = norm(raw);
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+
+  let hours = d.getUTCHours();
+  const minutes = String(d.getUTCMinutes()).padStart(2, "0");
+  const ap = hours >= 12 ? "PM" : "AM";
+  if (hours === 0) hours = 12;
+  else if (hours > 12) hours -= 12;
+  return `${hours}:${minutes} ${ap}`;
+}
+
+function archiveDateTimeToLocalValue(raw: string) {
+  const value = norm(raw);
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const min = String(d.getUTCMinutes()).padStart(2, "0");
+  const ss = String(d.getUTCSeconds()).padStart(2, "0");
+
+  return `${yyyy}-${mm}-${dd}T${hh}:${min}:${ss}`;
+}
+
+function archiveSiteToVerdict(raw: string | null | undefined): string | null {
+  const v = normalizeName(String(raw ?? ""));
+  if (!v) return null;
+  if (v.includes("on site") || v === "onsite" || v === "on_site") return "on_site";
+  if (v.includes("off site") || v === "offsite" || v === "off_site") return "off_site";
+  return v;
+}
+
+function buildArchiveShiftRateMetaMap(rows: PayrollArchiveRow[]) {
+  const out: Record<string, ShiftRateMeta> = {};
+  for (const row of rows) {
+    const shiftId = norm(row?.["Shift ID"]);
+    if (!shiftId) continue;
+    const payRate = parseRate(String(row?.["Pay Rate"] ?? ""));
+    if (payRate == null) continue;
+    out[shiftId] = {
+      finalRate: payRate.toFixed(2),
+      baseRate: payRate.toFixed(2),
+      addOnTotal: parseRate(String(row?.["Overtime Pay"] ?? ""))?.toFixed(2) || "",
+      updatedBy: norm(row?.["Last Edited By"]),
+      updatedAt: norm(row?.["Last Edited At"]),
+      updatedSource: "Payroll Archive",
+      rateSource: "Payroll Archive",
+      rateSourceDetail: norm(row?.["Edits"]) || "Archived payroll row",
+      approvedBy: "",
+      approvedAt: "",
+      approvalStatus: norm(row?.["Approval Status"]) || "Not Approved",
+      requiresApprovalFromRules: "FALSE",
+      appliedRuleIds: [],
+      appliedRuleSummary: "",
+      appliedRules: [],
+      raw: row,
+    };
+  }
+  return out;
+}
+
+function normalizePayrollArchiveRows(rows: PayrollArchiveRow[]) {
+  const shifts: ShiftRow[] = [];
+  const clockMap: Record<string, ClockEntry> = {};
+  const locationMap: Record<string, LocationEntry> = {};
+  const payRateByShift: Record<string, string> = {};
+  const archiveMetaByShift: Record<string, ArchiveShiftMeta> = {};
+
+  for (const row of rows) {
+    const shiftId = norm(row?.["Shift ID"]);
+    if (!shiftId) continue;
+
+    const date = formatArchiveDate(row?.["Date"]);
+    const startTime = formatArchiveTime(row?.["Start Time"]);
+    const endTime = formatArchiveTime(row?.["End Time"]);
+    const payRate = parseRate(String(row?.["Pay Rate"] ?? ""));
+
+    shifts.push({
+      shiftId,
+      date,
+      client: norm(row?.["Client"]),
+      caregiver: norm(row?.["Name on Schedule"]) || norm(row?.["Caregiver Name"]),
+      caregiverId: norm(row?.["Caregiver ID"]),
+      startTime,
+      endTime,
+      status: "Archived",
+      conflict: norm(row?.["Reason"]),
+      dow: toDateSafe(date)?.getDay(),
+    });
+
+    clockMap[shiftId] = {
+      clockInTime: archiveDateTimeToLocalValue(row?.["Clock In Time"]) || null,
+      clockOutTime: archiveDateTimeToLocalValue(row?.["Clock Out Time"]) || null,
+    };
+
+    locationMap[shiftId] = {
+      clockIn: {
+        timestamp: archiveDateTimeToLocalValue(row?.["Clock In Time"]) || null,
+        verdict: archiveSiteToVerdict(row?.["Clock In Site"]),
+      },
+      clockOut: {
+        timestamp: archiveDateTimeToLocalValue(row?.["Clock Out Time"]) || null,
+        verdict: archiveSiteToVerdict(row?.["Clock Out Site"]),
+      },
+    };
+
+    if (payRate != null) {
+      payRateByShift[shiftId] = payRate.toFixed(2);
+    }
+
+    archiveMetaByShift[shiftId] = {
+      archiveId: norm(row?.["Archive ID"]),
+      weekStartDate: norm(row?.["Week Start Date"]),
+      weekEndDate: norm(row?.["Week End Date"]),
+      caregiverName: norm(row?.["Caregiver Name"]),
+      nameOnSchedule: norm(row?.["Name on Schedule"]),
+      clockInSite: norm(row?.["Clock In Site"]),
+      clockOutSite: norm(row?.["Clock Out Site"]),
+      scheduledHours: parseNumber(String(row?.["Scheduled Hours"] ?? "")) ?? 0,
+      overtimeHours: parseNumber(String(row?.["Overtime Hours"] ?? "")) ?? 0,
+      overtimePay: parseNumber(String(row?.["Overtime Pay"] ?? "")) ?? 0,
+      totalPay: parseNumber(String(row?.["Total Pay"] ?? "")) ?? 0,
+      edits: norm(row?.["Edits"]),
+      lastEditedAt: norm(row?.["Last Edited At"]),
+      lastEditedBy: norm(row?.["Last Edited By"]),
+      approvalStatus: norm(row?.["Approval Status"]) || "Not Approved",
+      reason: norm(row?.["Reason"]),
+    };
+  }
+
+  return {
+    shifts,
+    clockMap,
+    locationMap,
+    payRateByShift,
+    shiftRateMetaByShift: buildArchiveShiftRateMetaMap(rows),
+    archiveMetaByShift,
+  };
 }
 
 function parseTimeToMinutes(t: string): number | null {
@@ -889,14 +1084,17 @@ function TextInput({
   );
 }
 
-function getApprovalPill(meta?: ShiftRateMeta) {
-  const status = normalizeName(meta?.approvalStatus || "");
-
-  if (
+function isApprovedStatus(raw: string | null | undefined) {
+  const status = normalizeName(raw || "");
+  return (
     status.includes("approved") &&
     !status.includes("not approved") &&
     !status.includes("unapproved")
-  ) {
+  );
+}
+
+function getApprovalPill(meta?: ShiftRateMeta) {
+  if (isApprovedStatus(meta?.approvalStatus)) {
     return {
       text: "Approved",
       bg: "rgba(34,197,94,0.10)",
@@ -982,6 +1180,12 @@ function formatClockStamp(value: string | null | undefined) {
   return `${hours}:${minutes} ${ap}`;
 }
 
+function formatSiteLabel(value: string | null | undefined) {
+  const raw = norm(value);
+  if (!raw) return "No site";
+  return raw.replace(/_/g, " ");
+}
+
 function makeBlankRateRuleForm(): RateRuleFormState {
   return {
     ruleId: "",
@@ -990,6 +1194,7 @@ function makeBlankRateRuleForm(): RateRuleFormState {
     priority: "5",
     ruleName: "",
     ruleType: "Addon",
+    targetScope: "caregiver",
     rateMode: "Add",
     client: "",
     caregiverId: "",
@@ -1034,6 +1239,11 @@ type PayrollShift = ShiftRow & {
 
   clockInTime: string | null;
   clockOutTime: string | null;
+  clockInSite: string;
+  clockOutSite: string;
+  approvalStatus: string;
+  archivedTotalPay: number;
+  archiveReason: string;
   isManuallyConfirmed?: boolean;
   adjustedStartTime?: string;
   adjustedEndTime?: string;
@@ -1073,6 +1283,42 @@ function AddRuleModal({
 
   const selectedCaregiver =
     caregiverOptions.find((cg) => cg.caregiverId === form.caregiverId) || null;
+  const showStepTwo = Boolean(norm(form.ruleName));
+  const showStepThree = showStepTwo && Boolean(form.ruleType);
+  const showStepFour =
+    showStepThree &&
+    (form.targetScope === "client" ? Boolean(norm(form.client)) : Boolean(norm(form.caregiverId)));
+  const autoRateMode = form.ruleType === "Base" ? "Set" : "Add";
+  const amountLabel = form.ruleType === "Base" ? "Base Amount" : "Add On Amount";
+  const amountPlaceholder = form.ruleType === "Base" ? "Ex: 18.00" : "Ex: 2.00";
+  const stepCardStyle: React.CSSProperties = {
+    border: `1px solid ${UI.borderSoft}`,
+    borderRadius: 14,
+    padding: 14,
+    background: UI.headerBg,
+    display: "grid",
+    gap: 12,
+  };
+  const stepTitleStyle: React.CSSProperties = {
+    fontSize: 14,
+    fontWeight: 950,
+    color: UI.text,
+  };
+  const helperStyle: React.CSSProperties = {
+    fontSize: 12,
+    color: UI.textDim,
+    lineHeight: 1.4,
+  };
+  const toggleButtonStyle = (active: boolean): React.CSSProperties => ({
+    padding: "9px 12px",
+    borderRadius: 10,
+    border: active ? `1px solid ${UI.blue}` : `1px solid ${UI.border}`,
+    background: active ? "rgba(43,111,214,0.10)" : UI.panelBg,
+    color: active ? UI.blue : UI.text,
+    fontWeight: 900,
+    fontSize: 13,
+    cursor: "pointer",
+  });
 
   return (
     <div
@@ -1168,226 +1414,263 @@ function AddRuleModal({
           </div>
         ) : null}
 
-        <div
-          style={{
-            marginTop: 16,
-            display: "grid",
-            gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-            gap: 14,
-          }}
-        >
-          <div>
-            <label style={fieldLabelStyle}>Rule ID</label>
-            <input
-              value={form.ruleId}
-              onChange={(e) => onChange("ruleId", e.target.value)}
-              placeholder="Auto-generated from rule name"
-              style={inputStyle}
-            />
-          </div>
+        <div style={{ marginTop: 16, display: "grid", gap: 14 }}>
+          <div style={stepCardStyle}>
+            <div style={stepTitleStyle}>Step 1 · Name The Rule</div>
+            <div style={helperStyle}>
+              Enter the rule name first. The rule ID is generated automatically and priority is fixed at 5.
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 14 }}>
+              <div>
+                <label style={fieldLabelStyle}>Rule Name</label>
+                <input
+                  value={form.ruleName}
+                  onChange={(e) => onChange("ruleName", e.target.value)}
+                  placeholder="Ex: Christmas Day Add On"
+                  style={inputStyle}
+                />
+              </div>
 
-          <div>
-            <label style={fieldLabelStyle}>Rule Name</label>
-            <input
-              value={form.ruleName}
-              onChange={(e) => onChange("ruleName", e.target.value)}
-              placeholder="Ex: Christmas Day Add On"
-              style={inputStyle}
-            />
-          </div>
-
-          <div>
-            <label style={fieldLabelStyle}>Priority</label>
-            <select
-              value={form.priority}
-              onChange={(e) => onChange("priority", e.target.value)}
-              style={inputStyle}
-            >
-              {Array.from({ length: 10 }, (_, i) => String(i + 1)).map((n) => (
-                <option key={n} value={n}>
-                  {n}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div>
-            <label style={fieldLabelStyle}>Rule Type</label>
-            <select
-              value={form.ruleType}
-              onChange={(e) =>
-                onChange("ruleType", e.target.value as RateRuleFormState["ruleType"])
-              }
-              style={inputStyle}
-            >
-              <option value="Base">Base</option>
-              <option value="Addon">Addon</option>
-            </select>
-          </div>
-
-          <div>
-            <label style={fieldLabelStyle}>Rate Mode</label>
-            <select
-              value={form.rateMode}
-              onChange={(e) =>
-                onChange("rateMode", e.target.value as RateRuleFormState["rateMode"])
-              }
-              style={inputStyle}
-            >
-              <option value="Set">Set</option>
-              <option value="Add">Add</option>
-            </select>
-          </div>
-
-          <div>
-            <label style={fieldLabelStyle}>Client</label>
-            <input
-              list="rate-rule-client-options"
-              value={form.client}
-              onChange={(e) => onChange("client", e.target.value)}
-              placeholder="Start typing client name"
-              style={inputStyle}
-            />
-            <datalist id="rate-rule-client-options">
-              {clientOptions.map((client) => (
-                <option key={client} value={client} />
-              ))}
-            </datalist>
-          </div>
-
-          <div>
-            <label style={fieldLabelStyle}>Caregiver</label>
-            <select
-              value={form.caregiverId}
-              onChange={(e) => onChange("caregiverId", e.target.value)}
-              style={inputStyle}
-            >
-              <option value="">Select caregiver</option>
-              {caregiverOptions.map((cg) => (
-                <option key={cg.caregiverId} value={cg.caregiverId}>
-                  {cg.label}
-                  {cg.sublabel ? ` — ${cg.sublabel}` : ""}
-                  {` (${cg.caregiverId})`}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div>
-            <label style={fieldLabelStyle}>Selected Caregiver ID</label>
-            <div
-              style={{
-                ...inputStyle,
-                minHeight: 39,
-                display: "flex",
-                alignItems: "center",
-                color: selectedCaregiver ? UI.text : UI.textDim,
-              }}
-            >
-              {selectedCaregiver?.caregiverId || "—"}
+              <div>
+                <label style={fieldLabelStyle}>Rule ID</label>
+                <input
+                  value={form.ruleId}
+                  readOnly
+                  placeholder="Auto-generated from rule name"
+                  style={{
+                    ...inputStyle,
+                    background: "#f8fafc",
+                    color: UI.textDim,
+                    cursor: "default",
+                  }}
+                />
+              </div>
             </div>
           </div>
 
-          <div>
-            <label style={fieldLabelStyle}>Shift Type</label>
-            <input
-              value={form.shiftType}
-              onChange={(e) => onChange("shiftType", e.target.value)}
-              placeholder="Optional"
-              style={inputStyle}
-            />
-          </div>
+          {showStepTwo ? (
+            <div style={stepCardStyle}>
+              <div style={stepTitleStyle}>Step 2 · Choose The Rule Type</div>
+              <div style={helperStyle}>
+                Addon rules add to a rate. Base rules set the rate. Rate mode updates automatically.
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 14 }}>
+                <div>
+                  <label style={fieldLabelStyle}>Rule Type</label>
+                  <select
+                    value={form.ruleType}
+                    onChange={(e) =>
+                      onChange("ruleType", e.target.value as RateRuleFormState["ruleType"])
+                    }
+                    style={inputStyle}
+                  >
+                    <option value="Base">Base</option>
+                    <option value="Addon">Addon</option>
+                  </select>
+                </div>
 
-          <div>
-            <label style={fieldLabelStyle}>Holiday Rule</label>
-            <input
-              value={form.holidayRule}
-              onChange={(e) => onChange("holidayRule", e.target.value)}
-              placeholder="Ex: Christmas Day"
-              style={inputStyle}
-            />
-          </div>
+                <div>
+                  <label style={fieldLabelStyle}>Rate Mode</label>
+                  <input
+                    value={autoRateMode}
+                    readOnly
+                    style={{
+                      ...inputStyle,
+                      background: "#f8fafc",
+                      color: UI.textDim,
+                      cursor: "default",
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
+          ) : null}
 
-          <div>
-            <label style={fieldLabelStyle}>Start Date</label>
-            <input
-              value={form.startDate}
-              onChange={(e) => onChange("startDate", e.target.value)}
-              placeholder="12/25/2026"
-              style={inputStyle}
-            />
-          </div>
+          {showStepThree ? (
+            <div style={stepCardStyle}>
+              <div style={stepTitleStyle}>Step 3 · Choose Client Or Caregiver</div>
+              <div style={helperStyle}>
+                Pick one target for this rule. Use either a caregiver or a client, not both.
+              </div>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onChange("targetScope", "caregiver");
+                    onChange("client", "");
+                  }}
+                  style={toggleButtonStyle(form.targetScope === "caregiver")}
+                >
+                  Caregiver
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onChange("targetScope", "client");
+                    onChange("caregiverId", "");
+                  }}
+                  style={toggleButtonStyle(form.targetScope === "client")}
+                >
+                  Client
+                </button>
+              </div>
 
-          <div>
-            <label style={fieldLabelStyle}>End Date</label>
-            <input
-              value={form.endDate}
-              onChange={(e) => onChange("endDate", e.target.value)}
-              placeholder="12/25/2026"
-              style={inputStyle}
-            />
-          </div>
+              {form.targetScope === "client" ? (
+                <div>
+                  <label style={fieldLabelStyle}>Client</label>
+                  <input
+                    list="rate-rule-client-options"
+                    value={form.client}
+                    onChange={(e) => onChange("client", e.target.value)}
+                    placeholder="Start typing client name"
+                    style={inputStyle}
+                  />
+                  <datalist id="rate-rule-client-options">
+                    {clientOptions.map((client) => (
+                      <option key={client} value={client} />
+                    ))}
+                  </datalist>
+                </div>
+              ) : (
+                <div style={{ display: "grid", gap: 8 }}>
+                  <div>
+                    <label style={fieldLabelStyle}>Caregiver</label>
+                    <select
+                      value={form.caregiverId}
+                      onChange={(e) => onChange("caregiverId", e.target.value)}
+                      style={inputStyle}
+                    >
+                      <option value="">Select caregiver</option>
+                      {caregiverOptions.map((cg) => (
+                        <option key={cg.caregiverId} value={cg.caregiverId}>
+                          {cg.label}
+                          {cg.sublabel ? ` — ${cg.sublabel}` : ""}
+                          {` (${cg.caregiverId})`}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
 
-          <div>
-            <label style={fieldLabelStyle}>
-              {form.rateMode === "Set" ? "Pay Rate" : "Add Amount"}
-            </label>
-            <input
-              value={form.rateMode === "Set" ? form.payRate : form.addAmount}
-              onChange={(e) =>
-                form.rateMode === "Set"
-                  ? onChange("payRate", e.target.value)
-                  : onChange("addAmount", e.target.value)
-              }
-              placeholder={form.rateMode === "Set" ? "17" : "3"}
-              style={inputStyle}
-            />
-          </div>
+                  {selectedCaregiver ? (
+                    <div style={{ fontSize: 12, color: UI.textDim }}>
+                      Selected caregiver ID: <b style={{ color: UI.text }}>{selectedCaregiver.caregiverId}</b>
+                    </div>
+                  ) : null}
+                </div>
+              )}
+            </div>
+          ) : null}
 
-          <div
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              justifyContent: "flex-end",
-              gap: 10,
-            }}
-          >
-            <label
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                fontWeight: 900,
-                fontSize: 13,
-                color: UI.text,
-              }}
-            >
-              <input
-                type="checkbox"
-                checked={form.active}
-                onChange={(e) => onChange("active", e.target.checked)}
-              />
-              Active
-            </label>
+          {showStepFour ? (
+            <div style={stepCardStyle}>
+              <div style={stepTitleStyle}>Step 4 · Rule Details</div>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                  gap: 14,
+                }}
+              >
+                <div>
+                  <label style={fieldLabelStyle}>Type</label>
+                  <input
+                    value={form.shiftType}
+                    onChange={(e) => onChange("shiftType", e.target.value)}
+                    placeholder="Ex: Weekend, Overnight"
+                    style={inputStyle}
+                  />
+                </div>
 
-            <label
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                fontWeight: 900,
-                fontSize: 13,
-                color: UI.text,
-              }}
-            >
-              <input
-                type="checkbox"
-                checked={form.requiresApproval}
-                onChange={(e) => onChange("requiresApproval", e.target.checked)}
-              />
-              Requires Approval
-            </label>
-          </div>
+                <div>
+                  <label style={fieldLabelStyle}>Holiday Rule</label>
+                  <input
+                    value={form.holidayRule}
+                    onChange={(e) => onChange("holidayRule", e.target.value)}
+                    placeholder="Ex: Christmas Day"
+                    style={inputStyle}
+                  />
+                </div>
+
+                <div>
+                  <label style={fieldLabelStyle}>Start Date</label>
+                  <input
+                    type="date"
+                    value={form.startDate}
+                    onChange={(e) => onChange("startDate", e.target.value)}
+                    style={inputStyle}
+                  />
+                </div>
+
+                <div>
+                  <label style={fieldLabelStyle}>End Date</label>
+                  <input
+                    type="date"
+                    value={form.endDate}
+                    onChange={(e) => onChange("endDate", e.target.value)}
+                    style={inputStyle}
+                  />
+                </div>
+
+                <div>
+                  <label style={fieldLabelStyle}>{amountLabel}</label>
+                  <input
+                    value={form.ruleType === "Base" ? form.payRate : form.addAmount}
+                    onChange={(e) =>
+                      form.ruleType === "Base"
+                        ? onChange("payRate", e.target.value)
+                        : onChange("addAmount", e.target.value)
+                    }
+                    placeholder={amountPlaceholder}
+                    style={inputStyle}
+                  />
+                </div>
+
+                <div
+                  style={{
+                    display: "grid",
+                    alignContent: "end",
+                    gap: 10,
+                  }}
+                >
+                  <label
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      fontWeight: 900,
+                      fontSize: 13,
+                      color: UI.text,
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={form.active}
+                      onChange={(e) => onChange("active", e.target.checked)}
+                    />
+                    Active
+                  </label>
+
+                  <label
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      fontWeight: 900,
+                      fontSize: 13,
+                      color: UI.text,
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={form.requiresApproval}
+                      onChange={(e) => onChange("requiresApproval", e.target.checked)}
+                    />
+                    Requires Approval
+                  </label>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </div>
 
         <div
@@ -1402,8 +1685,8 @@ function AddRuleModal({
             lineHeight: 1.45,
           }}
         >
-          Add at least one condition so the rule knows what it should match:
-          client, caregiver ID, shift type, holiday, or date range.
+          You can keep the rule broad or narrow it down with type, holiday, or a date range.
+          The client or caregiver target is chosen in Step 3.
         </div>
 
         <div
@@ -1452,7 +1735,8 @@ function AddRuleModal({
   );
 }
 export default function BillingPayrollClient() {
-  const [week, setWeek] = useState<WeekKind>("cw");
+  const [selectedWeekStartDate, setSelectedWeekStartDate] = useState("");
+  const [availableWeeks, setAvailableWeeks] = useState<ArchivedWeekOption[]>([]);
   const [viewMode, setViewMode] = useState<ViewMode>("billing");
 
   const [loading, setLoading] = useState(true);
@@ -1463,9 +1747,13 @@ export default function BillingPayrollClient() {
   const [locationMap, setLocationMap] = useState<Record<string, LocationEntry>>(
     {}
   );
+  const [archiveMetaByShift, setArchiveMetaByShift] = useState<Record<string, ArchiveShiftMeta>>({});
 
       // shiftId -> pay rate input (payroll)
   const [payRateByShift, setPayRateByShift] = useState<Record<string, string>>(
+    {}
+  );
+  const [originalPayRateByShift, setOriginalPayRateByShift] = useState<Record<string, string>>(
     {}
   );
   const [savingRateByShift, setSavingRateByShift] = useState<Record<string, boolean>>(
@@ -1534,6 +1822,9 @@ export default function BillingPayrollClient() {
   const [syncingRates, setSyncingRates] = useState(false);
   const [syncRatesError, setSyncRatesError] = useState<string | null>(null);
   const [syncRatesSuccess, setSyncRatesSuccess] = useState<string | null>(null);
+  const [payrollTextModalOpen, setPayrollTextModalOpen] = useState(false);
+  const [payrollSummaryDraft, setPayrollSummaryDraft] = useState("");
+  const [copyExportSuccess, setCopyExportSuccess] = useState<string | null>(null);
 
   // Rules view
   const [rulesOpen, setRulesOpen] = useState(false);
@@ -1610,21 +1901,43 @@ export default function BillingPayrollClient() {
       setPayrollMessagesError(null);
 
       try {
-        // 1) schedule + maps
-        const schedRes = await fetch(
-          `/api/schedule?week=${encodeURIComponent(week)}`,
-          { cache: "no-store" }
+        // 1) archived payroll rows
+        const archiveRes = await fetch(`/api/payroll-archive`, { cache: "no-store" });
+        const archiveJson = (await archiveRes.json()) as PayrollArchiveApiResponse;
+        if (!archiveRes.ok || !archiveJson.ok) {
+          throw new Error(archiveJson.error || "Failed to load payroll archive");
+        }
+
+        const archiveRows = Array.isArray(archiveJson.rows) ? archiveJson.rows : [];
+        const weekOptions = Array.from(
+          archiveRows.reduce((map, row) => {
+            const weekStartDate = norm(row?.["Week Start Date"]);
+            const weekEndDate = norm(row?.["Week End Date"]);
+            if (!weekStartDate) return map;
+
+            const existing = map.get(weekStartDate);
+            if (!existing || (!existing.weekEndDate && weekEndDate)) {
+              map.set(weekStartDate, { weekStartDate, weekEndDate });
+            }
+            return map;
+          }, new Map<string, ArchivedWeekOption>()).values()
+        ).sort(
+          (a, b) =>
+            new Date(b.weekStartDate).getTime() - new Date(a.weekStartDate).getTime()
         );
-        const schedJson = (await schedRes.json()) as ScheduleMapsApiResponse;
-        if (!schedJson.ok)
-          throw new Error(schedJson.error || "Failed to load schedule");
 
-        const rowsFromApi =
-          (schedJson.rows && Array.isArray(schedJson.rows) && schedJson.rows) ||
-          normalizeScheduleValues(schedJson.values ?? []);
+        const weekStarts = weekOptions.map((week) => week.weekStartDate);
 
-        const clocks = schedJson.clockMap || {};
-        const locs = schedJson.locationMap || {};
+        const effectiveWeekStart =
+          selectedWeekStartDate && weekStarts.includes(selectedWeekStartDate)
+            ? selectedWeekStartDate
+            : weekStarts[0] || "";
+
+        const filteredArchiveRows = effectiveWeekStart
+          ? archiveRows.filter((row) => norm(row?.["Week Start Date"]) === effectiveWeekStart)
+          : archiveRows;
+
+        const normalizedArchive = normalizePayrollArchiveRows(filteredArchiveRows);
 
         // 2) clients rates
         const clientsRes = await fetch(`/api/clients`, { cache: "no-store" });
@@ -1667,38 +1980,15 @@ export default function BillingPayrollClient() {
         }
 
                            // 4) shift rates for the displayed week
-        let rateMapByShift: Record<string, string> = {};
-        let rateMetaMapByShift: Record<string, ShiftRateMeta> = {};
-
-        try {
-          const range = getDateRangeFromShifts(rowsFromApi);
-          if (range) {
-            const rateRes = await fetch(
-              `/api/shift-rates?dateFrom=${encodeURIComponent(range.dateFrom)}&dateTo=${encodeURIComponent(range.dateTo)}`,
-              { cache: "no-store" }
-            );
-            const rateJson = (await rateRes.json()) as ShiftRatesApiResponse;
-
-            if (!rateJson.ok) {
-              throw new Error(rateJson.error || "Failed to load shift rates");
-            }
-
-            const rawRows = rateJson.rows || rateJson.rates || [];
-
-            rateMapByShift = buildPayRateMapFromApi(rawRows);
-            rateMetaMapByShift = buildShiftRateMetaMapFromApi(rawRows);
-          }
-        } catch (err) {
-          console.error("[billing-payroll] failed to load shift rates:", err);
-          // do not block the page if rates fail; fallback to default $16
-        }
+        const rateMapByShift = normalizedArchive.payRateByShift;
+        const rateMetaMapByShift = normalizedArchive.shiftRateMetaByShift;
 
         // 5) payroll messages for the displayed week
         let groupedPayrollMessages: Record<string, PayrollMessagesByCaregiverEntry> = {};
         let payrollMessagesLoadError: string | null = null;
 
         try {
-          const range = getDateRangeFromShifts(rowsFromApi);
+          const range = getDateRangeFromShifts(normalizedArchive.shifts);
           if (range) {
             const msgRes = await fetch(
               `/api/payroll-messages?dateFrom=${encodeURIComponent(range.dateFrom)}&dateTo=${encodeURIComponent(range.dateTo)}&groupByCaregiver=true`,
@@ -1720,13 +2010,19 @@ export default function BillingPayrollClient() {
 
         if (cancelled) return;
 
-        setShifts(rowsFromApi);
-        setClockMap(clocks);
-        setLocationMap(locs);
+        setAvailableWeeks(weekOptions);
+        if (effectiveWeekStart !== selectedWeekStartDate) {
+          setSelectedWeekStartDate(effectiveWeekStart);
+        }
+        setShifts(normalizedArchive.shifts);
+        setClockMap(normalizedArchive.clockMap);
+        setLocationMap(normalizedArchive.locationMap);
+        setArchiveMetaByShift(normalizedArchive.archiveMetaByShift);
         setClientRateMap(rateMap);
         setClientOptions(sortedClientOptions);
         setCaregiverById(byId);
         setPayRateByShift(rateMapByShift);
+        setOriginalPayRateByShift(rateMapByShift);
         setShiftRateMetaByShift(rateMetaMapByShift);
         setPayrollMessagesByCaregiver(groupedPayrollMessages);
         setPayrollMessagesError(payrollMessagesLoadError);
@@ -1746,10 +2042,14 @@ export default function BillingPayrollClient() {
         setSyncingRates(false);
         setSyncRatesError(null);
         setSyncRatesSuccess(null);
+        setPayrollTextModalOpen(false);
+        setPayrollSummaryDraft("");
+        setCopyExportSuccess(null);
         // clear local per-shift overrides on week change
         setManualConfirmByShiftId({});
         setTimeOverrideByShiftId({});
         setPayDueOverrideByShiftId({});
+        setSavingRateByShift({});
 
         // keep billing overrides across week toggle? (feels safer to clear)
         setClientRateOverride({});
@@ -1769,7 +2069,7 @@ export default function BillingPayrollClient() {
     return () => {
       cancelled = true;
     };
-  }, [week]);
+  }, [selectedWeekStartDate]);
   const weeklyRules = useMemo(() => {
     const byId = new Map<string, ShiftRateRule>();
 
@@ -1798,11 +2098,11 @@ export default function BillingPayrollClient() {
       .filter((d): d is Date => !!d)
       .sort((a, b) => a.getTime() - b.getTime());
 
-    if (!dates.length) return week === "cw" ? "This Week" : "Next Week";
+    if (!dates.length) return selectedWeekStartDate ? `Week of ${formatArchiveDate(selectedWeekStartDate)}` : "Archived Week";
     const start = dates[0];
     const end = dates[dates.length - 1];
     return `Week of ${fmtMDY(start)} – ${fmtMDY(end)}`;
-  }, [shifts, week]);
+  }, [shifts, selectedWeekStartDate]);
 
   // derive missing caregiver IDs (in schedule but not in caregiver sheet)
   useEffect(() => {
@@ -1834,8 +2134,16 @@ export default function BillingPayrollClient() {
   }, [workedShifts, clockMap, locationMap, timeOverrideByShiftId]);
 
   const effectiveConfirmState = (shiftId: string, base: ConfirmEval | undefined) => {
-    const manual = manualConfirmByShiftId[norm(shiftId)];
+    const normalizedShiftId = norm(shiftId);
+    const manual = manualConfirmByShiftId[normalizedShiftId];
     if (manual) return "confirmed" as const;
+
+    const archiveApprovalStatus = archiveMetaByShift[normalizedShiftId]?.approvalStatus;
+    const rateApprovalStatus = shiftRateMetaByShift[normalizedShiftId]?.approvalStatus;
+    if (isApprovedStatus(archiveApprovalStatus) || isApprovedStatus(rateApprovalStatus)) {
+      return "confirmed" as const;
+    }
+
     return base?.state ?? "unknown";
   };
 
@@ -1854,7 +2162,22 @@ export default function BillingPayrollClient() {
       else if (state === "future") futureCount += 1;
     }
     return { confirmedCount, flaggedCount, futureCount };
-  }, [workedShifts, evalByShiftId, manualConfirmByShiftId]);
+  }, [workedShifts, evalByShiftId, manualConfirmByShiftId, archiveMetaByShift, shiftRateMetaByShift]);
+
+  const confirmedHoursTotal = useMemo(() => {
+    let total = 0;
+    for (const s0 of workedShifts) {
+      const s = applyTimeOverride(s0);
+      const id = norm(s.shiftId);
+      const ev = id ? evalByShiftId[id] : null;
+      const state = effectiveConfirmState(id, ev ?? undefined);
+      if (state === "confirmed") {
+        total += hoursBetween(s.startTime, s.endTime);
+      }
+    }
+    return total;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workedShifts, evalByShiftId, manualConfirmByShiftId, timeOverrideByShiftId, archiveMetaByShift, shiftRateMetaByShift]);
 
   const caregiverDisplayName = (caregiverId: string, fallbackScheduleName: string) => {
     const p = caregiverById[norm(caregiverId)];
@@ -2072,6 +2395,7 @@ export default function BillingPayrollClient() {
       const confirmState = effectiveConfirmState(sid, ev);
 
       const shiftClock = sid ? clockMap[sid] : undefined;
+      const archiveMeta = sid ? archiveMetaByShift[sid] : undefined;
       const clockInTime = shiftClock?.clockInTime ?? null;
       const clockOutTime = shiftClock?.clockOutTime ?? null;
 
@@ -2119,6 +2443,11 @@ export default function BillingPayrollClient() {
 
         clockInTime,
         clockOutTime,
+        clockInSite: archiveMeta?.clockInSite || "",
+        clockOutSite: archiveMeta?.clockOutSite || "",
+        approvalStatus: archiveMeta?.approvalStatus || "Not Approved",
+        archivedTotalPay: archiveMeta?.totalPay || 0,
+        archiveReason: archiveMeta?.reason || "",
         isManuallyConfirmed: Boolean(manualConfirmByShiftId[sid]),
         adjustedStartTime: timeOverrideByShiftId[sid]?.startTime,
         adjustedEndTime: timeOverrideByShiftId[sid]?.endTime,
@@ -2149,7 +2478,9 @@ export default function BillingPayrollClient() {
         runningHours += s.durationHours;
 
         const computedPayDue =
-          s.confirmState === "confirmed"
+          s.archivedTotalPay > 0
+            ? s.archivedTotalPay
+            : s.confirmState === "confirmed"
             ? roundHours(regularHours * s.payRate + overtimeHours * s.payRate * 1.5)
             : 0;
 
@@ -2191,6 +2522,7 @@ export default function BillingPayrollClient() {
     timeOverrideByShiftId,
     payDueOverrideByShiftId,
     clockMap,
+    archiveMetaByShift,
   ]);
     const payrollTotals = useMemo(() => {
     let scheduledHours = 0;
@@ -2295,12 +2627,43 @@ export default function BillingPayrollClient() {
     return rows.map((row) => row.map(csvEscape).join(",")).join("\n");
   }, [payrollGroups]);
 
+  const exportPayrollSummaryText = useMemo(() => {
+    const blocks = payrollGroups
+      .map((g) => {
+        const caregiverName =
+          norm(g.caregiverLabel) || norm(g.nameOnSchedule) || "Unknown Caregiver";
+        const hoursByRate = new Map<string, { rate: number; hours: number }>();
+
+        for (const s of g.shifts) {
+          if (s.durationHours <= 0 || s.payRate <= 0) continue;
+
+          const rateKey = s.payRate.toFixed(2);
+          const prev = hoursByRate.get(rateKey) || { rate: s.payRate, hours: 0 };
+          prev.hours += s.durationHours;
+          hoursByRate.set(rateKey, prev);
+        }
+
+        if (!hoursByRate.size) return "";
+
+        const lines = Array.from(hoursByRate.values())
+          .sort((a, b) => b.rate - a.rate)
+          .map((entry) => `${formatHoursLabel(entry.hours)} at ${money(entry.rate)} an hour`);
+
+        return [caregiverName, ...lines].join("\n");
+      })
+      .filter(Boolean);
+
+    return blocks.join("\n\n");
+  }, [payrollGroups]);
+
   const downloadPayrollCsv = () => {
     const today = new Date();
     const y = today.getFullYear();
     const m = String(today.getMonth() + 1).padStart(2, "0");
     const d = String(today.getDate()).padStart(2, "0");
-    const safeWeek = week === "cw" ? "current-week" : "next-week";
+    const safeWeek = selectedWeekStartDate
+      ? formatArchiveDate(selectedWeekStartDate).replace(/\//g, "-")
+      : "archived-week";
     const filename = `busybees-payroll-${safeWeek}-${y}-${m}-${d}.csv`;
 
     const blob = new Blob([exportCsv], { type: "text/csv;charset=utf-8;" });
@@ -2314,6 +2677,40 @@ export default function BillingPayrollClient() {
     link.remove();
 
     URL.revokeObjectURL(url);
+  };
+
+  const openPayrollSummaryEditor = () => {
+    setCopyExportSuccess(null);
+    setError(null);
+
+    if (!exportPayrollSummaryText.trim()) {
+      setError("No payroll data available for the selected week.");
+      return;
+    }
+
+    setPayrollSummaryDraft(exportPayrollSummaryText);
+    setPayrollTextModalOpen(true);
+  };
+
+  const copyPayrollSummaryDraft = async () => {
+    try {
+      setCopyExportSuccess(null);
+      setError(null);
+
+      if (!payrollSummaryDraft.trim()) {
+        throw new Error("Payroll text is empty.");
+      }
+
+      await navigator.clipboard.writeText(payrollSummaryDraft);
+      setCopyExportSuccess("Payroll summary copied.");
+      window.setTimeout(() => {
+        setCopyExportSuccess((prev) =>
+          prev === "Payroll summary copied." ? null : prev
+        );
+      }, 2500);
+    } catch (e: any) {
+      setError(e?.message || "Failed to copy payroll summary.");
+    }
   };
 
   const Toggle = ({
@@ -2441,7 +2838,7 @@ export default function BillingPayrollClient() {
         [sid]: parsed.toFixed(2),
       }));
 
-            setShiftRateMetaByShift((prev) => {
+        setShiftRateMetaByShift((prev) => {
         const current = prev[sid];
 
         return {
@@ -2486,6 +2883,11 @@ export default function BillingPayrollClient() {
           },
         };
       });
+
+      setOriginalPayRateByShift((prev) => ({
+        ...prev,
+        [sid]: parsed.toFixed(2),
+      }));
     } catch (e: any) {
       setError(e?.message || "Failed to save shift rate");
     } finally {
@@ -2493,9 +2895,26 @@ export default function BillingPayrollClient() {
     }
   };
 
+  const approveAllCaregiverShifts = (shiftsForCaregiver: PayrollShift[]) => {
+    const nextEntries = shiftsForCaregiver
+      .filter((s) => s.confirmState !== "future")
+      .map((s) => norm(s.shiftId))
+      .filter(Boolean);
+
+    if (!nextEntries.length) return;
+
+    setManualConfirmByShiftId((prev) => {
+      const next = { ...prev };
+      for (const shiftId of nextEntries) {
+        next[shiftId] = true;
+      }
+      return next;
+    });
+  };
+
      const updateRateRuleForm: RateRuleFormChange = (key, value) => {
   setRateRuleForm((prev) => {
-    const next: RateRuleFormState = {
+     const next: RateRuleFormState = {
       ...prev,
       [key]: value,
     } as RateRuleFormState;
@@ -2504,8 +2923,21 @@ export default function BillingPayrollClient() {
       next.ruleId = buildRuleIdFromName(String(value || ""));
     }
 
-    if (key === "ruleId") {
-      next.ruleIdManuallyEdited = true;
+    if (key === "ruleType") {
+      next.rateMode = value === "Base" ? "Set" : "Add";
+      if (value === "Base") {
+        next.addAmount = "";
+      } else {
+        next.payRate = "";
+      }
+    }
+
+    if (key === "targetScope") {
+      if (value === "client") {
+        next.caregiverId = "";
+      } else {
+        next.client = "";
+      }
     }
 
     return next;
@@ -2529,11 +2961,6 @@ export default function BillingPayrollClient() {
       return;
     }
 
-    if (!norm(rateRuleForm.priority)) {
-      setAddRuleError("Priority is required.");
-      return;
-    }
-
     if (rateRuleForm.rateMode === "Set" && !norm(rateRuleForm.payRate)) {
       setAddRuleError("Pay Rate is required when Rate Mode is Set.");
       return;
@@ -2541,6 +2968,16 @@ export default function BillingPayrollClient() {
 
     if (rateRuleForm.rateMode === "Add" && !norm(rateRuleForm.addAmount)) {
       setAddRuleError("Add Amount is required when Rate Mode is Add.");
+      return;
+    }
+
+    if (rateRuleForm.targetScope === "client" && !norm(rateRuleForm.client)) {
+      setAddRuleError("Choose a client for this rule.");
+      return;
+    }
+
+    if (rateRuleForm.targetScope === "caregiver" && !norm(rateRuleForm.caregiverId)) {
+      setAddRuleError("Choose a caregiver for this rule.");
       return;
     }
 
@@ -2570,12 +3007,13 @@ export default function BillingPayrollClient() {
           action: "createRateRule",
           ruleId: norm(rateRuleForm.ruleId),
           active: rateRuleForm.active,
-          priority: rateRuleForm.priority,
+          priority: "5",
           ruleName: norm(rateRuleForm.ruleName),
           ruleType: rateRuleForm.ruleType,
-          rateMode: rateRuleForm.rateMode,
-          client: norm(rateRuleForm.client),
-          caregiverId: norm(rateRuleForm.caregiverId),
+          rateMode: rateRuleForm.ruleType === "Base" ? "Set" : "Add",
+          client: rateRuleForm.targetScope === "client" ? norm(rateRuleForm.client) : "",
+          caregiverId:
+            rateRuleForm.targetScope === "caregiver" ? norm(rateRuleForm.caregiverId) : "",
           shiftType: norm(rateRuleForm.shiftType),
           holidayRule: norm(rateRuleForm.holidayRule),
           startDate: norm(rateRuleForm.startDate),
@@ -2683,6 +3121,111 @@ export default function BillingPayrollClient() {
       onChange={updateRateRuleForm}
     />
 
+    {payrollTextModalOpen ? (
+      <div
+        onClick={() => setPayrollTextModalOpen(false)}
+        style={{
+          position: "fixed",
+          inset: 0,
+          background: "rgba(15,23,42,0.45)",
+          display: "grid",
+          placeItems: "center",
+          padding: 20,
+          zIndex: 1000,
+        }}
+      >
+        <div
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            width: "min(920px, 100%)",
+            maxHeight: "85vh",
+            background: UI.panelBg,
+            borderRadius: 16,
+            border: `1px solid ${UI.borderSoft}`,
+            boxShadow: "0 24px 60px rgba(15,23,42,0.22)",
+            padding: 18,
+            display: "grid",
+            gap: 14,
+          }}
+        >
+          <div style={{ display: "grid", gap: 4 }}>
+            <div style={{ fontSize: 18, fontWeight: 950 }}>Payroll Text</div>
+            <div style={{ fontSize: 13, color: UI.textDim }}>
+              Edit the text below, then copy it when it looks right.
+            </div>
+          </div>
+
+          <textarea
+            value={payrollSummaryDraft}
+            onChange={(e) => setPayrollSummaryDraft(e.target.value)}
+            spellCheck={false}
+            style={{
+              width: "100%",
+              minHeight: 360,
+              maxHeight: "55vh",
+              resize: "vertical",
+              borderRadius: 12,
+              border: `1px solid ${UI.border}`,
+              padding: 14,
+              fontSize: 14,
+              lineHeight: 1.45,
+              color: UI.text,
+              outline: "none",
+              fontFamily:
+                'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+            }}
+          />
+
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              gap: 10,
+              flexWrap: "wrap",
+              alignItems: "center",
+            }}
+          >
+            <div style={{ fontSize: 12, fontWeight: 800, color: UI.textDim }}>
+              {copyExportSuccess || " "}
+            </div>
+
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <button
+                type="button"
+                onClick={() => setPayrollTextModalOpen(false)}
+                style={{
+                  padding: "9px 12px",
+                  borderRadius: 10,
+                  border: `1px solid ${UI.border}`,
+                  background: UI.panelBg,
+                  fontWeight: 900,
+                  cursor: "pointer",
+                }}
+              >
+                Close
+              </button>
+
+              <button
+                type="button"
+                onClick={copyPayrollSummaryDraft}
+                style={{
+                  padding: "9px 14px",
+                  borderRadius: 10,
+                  border: `1px solid ${UI.green}`,
+                  background: UI.green,
+                  color: "#fff",
+                  fontWeight: 950,
+                  cursor: "pointer",
+                }}
+              >
+                Copy Text
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    ) : null}
+
     <div style={{ maxWidth: 1300, margin: "0 auto" }}>
       {/* Header */}
       <div
@@ -2714,7 +3257,7 @@ export default function BillingPayrollClient() {
             }}
           >
             <Pill
-              text={`Confirmed: ${totalsConfirm.confirmedCount}`}
+              text={`Confirmed: ${confirmedHoursTotal.toFixed(2)}h`}
               bg="rgba(22,101,52,0.12)"
               color="#166534"
             />
@@ -2824,6 +3367,26 @@ export default function BillingPayrollClient() {
           </button>
 
           <button
+            onClick={openPayrollSummaryEditor}
+            disabled={loading}
+            style={{
+              padding: "7px 10px",
+              borderRadius: 10,
+              border: `1px solid ${UI.green}`,
+              background: UI.panelBg,
+              color: UI.green,
+              fontWeight: 950,
+              fontSize: 12,
+              cursor: loading ? "wait" : "pointer",
+              lineHeight: 1.1,
+              opacity: loading ? 0.7 : 1,
+            }}
+            title="Open editable payroll text"
+          >
+            Copy Payroll Text
+          </button>
+
+          <button
             onClick={downloadPayrollCsv}
             style={{
               padding: "7px 10px",
@@ -2840,8 +3403,8 @@ export default function BillingPayrollClient() {
             Export CSV
           </button>
           <select
-            value={week}
-            onChange={(e) => setWeek(e.target.value as WeekKind)}
+            value={selectedWeekStartDate}
+            onChange={(e) => setSelectedWeekStartDate(e.target.value)}
             style={{
               padding: "7px 10px",
               borderRadius: 10,
@@ -2853,8 +3416,17 @@ export default function BillingPayrollClient() {
               lineHeight: 1.1,
             }}
           >
-            <option value="cw">This Week</option>
-            <option value="nw">Next Week</option>
+            {availableWeeks.length === 0 ? (
+              <option value="">No archived weeks</option>
+            ) : (
+              availableWeeks.map((week) => (
+                <option key={week.weekStartDate} value={week.weekStartDate}>
+                  {`${formatArchiveDate(week.weekStartDate)} - ${formatArchiveDate(
+                    week.weekEndDate || week.weekStartDate
+                  )}`}
+                </option>
+              ))
+            )}
           </select>
 
           <a
@@ -2933,7 +3505,7 @@ export default function BillingPayrollClient() {
             marginBottom: 12,
           }}
         >
-          <div style={{ fontSize: 16, fontWeight: 950 }}>Rules Used This Week</div>
+          <div style={{ fontSize: 16, fontWeight: 950 }}>Rules Used For This Report</div>
           <div style={{ marginTop: 6, color: UI.textDim, fontSize: 13 }}>
             Showing distinct applied rules found in the loaded shift-rate data for this week.
           </div>
@@ -3214,7 +3786,7 @@ export default function BillingPayrollClient() {
                                         <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 0 }}>
                                           <thead>
                                             <tr>
-                                              {["Date", "Caregiver", "Time (adjustable)", "Confirm", "Actions"].map((h) => (
+                                              {["Date", "Caregiver", "Time (adjustable)", "Clock In", "Clock Out", "Confirm", "Actions"].map((h) => (
                                                <th
   key={h}
   style={{
@@ -3250,6 +3822,7 @@ export default function BillingPayrollClient() {
 
                                               const cgFull = caregiverDisplayName(s.caregiverId, s.caregiver);
                                               const cgNos = caregiverNameOnSchedule(s.caregiverId, s.caregiver);
+                                              const shiftClock = clockMap[id];
 
                                               return (
                                                 <tr key={s.shiftId}>
@@ -3326,7 +3899,15 @@ export default function BillingPayrollClient() {
                                                         h)
                                                       </span>
                                                     </div>
-                                                  </td>
+</td>
+
+                                                  <td style={{ padding: "6px 7px", borderBottom: `1px solid ${UI.borderSoft}`, whiteSpace: "nowrap", fontSize: 12.5 }}>
+  {formatClockStamp(shiftClock?.clockInTime)}
+</td>
+
+                                                  <td style={{ padding: "6px 7px", borderBottom: `1px solid ${UI.borderSoft}`, whiteSpace: "nowrap", fontSize: 12.5 }}>
+  {formatClockStamp(shiftClock?.clockOutTime)}
+</td>
 
                                                   <td style={{ padding: 10, borderBottom: `1px solid ${UI.borderSoft}` }}>
                                                     {badge}
@@ -3360,7 +3941,7 @@ export default function BillingPayrollClient() {
 
                                             {clientShifts.length === 0 ? (
                                               <tr>
-                                                <td colSpan={5} style={{ padding: 12, color: UI.textDim }}>
+                                                <td colSpan={7} style={{ padding: 12, color: UI.textDim }}>
                                                   No shifts found for this client.
                                                 </td>
                                               </tr>
@@ -3451,6 +4032,9 @@ export default function BillingPayrollClient() {
                     const caregiverPayrollMessageCount = payrollMessageEntry?.count || 0;
                     const open = !!expandedCaregivers[g.caregiverId];
                     const finished = isCaregiverFinished(g);
+                    const caregiverApproveAllCount = g.shifts.filter(
+                      (s) => s.confirmState !== "future"
+                    ).length;
                     return (
                       <div
   key={g.caregiverId}
@@ -3512,11 +4096,13 @@ export default function BillingPayrollClient() {
           color={UI.slate}
         />
 
-        <Pill
-          text={`OT ${caregiverOvertime.toFixed(2)}h`}
-          bg="rgba(245,158,11,0.14)"
-          color="#9a3412"
-        />
+        {caregiverOvertime > 0 ? (
+          <Pill
+            text={`OT ${caregiverOvertime.toFixed(2)}h`}
+            bg="rgba(245,158,11,0.14)"
+            color="#9a3412"
+          />
+        ) : null}
 
         <Pill
           text={`${caregiverConfirmed.toFixed(2)}h confirmed`}
@@ -3558,19 +4144,54 @@ export default function BillingPayrollClient() {
 
                                            {open ? (
                           <div style={{ display: "grid", gap: 12 }}>
+                            <div
+                              style={{
+                                display: "flex",
+                                justifyContent: "flex-end",
+                                padding: "10px 10px 0",
+                              }}
+                            >
+                              <button
+                                type="button"
+                                onClick={() => approveAllCaregiverShifts(g.shifts)}
+                                disabled={caregiverApproveAllCount === 0}
+                                style={{
+                                  padding: "7px 10px",
+                                  borderRadius: 9,
+                                  border: `1px solid ${UI.green}`,
+                                  background:
+                                    caregiverApproveAllCount === 0
+                                      ? "rgba(22,101,52,0.08)"
+                                      : UI.green,
+                                  color: caregiverApproveAllCount === 0 ? UI.green : "#fff",
+                                  fontWeight: 900,
+                                  fontSize: 12,
+                                  cursor:
+                                    caregiverApproveAllCount === 0
+                                      ? "not-allowed"
+                                      : "pointer",
+                                  opacity: caregiverApproveAllCount === 0 ? 0.65 : 1,
+                                }}
+                                title="Approve all non-future shifts for this caregiver"
+                              >
+                                Approve All
+                              </button>
+                            </div>
                             <div style={{ overflowX: "auto" }}>
                               <table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 0 }}>
                                 <thead>
                                   <tr>
                                   {[
-    "Date",
-    "Client",
-    "Time",
-    "Confirm",
-    "Shift Flags",
-    "Pay Rate / Rule Details",
-    "Pay Due",
-    "Actions",
+  "Date",
+  "Client",
+  "Start",
+  "End",
+  "Clock In",
+  "Clock Out",
+  "Pay Rate / Rules",
+  "Final Pay",
+  "Approved",
+  "Actions",
   ].map((h) => (
                                      <th
     key={h}
@@ -3592,16 +4213,18 @@ export default function BillingPayrollClient() {
                               <tbody>
                               {g.shifts.map((s) => {
   const id = norm(s.shiftId);
-  const state = s.confirmState;
   const rateMeta = shiftRateMetaByShift[id];
   const approvalPill = getApprovalPill(rateMeta);
-  const simpleReasons = summarizeReasons(s.reasons);
-
-  const rowBg =
-    state === "confirmed"
-      ? "rgba(22,101,52,0.06)"
-      : state === "flagged"
-      ? "rgba(239,68,68,0.06)"
+  const currentRateInput = norm(payRateByShift[id] ?? "");
+  const parsedCurrentRate = parseRate(currentRateInput);
+  const originalRateInput = norm(originalPayRateByShift[id] ?? "");
+  const parsedOriginalRate = parseRate(originalRateInput);
+  const hasRateChange =
+    currentRateInput !== "" &&
+    parsedCurrentRate != null &&
+    parsedCurrentRate !== (parsedOriginalRate ?? null);
+  const rowBg = normalizeName(s.approvalStatus).includes("approved") && !normalizeName(s.approvalStatus).includes("not approved")
+      ? "rgba(22,101,52,0.04)"
       : "transparent";
 
   return (
@@ -3636,71 +4259,40 @@ export default function BillingPayrollClient() {
           borderBottom: `1px solid ${UI.borderSoft}`,
           whiteSpace: "nowrap",
           verticalAlign: "top",
+          fontSize: 12.5,
+        }}
+      >
+        {s.startTime}
+      </td>
+
+      <td
+        style={{
+          padding: "6px 7px",
+          borderBottom: `1px solid ${UI.borderSoft}`,
+          whiteSpace: "nowrap",
+          verticalAlign: "top",
+          fontSize: 12.5,
+        }}
+      >
+        {s.endTime}
+      </td>
+
+      <td
+        style={{
+          padding: "6px 7px",
+          borderBottom: `1px solid ${UI.borderSoft}`,
+          verticalAlign: "top",
+          fontSize: 12.5,
         }}
       >
         <div
           style={{
-            display: "flex",
-            gap: 6,
-            flexWrap: "wrap",
-            alignItems: "center",
+            display: "grid",
+            gap: 2,
           }}
         >
-          <select
-            value={timeOverrideByShiftId[id]?.startTime ?? s.startTime}
-            onChange={(e) =>
-              setShiftTimeLocal(id, {
-                startTime: e.target.value,
-                endTime: timeOverrideByShiftId[id]?.endTime ?? s.endTime,
-              })
-            }
-            style={{
-              padding: "4px 6px",
-              borderRadius: 8,
-              border: `1px solid ${UI.border}`,
-              background: UI.panelBg,
-              fontWeight: 900,
-              fontSize: 13.5,
-              cursor: "pointer",
-            }}
-          >
-            {timeOptions.map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
-            ))}
-          </select>
-
-          <span style={{ color: UI.textDim, fontWeight: 900 }}>–</span>
-
-          <select
-            value={timeOverrideByShiftId[id]?.endTime ?? s.endTime}
-            onChange={(e) =>
-              setShiftTimeLocal(id, {
-                startTime: timeOverrideByShiftId[id]?.startTime ?? s.startTime,
-                endTime: e.target.value,
-              })
-            }
-            style={{
-              padding: "4px 6px",
-              borderRadius: 8,
-              border: `1px solid ${UI.border}`,
-              background: UI.panelBg,
-              fontWeight: 900,
-              fontSize: 13.5,
-              cursor: "pointer",
-            }}
-          >
-            {timeOptions.map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
-            ))}
-          </select>
-
-          <span style={{ color: UI.textDim, fontWeight: 900, fontSize: 12 }}>
-            ({s.durationHours.toFixed(2)}h)
-          </span>
+          <div style={{ fontWeight: 800, color: UI.text }}>{formatClockStamp(s.clockInTime)}</div>
+          <div style={{ color: UI.textDim, fontSize: 11.5 }}>{formatSiteLabel(s.clockInSite)}</div>
         </div>
       </td>
 
@@ -3709,57 +4301,13 @@ export default function BillingPayrollClient() {
           padding: "6px 7px",
           borderBottom: `1px solid ${UI.borderSoft}`,
           verticalAlign: "top",
+          fontSize: 12.5,
         }}
       >
-        {state === "confirmed" ? (
-          <Pill
-            text="Confirmed"
-            bg="rgba(22,101,52,0.12)"
-            color="#166534"
-          />
-        ) : state === "flagged" ? (
-          <Pill
-            text="Flagged"
-            bg="rgba(239,68,68,0.10)"
-            color="#991b1b"
-          />
-        ) : state === "future" ? (
-          <Pill
-            text="Future"
-            bg="rgba(148,163,184,0.22)"
-            color="#334155"
-          />
-        ) : (
-          <Pill
-            text="Unknown"
-            bg="rgba(100,116,139,0.18)"
-            color="#334155"
-          />
-        )}
-      </td>
-
-      <td
-        style={{
-          padding: "6px 7px",
-          borderBottom: `1px solid ${UI.borderSoft}`,
-          verticalAlign: "top",
-        }}
-      >
-        {state === "flagged" && simpleReasons.length ? (
-          <ReasonList reasons={simpleReasons} />
-        ) : state === "future" ? (
-          <span
-            style={{ color: UI.textDim, fontWeight: 800, fontSize: 12 }}
-          >
-            Not evaluated yet
-          </span>
-        ) : (
-          <span
-            style={{ color: UI.textDim, fontWeight: 800, fontSize: 12 }}
-          >
-            —
-          </span>
-        )}
+        <div style={{ display: "grid", gap: 2 }}>
+          <div style={{ fontWeight: 800, color: UI.text }}>{formatClockStamp(s.clockOutTime)}</div>
+          <div style={{ color: UI.textDim, fontSize: 11.5 }}>{formatSiteLabel(s.clockOutSite)}</div>
+        </div>
       </td>
 
       <td
@@ -3798,6 +4346,26 @@ export default function BillingPayrollClient() {
             >
               / hr
             </span>
+            {hasRateChange ? (
+              <button
+                type="button"
+                onClick={() => saveShiftRate(id)}
+                disabled={!!savingRateByShift[id]}
+                style={{
+                  padding: "6px 8px",
+                  borderRadius: 8,
+                  border: `1px solid ${UI.slate}`,
+                  background: UI.slate,
+                  color: "#fff",
+                  fontWeight: 900,
+                  fontSize: 12,
+                  lineHeight: 1.1,
+                  cursor: savingRateByShift[id] ? "wait" : "pointer",
+                }}
+              >
+                {savingRateByShift[id] ? "Saving..." : "Save"}
+              </button>
+            ) : null}
             <Pill
               text={approvalPill.text}
               bg={approvalPill.bg}
@@ -3887,6 +4455,7 @@ export default function BillingPayrollClient() {
               </div>
             </div>
           ) : null}
+
         </div>
       </td>
 
@@ -3917,43 +4486,29 @@ export default function BillingPayrollClient() {
           verticalAlign: "top",
         }}
       >
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          {state === "flagged" ? (
-            <button
-              onClick={() => confirmShiftLocal(id)}
-              style={{
-                padding: "6px 8px",
-                borderRadius: 8,
-                border: `1px solid ${UI.green}`,
-                background: "rgba(22,101,52,0.10)",
-                color: "#166534",
-                fontWeight: 900,
-                fontSize: 12,
-                lineHeight: 1.1,
-                cursor: "pointer",
-              }}
-            >
-              Confirm
-            </button>
+        <div style={{ display: "grid", gap: 6 }}>
+          <Pill
+            text={s.approvalStatus || approvalPill.text}
+            bg={approvalPill.bg}
+            color={approvalPill.color}
+          />
+          {s.archiveReason ? (
+            <div style={{ color: UI.textDim, fontWeight: 800, fontSize: 11.5, lineHeight: 1.35, maxWidth: 220 }}>
+              {s.archiveReason}
+            </div>
           ) : null}
+        </div>
+      </td>
 
-          <button
-            onClick={() => saveShiftRate(id)}
-            disabled={!!savingRateByShift[id]}
-            style={{
-              padding: "6px 8px",
-              borderRadius: 8,
-              border: `1px solid ${UI.slate}`,
-              background: UI.slate,
-              color: "#fff",
-              fontWeight: 900,
-              fontSize: 12,
-              lineHeight: 1.1,
-              cursor: savingRateByShift[id] ? "wait" : "pointer",
-            }}
-          >
-            {savingRateByShift[id] ? "Saving..." : "Save rate"}
-          </button>
+      <td
+        style={{
+          padding: "6px 7px",
+          borderBottom: `1px solid ${UI.borderSoft}`,
+          verticalAlign: "top",
+        }}
+      >
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <span style={{ color: UI.textDim, fontWeight: 900 }}>—</span>
         </div>
       </td>
     </tr>

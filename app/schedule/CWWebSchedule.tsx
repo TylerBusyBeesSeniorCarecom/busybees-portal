@@ -86,6 +86,7 @@ type CaregiversApiResponse = {
 };
 
 const SCHEDULE_CELL_DRAG_MIME = "application/x-busybees-schedule-cell";
+const SHIFT_CLIPBOARD_CURSOR_OFFSET = 18;
 
 type ScheduleCellDragPayload = {
   sourceA1: string;
@@ -2716,14 +2717,17 @@ const [unpublishedModalOpen, setUnpublishedModalOpen] = useState(false);
   }, [week]);
 
       // inline cell editing
-   const [editingA1, setEditingA1] = useState<string | null>(null);
+  const [editingA1, setEditingA1] = useState<string | null>(null);
   const [draftByA1, setDraftByA1] = useState<Record<string, string>>({});
   const inlineEditTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const inlineEditContainerRef = useRef<HTMLDivElement | null>(null);
   const [inlineEditCursor, setInlineEditCursor] = useState(0);
   const [inlineEditSuggestionIndex, setInlineEditSuggestionIndex] = useState(0);
   const [dragOverA1, setDragOverA1] = useState<string | null>(null);
   const [dragSourceA1, setDragSourceA1] = useState<string | null>(null);
   const [shiftClipboard, setShiftClipboard] = useState<ScheduleCellDragPayload | null>(null);
+  const [shiftClipboardCursor, setShiftClipboardCursor] = useState({ x: 0, y: 0 });
+  const [clipboardHoverA1, setClipboardHoverA1] = useState<string | null>(null);
 
   // allow independent cell save states
   const [savingA1Set, setSavingA1Set] = useState<Set<string>>(new Set());
@@ -2798,6 +2802,33 @@ function closeInsertRowModal() {
     anchorClientName: "",
   });
 }
+
+  useEffect(() => {
+    if (!shiftClipboard) return;
+
+    const handleMouseMove = (event: MouseEvent) => {
+      setShiftClipboardCursor({ x: event.clientX, y: event.clientY });
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setShiftClipboard(null);
+      setClipboardHoverA1(null);
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [shiftClipboard]);
+
+  useEffect(() => {
+    if (shiftClipboard) return;
+    setClipboardHoverA1(null);
+  }, [shiftClipboard]);
 function setInsertRowPosition(position: "above" | "below") {
   setInsertRowModal((prev) => {
     const anchorRow = prev.anchorRow;
@@ -5005,6 +5036,7 @@ const weekProgress = useMemo(() => {
     dayLabel: string;
     weekOf?: string;
     backgroundRefresh?: boolean;
+    keepOpenIfUnchanged?: boolean;
   }): Promise<boolean> {
   const {
     a1,
@@ -5014,6 +5046,7 @@ const weekProgress = useMemo(() => {
     dayLabel,
     weekOf,
     backgroundRefresh = true,
+    keepOpenIfUnchanged = false,
   } = args;
 
   let oldVal = "";
@@ -5030,7 +5063,9 @@ const weekProgress = useMemo(() => {
   }
 
     if (norm(oldVal) === norm(newVal)) {
-    cancelInlineEdit(a1);
+    if (!keepOpenIfUnchanged) {
+      cancelInlineEdit(a1);
+    }
     return true;
   }
 
@@ -5660,6 +5695,15 @@ async function pasteCopiedShiftIntoCell(args: {
     title: draftMode ? "Shift copied to draft" : "Shift pasted",
     lines: [`${clientName} • ${dayLabel}`],
   });
+}
+
+function previewShiftClipboardValue(value: string) {
+  const lines = value
+    .split(/\r?\n/)
+    .map((line) => norm(line))
+    .filter(Boolean);
+
+  return lines.slice(0, 3);
 }
 
 async function handleCaregiverDropToShift(args: {
@@ -9072,11 +9116,18 @@ async function handleCaregiverDropToShift(args: {
                                         });
                                         return;
                                       }
+
+                                      if (!isEditing && !isSaving) {
+                                        startInlineEdit(a1, value);
+                                      }
                                     }}
-                                    onDoubleClick={() => {
-                                      if (bulkMode) return;
-                                      if (!a1 || isSaving) return;
-                                      startInlineEdit(a1, value);
+                                    onMouseEnter={() => {
+                                      if (!a1 || !shiftClipboard) return;
+                                      setClipboardHoverA1(a1);
+                                    }}
+                                    onMouseLeave={() => {
+                                      if (!a1 || !shiftClipboard) return;
+                                      setClipboardHoverA1((prev) => (prev === a1 ? null : prev));
                                     }}
                                     onDragEnter={(e) => {
                                       if (!a1 || bulkMode) return;
@@ -9115,6 +9166,8 @@ async function handleCaregiverDropToShift(args: {
                                       background:
                                         dragOverA1 === a1
                                           ? "#dbeafe"
+                                          : clipboardHoverA1 === a1
+                                          ? "#eff6ff"
                                           : dragSourceA1 === a1
                                           ? "#eff6ff"
                                           : isBulkSelected
@@ -9131,6 +9184,8 @@ async function handleCaregiverDropToShift(args: {
                                       boxShadow:
                                         dragOverA1 === a1
                                           ? "inset 0 0 0 3px #2563eb"
+                                          : clipboardHoverA1 === a1
+                                          ? "inset 0 0 0 3px #2563eb"
                                           : dragSourceA1 === a1
                                           ? "inset 0 0 0 2px #60a5fa"
                                           : isBulkSelected
@@ -9141,6 +9196,8 @@ async function handleCaregiverDropToShift(args: {
                                       outline:
                                         dragOverA1 === a1
                                           ? "2px dashed #60a5fa"
+                                          : clipboardHoverA1 === a1
+                                          ? "2px solid #2563eb"
                                           : dragSourceA1 === a1
                                           ? "2px solid rgba(96,165,250,0.6)"
                                           : isBulkSelected
@@ -9152,6 +9209,7 @@ async function handleCaregiverDropToShift(args: {
                                   >
                                     {isEditing && !bulkMode ? (
                                       <div
+                                        ref={inlineEditContainerRef}
                                         style={{
                                           display: "grid",
                                           gap: 8,
@@ -9216,6 +9274,21 @@ async function handleCaregiverDropToShift(args: {
                                           onKeyUp={(e) => {
                                             setInlineEditCursor(e.currentTarget.selectionStart ?? 0);
                                           }}
+                                          onBlur={(e) => {
+                                            const nextTarget = e.relatedTarget as Node | null;
+                                            const container = inlineEditContainerRef.current;
+                                            if (nextTarget && container?.contains(nextTarget)) return;
+                                            if (isSaving) return;
+                                            void saveInlineEdit({
+                                              a1,
+                                              newVal: draftByA1[a1] ?? "",
+                                              clientName: name,
+                                              shiftDateForSave: dateStrForDow,
+                                              dayLabel,
+                                              weekOf: weekStartYmd,
+                                              keepOpenIfUnchanged: true,
+                                            });
+                                          }}
                                           onKeyDown={(e) => {
                                             if (e.key === "Escape") {
                                               e.preventDefault();
@@ -9251,7 +9324,7 @@ async function handleCaregiverDropToShift(args: {
 
                                             if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
                                               e.preventDefault();
-                                              saveInlineEdit({
+                                              void saveInlineEdit({
                                                 a1,
                                                 newVal: draftByA1[a1] ?? "",
                                                 clientName: name,
@@ -9345,42 +9418,37 @@ async function handleCaregiverDropToShift(args: {
                                           <button
                                             type="button"
                                             onClick={() => {
-                                              const copiedValue = draftByA1[a1] ?? "";
-                                              if (!norm(copiedValue)) return;
-
-                                              const payload: ScheduleCellDragPayload = {
-                                                sourceA1: a1,
-                                                sourceValue: copiedValue,
+                                              if (isSaving) return;
+                                              void saveInlineEdit({
+                                                a1,
+                                                newVal: "",
                                                 clientName: name,
-                                                dateStr: dateStrForDow,
+                                                shiftDateForSave: dateStrForDow,
                                                 dayLabel,
-                                                week,
-                                                mode: "copy",
-                                              };
-
-                                              setShiftClipboard(payload);
-                                              cancelInlineEdit(a1);
-                                              setSaveToast({
-                                                id: Date.now(),
-                                                kind: "success",
-                                                title: "Shift copied",
-                                                lines: ["Click any cell to paste it right away."],
+                                                weekOf: weekStartYmd,
                                               });
                                             }}
-                                            disabled={isSaving || !norm(draftByA1[a1] ?? "")}
+                                            disabled={isSaving}
                                             style={{
-                                              border: "1px solid #2563eb",
-                                              background: "#eff6ff",
-                                              color: "#1d4ed8",
-                                              borderRadius: 8,
-                                              padding: "6px 10px",
-                                              cursor:
-                                                isSaving || !norm(draftByA1[a1] ?? "") ? "default" : "pointer",
-                                              fontWeight: 900,
-                                              fontSize: 12,
+                                              width: 30,
+                                              height: 30,
+                                              border: "1px solid #fca5a5",
+                                              background: "#fff1f2",
+                                              color: "#b91c1c",
+                                              borderRadius: 999,
+                                              cursor: isSaving ? "default" : "pointer",
+                                              fontWeight: 1000,
+                                              fontSize: 16,
+                                              lineHeight: 1,
+                                              display: "inline-flex",
+                                              alignItems: "center",
+                                              justifyContent: "center",
+                                              padding: 0,
                                             }}
+                                            aria-label="Clear cell"
+                                            title="Clear cell"
                                           >
-                                            Copy
+                                            ×
                                           </button>
 
                                           <button
@@ -9400,45 +9468,6 @@ async function handleCaregiverDropToShift(args: {
                                           >
                                             Cancel
                                           </button>
-
-                                          <button
-                                            type="button"
-                                            onClick={() =>
-                                              saveInlineEdit({
-                                                a1,
-                                                newVal: draftByA1[a1] ?? "",
-                                                clientName: name,
-                                                shiftDateForSave: dateStrForDow,
-                                                dayLabel,
-                                                weekOf: weekStartYmd,
-                                              })
-                                            }
-                                            disabled={isSaving}
-                                            style={{
-                                              border: "1px solid #111827",
-                                              background: "#111827",
-                                              color: "#fff",
-                                              borderRadius: 8,
-                                              padding: "6px 10px",
-                                              cursor: isSaving ? "default" : "pointer",
-                                              fontWeight: 900,
-                                              fontSize: 12,
-                                            }}
-                                          >
-                                            {draftMode ? "Save to Draft" : isSaving ? "Saving..." : "Save"}
-                                          </button>
-                                        </div>
-
-                                        <div
-                                          style={{
-                                            fontSize: 11,
-                                            color: UI.textDim,
-                                            fontWeight: 800,
-                                            lineHeight: 1.35,
-                                          }}
-                                        >
-                                          Double click a shift to edit • Tab = autocomplete caregiver • Esc = cancel • Ctrl/Cmd + Enter ={" "}
-                                          {draftMode ? "save to draft" : "save"}
                                         </div>
                                       </div>
                                     ) : (
@@ -9484,6 +9513,24 @@ async function handleCaregiverDropToShift(args: {
     if (bulkMode) return;
     if (!a1 || isSaving) return;
     startInlineEdit(a1, value);
+  }}
+  onRequestCopy={() => {
+    if (!a1 || isSaving || !norm(displayValue)) return;
+    setShiftClipboard({
+      sourceA1: a1,
+      sourceValue: displayValue,
+      clientName: name,
+      dateStr: dateStrForDow,
+      dayLabel,
+      week,
+      mode: "copy",
+    });
+    setSaveToast({
+      id: Date.now(),
+      kind: "success",
+      title: "Shift copied",
+      lines: ["Click any schedule cell to paste it. Esc cancels copy mode."],
+    });
   }}
   expanded={isExpanded}
   onToggleExpanded={() => {
@@ -9546,6 +9593,67 @@ async function handleCaregiverDropToShift(args: {
           applicantSearch={applicantSearch ?? ""}
           setApplicantSearch={(v: string) => setApplicantSearch(v)}
         />
+
+        {shiftClipboard ? (
+          <div
+            aria-hidden="true"
+            style={{
+              position: "fixed",
+              left: shiftClipboardCursor.x + SHIFT_CLIPBOARD_CURSOR_OFFSET,
+              top: shiftClipboardCursor.y + SHIFT_CLIPBOARD_CURSOR_OFFSET,
+              zIndex: 120,
+              pointerEvents: "none",
+              minWidth: 220,
+              maxWidth: 320,
+              padding: "10px 12px",
+              borderRadius: 14,
+              background: "rgba(255,255,255,0.78)",
+              border: "1px solid rgba(37,99,235,0.4)",
+              boxShadow: "0 18px 38px rgba(15,23,42,0.18)",
+              color: UI.text,
+              backdropFilter: "blur(8px)",
+              WebkitBackdropFilter: "blur(8px)",
+              opacity: 0.8,
+            }}
+          >
+            <div
+              style={{
+                fontSize: 10,
+                fontWeight: 1000,
+                letterSpacing: "0.08em",
+                textTransform: "uppercase",
+                color: "#1d4ed8",
+                marginBottom: 6,
+              }}
+            >
+              Copied Shift
+            </div>
+            <div
+              style={{
+                fontSize: 12,
+                fontWeight: 900,
+                color: UI.text,
+                marginBottom: 4,
+              }}
+            >
+              {shiftClipboard.clientName} • {shiftClipboard.dayLabel}
+            </div>
+            <div
+              style={{
+                display: "grid",
+                gap: 2,
+                fontSize: 12,
+                lineHeight: 1.35,
+                color: UI.textDim,
+                whiteSpace: "pre-wrap",
+              }}
+            >
+              {previewShiftClipboardValue(shiftClipboard.sourceValue).map((line, idx) => (
+                <div key={`${shiftClipboard.sourceA1}_${idx}`}>{line}</div>
+              ))}
+            </div>
+          </div>
+        ) : null}
 
         <style jsx>{`
           .scheduleLayout {

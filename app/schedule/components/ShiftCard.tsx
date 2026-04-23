@@ -1288,6 +1288,20 @@ function InfoCircleIcon({ size = 14 }: { size?: number }) {
   );
 }
 
+function CopyIcon({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <rect x="9" y="8" width="10" height="11" rx="2" stroke="currentColor" strokeWidth="2" />
+      <path
+        d="M7 15H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2v1"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
 function LightbulbIcon({ size = 14 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -1343,6 +1357,7 @@ export default function ShiftCard({
   status: rawStatus,
   disabled,
   onRequestEdit,
+  onRequestCopy,
   expanded,
   onToggleExpanded,
   dateStrForDow: rawDateStrForDow,
@@ -1383,6 +1398,7 @@ onOpenEditHistory,
   status: ShiftStatus;
   disabled?: boolean;
   onRequestEdit: () => void;
+  onRequestCopy?: () => void;
 
   expanded: boolean;
   onToggleExpanded: () => void;
@@ -1550,6 +1566,7 @@ const showHistoryIcon =
   !isRequestedEmpty &&
   !isCancelled &&
   Boolean(shiftId);
+const showCopyIcon = !isEmpty && !isCancelled && !isRequested && Boolean(norm(value));
   const isUnpublished = unpublishedCount > 0 && !isEmpty && !isCancelled && !isRequested;
    const border = isEmpty
     ? "none"
@@ -2588,7 +2605,7 @@ const total =
           return;
         }
 
-        const BATCH = 4;
+        const BATCH = 2;
         for (let i = 0; i < taskFns.length; i += BATCH) {
           if (ac.signal.aborted) return;
           const slice = taskFns.slice(i, i + BATCH);
@@ -2805,7 +2822,7 @@ return (
       overflow: "hidden",
     }}
   >
-         {showHistoryIcon && (
+        {showHistoryIcon && (
   <button
     type="button"
     onClick={handleOpenEditHistory}
@@ -2843,6 +2860,48 @@ return (
     <InfoCircleIcon size={13} />
   </button>
 )}
+        {showCopyIcon && onRequestCopy ? (
+  <button
+    type="button"
+    onClick={(e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      onRequestCopy();
+    }}
+    onDoubleClick={(e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    }}
+    style={{
+      position: "absolute",
+      top: 34,
+      left: 8,
+      width: 22,
+      height: 22,
+      borderRadius: 999,
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
+      fontSize: 13,
+      fontWeight: 950,
+      background: "rgba(255,255,255,0.22)",
+      color: fg,
+      border: "1px solid rgba(255,255,255,0.5)",
+      filter: "drop-shadow(0 1px 0 rgba(0,0,0,0.25))",
+      cursor: showHoverHistoryIcon ? "pointer" : "default",
+      userSelect: "none",
+      padding: 0,
+      zIndex: 5,
+      opacity: showHoverHistoryIcon ? 1 : 0,
+      pointerEvents: showHoverHistoryIcon ? "auto" : "none",
+      transition: "opacity 120ms ease",
+    }}
+    aria-label="Copy shift"
+    title="Copy shift"
+  >
+    <CopyIcon size={13} />
+  </button>
+) : null}
 
           {isEmpty ? (
                        <div
