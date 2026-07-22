@@ -2,7 +2,7 @@ const ALLOWED_ORIGINS = new Set([
   "https://docs.google.com",
   "http://127.0.0.1:3000",
   "http://localhost:3000",
-  "https://portal.busybeeseniorcare.com",
+  "https://portal.busybeesseniorcare.com",
 ]);
 
 export function getAllowedCorsOrigin(origin: string | null): string | null {
