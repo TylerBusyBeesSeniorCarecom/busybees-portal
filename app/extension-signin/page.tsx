@@ -12,21 +12,28 @@ export default function ExtensionSignInPage() {
 
   const handleSuccess = useCallback(() => {
     if (typeof window === "undefined") return;
-    if (status !== "authenticated" || !session?.user || successStartedRef.current) return;
+    if (successStartedRef.current) return;
 
     successStartedRef.current = true;
 
-    window.setTimeout(() => {
+    try {
       window.opener?.postMessage({ type: "busybees-auth-success" }, "*");
-      window.close();
+    } catch {}
 
-      window.setTimeout(() => {
-        if (!window.closed) {
-          setShowFallbackMessage(true);
-        }
-      }, 250);
-    }, 200);
-  }, [session?.user, status]);
+    try {
+      window.top?.postMessage({ type: "busybees-auth-success" }, "*");
+    } catch {}
+
+    try {
+      window.close();
+    } catch {}
+
+    window.setTimeout(() => {
+      if (!window.closed) {
+        setShowFallbackMessage(true);
+      }
+    }, 500);
+  }, []);
 
   useEffect(() => {
     if (status === "authenticated" && session?.user) {

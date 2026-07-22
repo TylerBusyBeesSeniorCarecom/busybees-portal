@@ -72,7 +72,20 @@ export default function SignInCard({
       }
 
       if (result.error) {
-        setErrorMessage("Invalid username, password, or access level.");
+        setErrorMessage(result.error ?? "Invalid email or password");
+        setIsCredentialsSigningIn(false);
+        return;
+      }
+
+      if (onSuccess) {
+        window.setTimeout(() => {
+          onSuccess();
+        }, 100);
+        return;
+      }
+
+      if (!result.ok) {
+        setErrorMessage(result.error ?? "Invalid email or password");
         setIsCredentialsSigningIn(false);
         return;
       }
