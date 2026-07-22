@@ -1350,6 +1350,33 @@ function formatFriendlyDate(raw: string): string {
   return `${weekday} the ${day}${ordinal(day)}`;
 }
 
+function formatCompactShiftDate(raw: string): string {
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return raw;
+  const day = d.toLocaleDateString(undefined, { weekday: "short" });
+  return `${day} ${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+function shiftStatusPill(status: ShiftStatus) {
+  switch (status) {
+    case "filled":
+      return { label: "Filled", bg: "#ecfdf5", border: "#86efac", color: "#166534" };
+    case "considering":
+      return { label: "Considering", bg: "#fff7ed", border: "#fdba74", color: "#c2410c" };
+    case "offered":
+    case "offering":
+      return { label: "Offered", bg: "#eff6ff", border: "#93c5fd", color: "#1d4ed8" };
+    case "pending":
+      return { label: "Pending Client Approval", bg: "#faf5ff", border: "#d8b4fe", color: "#7e22ce" };
+    case "requested":
+      return { label: "Requested", bg: "#fff7ed", border: "#fdba74", color: "#9a3412" };
+    case "canceled":
+      return { label: "Cancelled", bg: "#f3f4f6", border: "#d1d5db", color: "#4b5563" };
+    default:
+      return { label: "Open", bg: "#eff6ff", border: "#93c5fd", color: "#1d4ed8" };
+  }
+}
+
 /** ---------- Component ---------- */
 export default function ShiftCard({
   a1Key,
@@ -1389,6 +1416,7 @@ onOpenEditHistory,
   unpublishedCount = 0,
   popupOnly = false,
   popupTarget = null,
+  popupRenderMode = "floating",
   onPopupOnlyClose,
   panelStorageKey,
   panelInitial,
@@ -1434,6 +1462,7 @@ onOpenEditHistory,
   unpublishedCount?: number;
   popupOnly?: boolean;
   popupTarget?: PopupShiftTarget | null;
+  popupRenderMode?: "floating" | "inline";
   onPopupOnlyClose?: () => void;
   panelStorageKey?: string;
   panelInitial?: Partial<{ x: number; y: number; w: number; h: number }>;
@@ -1452,35 +1481,38 @@ const clientName = popupOnly && popupTarget ? popupTarget.clientName : rawClient
 const v = norm(value);
 
 // ✅ normalize request list (supports multiple requests in same cell)
-const requestList = isRequested ? (Array.isArray(requests) ? requests : []) : [];
+const requestList = Array.isArray(requests) ? requests : [];
 const firstReq = requestList[0] ?? null;
+const hasRequestData = requestList.length > 0;
 
 // ✅ requested-empty means: status=requested but no payload
-const isRequestedEmpty = isRequested && requestList.length === 0;
+const isRequestedEmpty = isRequested && !hasRequestData;
+const showRequestCard = !v && hasRequestData;
+const usesRequestData = isRequested || showRequestCard;
 
 // ✅ requested shifts are NOT "empty" visually even if value is blank,
 // BUT if we have no request payload at all, treat as empty.
-const isEmpty = (!v && !isRequested) || isRequestedEmpty;
+const isEmpty = (!v && !usesRequestData) || isRequestedEmpty;
 
 // ✅ requested shifts use request payload for start/end (first request drives summary + matching)
-const parsed = isRequested ? null : isEmpty ? null : parseCaregiverAndTime(v);
+const parsed = usesRequestData ? null : isEmpty ? null : parseCaregiverAndTime(v);
 
-const start = isRequested ? norm(firstReq?.start) : parsed?.start ?? "";
-const end = isRequested ? norm(firstReq?.end) : parsed?.end ?? "";
+const start = usesRequestData ? norm(firstReq?.start) : parsed?.start ?? "";
+const end = usesRequestData ? norm(firstReq?.end) : parsed?.end ?? "";
 
 // For normal shifts, parsed.timeLabel is fine.
 // For requested shifts, show first range + (+N) if multiple.
-const timeLabel = isRequested
+const timeLabel = usesRequestData
   ? start && end
     ? `${start}-${end}${requestList.length > 1 ? ` (+${requestList.length - 1})` : ""}`
     : ""
   : parsed?.timeLabel ?? "";
 
-const caregiver = isRequested ? norm(firstReq?.preferredCaregiver) : parsed?.caregiver ?? "";
+const caregiver = usesRequestData ? norm(firstReq?.preferredCaregiver) : parsed?.caregiver ?? "";
   const displayTime = timeLabel || "—";
 
 // ✅ for ghost shifts show Pref if provided, else Requested
-const displayCaregiver = isRequested ? (caregiver || "Requested") : caregiver ? caregiver : "Open";
+const displayCaregiver = usesRequestData ? (caregiver || "Requested") : caregiver ? caregiver : "Open";
  const isCancelled = status === "canceled";
 const canBuildInfo = !isRequestedEmpty && Boolean(norm(start) && norm(end));
 
@@ -1528,7 +1560,7 @@ const shiftId = norm(info?.shiftId);
 const showInfoIcon =
   !isEmpty &&
   !isCancelled &&
-  (tState === "future" || isRequested) &&
+  (tState === "future" || usesRequestData) &&
   !isRequestedEmpty &&
   Boolean(norm(start) && norm(end));
 
@@ -1551,7 +1583,7 @@ const showInfoIcon =
   }
 
   // ✅ Ghost/requested styling overrides
-  if (isRequested) {
+  if (usesRequestData) {
     bg = "rgba(255,255,255,0.0)";          // transparent
     fg = "#9a3412";                         // orange-brown text
   }
@@ -1566,11 +1598,11 @@ const showHistoryIcon =
   !isRequestedEmpty &&
   !isCancelled &&
   Boolean(shiftId);
-const showCopyIcon = !isEmpty && !isCancelled && !isRequested && Boolean(norm(value));
-  const isUnpublished = unpublishedCount > 0 && !isEmpty && !isCancelled && !isRequested;
+const showCopyIcon = !isEmpty && !isCancelled && !usesRequestData && Boolean(norm(value));
+  const isUnpublished = unpublishedCount > 0 && !isEmpty && !isCancelled && !usesRequestData;
    const border = isEmpty
     ? "none"
-    : isRequested
+    : usesRequestData
       ? "2px dashed rgba(234,88,12,0.85)" // ✅ dashed outline
       : isCancelled
         ? "1px solid #cbd5e1"
@@ -1583,7 +1615,7 @@ const showCopyIcon = !isEmpty && !isCancelled && !isRequested && Boolean(norm(va
             : "1px solid rgba(255,255,255,0.35)";
   const shadow = isEmpty
     ? "none"
-    : isRequested
+    : usesRequestData
       ? "0 0 0 2px rgba(234,88,12,0.10)" // ✅ subtle glow
       : isCancelled
         ? "0 1px 0 rgba(0,0,0,0.06)"
@@ -1700,39 +1732,39 @@ const popupLightBlur = isGlass ? "none" : "none";
   !isEmpty &&
   !isCancelled &&
   !isRequestedEmpty &&
-  ((tState === "future" && Boolean(parsed)) || (isRequested && Boolean(norm(start) && norm(end))));
+  ((tState === "future" && Boolean(parsed)) || (usesRequestData && Boolean(norm(start) && norm(end))));
 
    const shiftSummary = useMemo(() => {
   const hasTimes = !isRequestedEmpty && Boolean(norm(start) && norm(end));
   if (!hasTimes) return null;
 
-  const requestedCount = isRequested ? requestList.length : 0;
+  const requestedCount = usesRequestData ? requestList.length : 0;
 
   return {
     dateStr: dateStrForDow,
-    time: `${start}-${end}${isRequested && requestedCount > 1 ? ` (+${requestedCount - 1})` : ""}`,
-    caregiver: isRequested ? (caregiver || "Requested") : caregiver || "Open",
+    time: `${start}-${end}${usesRequestData && requestedCount > 1 ? ` (+${requestedCount - 1})` : ""}`,
+    caregiver: usesRequestData ? (caregiver || "Requested") : caregiver || "Open",
     client: clientName,
     start,
     end,
 
     // ✅ extra info for ghost shifts (multi)
     requestedCount,
-    requestedStatus: isRequested ? (norm(firstReq?.status) || "Pending") : "",
-    requestedNotes: isRequested
+    requestedStatus: usesRequestData ? (norm(firstReq?.status) || "Pending") : "",
+    requestedNotes: usesRequestData
       ? requestList
           .map((r) => norm(r?.notes))
           .filter(Boolean)
           .join("\n\n")
       : "",
-    requestedTimestamps: isRequested
+    requestedTimestamps: usesRequestData
       ? requestList
           .map((r) => norm(r?.timestamp))
           .filter(Boolean)
           .join(", ")
       : "",
   };
-}, [start, end, caregiver, clientName, dateStrForDow, isRequested, isRequestedEmpty, requestList, firstReq]);
+}, [start, end, caregiver, clientName, dateStrForDow, usesRequestData, isRequestedEmpty, requestList, firstReq]);
 
   function buildPrefillMessage(args: { caregiverName: string; caregiverId: string; note?: string }) {
     const { caregiverName, caregiverId, note } = args;
@@ -2069,7 +2101,7 @@ function openNestedShiftMenu(target: PopupShiftTarget) {
   // Load menu data when menu opens
   useEffect(() => {
   if (!menuOpen) {
-    if (popupOnly) onPopupOnlyClose?.();
+    if (popupOnly && popupRenderMode !== "inline") onPopupOnlyClose?.();
     return;
   }
 
@@ -2087,10 +2119,11 @@ function openNestedShiftMenu(target: PopupShiftTarget) {
   setDriveLoading(false);
   setDriveByCaregiverKey({});
   // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [menuOpen, popupOnly, onPopupOnlyClose, clientName]);
+}, [menuOpen, popupOnly, onPopupOnlyClose, clientName, popupRenderMode]);
 
   // ESC closes this panel
 useEffect(() => {
+  if (popupRenderMode === "inline") return;
   if (!menuOpen) return;
 
   function onKey(e: KeyboardEvent) {
@@ -2100,7 +2133,7 @@ useEffect(() => {
 
   window.addEventListener("keydown", onKey);
   return () => window.removeEventListener("keydown", onKey);
-}, [menuOpen]);
+}, [menuOpen, popupRenderMode]);
 
   /** ---------- Click / dblclick ---------- */
   const clickTimerRef = useRef<number | null>(null);
@@ -2126,7 +2159,7 @@ useEffect(() => {
       clickTimerRef.current = null;
     }
 
-    // ✅ Future shifts: open Shift Menu
+    // ✅ Future shifts and request cards: open Shift Menu
     if (canOpenShiftMenu) {
       openShiftMenu();
       return;
@@ -2137,7 +2170,11 @@ useEffect(() => {
   }
 
   const titleText =
-    tState === "future" ? "Click to edit • Double click for shift menu" : "Click to edit • Double click to toggle clocks";
+    usesRequestData
+      ? "Click to add a shift • Double click for request details"
+      : tState === "future"
+        ? "Click to edit • Double click for shift menu"
+        : "Click to edit • Double click to toggle clocks";
 
       function handleOpenEditHistory(e: React.MouseEvent | React.KeyboardEvent) {
   e.preventDefault();
@@ -2373,8 +2410,8 @@ type CaregiverRow = {
 
   const caregiversBase: CaregiverRow[] = useMemo(() => {
   // ✅ For normal shifts we require parsed time
-  // ✅ For requested shifts, parsed is intentionally null, but we still build list using start/end
-  if (!parsed && !isRequested) return [];
+  // ✅ For request cards, parsed is intentionally null, but we still build list using start/end
+  if (!parsed && !usesRequestData) return [];
   if (isRequestedEmpty) return [];
 
   const reqRange = timeRangeToMinutes(start, end);
@@ -2517,6 +2554,7 @@ const total =
 }, [
   parsed,
   isRequested,
+  usesRequestData,
   isRequestedEmpty,
   start,
   end,
@@ -2803,7 +2841,7 @@ return (
       background: bg,
       color: fg,
       borderRadius: 12,
-      padding: isEmpty ? "0px" : "10px 10px",
+      padding: isEmpty ? "0px" : usesRequestData ? "0px" : "10px 10px",
       boxShadow: shadow,
       opacity: disabled ? 0.6 : 1,
       position: "relative",
@@ -2919,6 +2957,103 @@ return (
               }}
             >
               —
+            </div>
+          ) : showRequestCard ? (
+            <div
+              style={{
+                minHeight: rowIsEmpty ? EMPTY_CELL_HEIGHT : CARD_COLLAPSED_HEIGHT,
+                height: "100%",
+                display: "flex",
+                flexDirection: "column",
+                justifyContent: "space-between",
+                gap: 8,
+                padding: "10px 12px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  justifyContent: "space-between",
+                  gap: 8,
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    openShiftMenu();
+                  }}
+                  style={{
+                    border: "1px solid rgba(234,88,12,0.45)",
+                    background: "rgba(255,247,237,0.9)",
+                    color: "#9a3412",
+                    borderRadius: 999,
+                    padding: "4px 10px",
+                    fontSize: 11,
+                    fontWeight: 1000,
+                    cursor: "pointer",
+                    lineHeight: 1.1,
+                  }}
+                  title="Open request details"
+                  aria-label="Open request details"
+                >
+                  Requested
+                </button>
+
+                {requestList.length > 1 ? (
+                  <span
+                    style={{
+                      fontSize: 10,
+                      fontWeight: 1000,
+                      color: "#c2410c",
+                      whiteSpace: "nowrap",
+                    }}
+                    title={`${requestList.length} requests in this cell`}
+                  >
+                    +{requestList.length - 1} more
+                  </span>
+                ) : null}
+              </div>
+
+              <div
+                style={{
+                  fontSize: 13,
+                  fontWeight: 950,
+                  color: "#9a3412",
+                  lineHeight: 1.25,
+                }}
+              >
+                {displayTime}
+              </div>
+
+              {caregiver ? (
+                <div
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 850,
+                    color: "#c2410c",
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
+                  title={`Preferred caregiver: ${caregiver}`}
+                >
+                  Pref: {caregiver}
+                </div>
+              ) : (
+                <div
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 850,
+                    color: "#c2410c",
+                    opacity: 0.85,
+                  }}
+                >
+                  Click cell to add shift
+                </div>
+              )}
             </div>
           ) : (
             <>
@@ -3064,127 +3199,21 @@ return (
       </div>
       ) : null}
 
-      {/* ---------- SHIFT MENU (FloatingPanel) ---------- */}
-<FloatingPanel
-  open={menuOpen}
-  onClose={() => {
-    setMenuOpen(false);
-    if (popupOnly) onPopupOnlyClose?.();
-  }}
-  title={
+      {/* ---------- SHIFT MENU ---------- */}
+{(() => {
+  const popupEngineContent = (
     <div
       style={{
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        gap: 10,
         width: "100%",
-        minWidth: 0,
+        height: "100%",
+        overflowY: "auto",
+        overflowX: "hidden",
+        padding: 10,
+        background: popupShellBg,
+        backdropFilter: popupBlur,
+        WebkitBackdropFilter: popupBlur,
       }}
     >
-      <div
-        style={{
-          minWidth: 0,
-          flex: "1 1 auto",
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          whiteSpace: "nowrap",
-          fontWeight: 950,
-          color: "#111827",
-        }}
-        title={
-          shiftSummary
-            ? `Shift Info • ${clientName} • ${shiftSummary.start}-${shiftSummary.end} • ${shiftSummary.caregiver || "Open"}`
-            : `Shift Info • ${clientName}`
-        }
-      >
-        {shiftSummary
-          ? `Shift Info • ${clientName} • ${shiftSummary.start}-${shiftSummary.end} • ${shiftSummary.caregiver || "Open"}`
-          : `Shift Info • ${clientName}`}
-      </div>
-
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          flex: "0 0 auto",
-          paddingRight: 6,
-        }}
-      >
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            setClearMode((v) => !v);
-          }}
-          style={{
-            border: isGlass
-              ? "1px solid rgba(255,255,255,0.32)"
-              : "1px solid rgba(15,23,42,0.16)",
-            background: popupButtonBg,
-            borderRadius: 999,
-            padding: "7px 11px",
-            fontWeight: 950,
-            cursor: "pointer",
-            color: "#0b1220",
-            fontSize: 12,
-            whiteSpace: "nowrap",
-            backdropFilter: popupLightBlur,
-            WebkitBackdropFilter: popupLightBlur,
-            boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.18)" : "none",
-          }}
-          title="Toggle clear mode"
-        >
-          {clearMode ? "Solid mode" : "Clear mode"}
-        </button>
-
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            setShowDesc((vv) => !vv);
-          }}
-          style={{
-            border: isGlass
-              ? "1px solid rgba(255,255,255,0.32)"
-              : "1px solid rgba(15,23,42,0.16)",
-            background: popupButtonBg,
-            borderRadius: 999,
-            padding: "7px 11px",
-            fontWeight: 950,
-            cursor: "pointer",
-            color: "#0b1220",
-            fontSize: 12,
-            whiteSpace: "nowrap",
-            backdropFilter: popupLightBlur,
-            WebkitBackdropFilter: popupLightBlur,
-            boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.18)" : "none",
-          }}
-          title="Toggle description"
-        >
-          {showDesc ? "Hide description" : "Case description"}
-        </button>
-
-        {initialMenuLoading ? <TinySpinner label="Loading…" /> : null}
-      </div>
-    </div>
-  }
-  storageKey={currentPanelStorageKey}
-  initial={panelInitial ?? { w: 720, h: 520 }}
-  clearMode={clearMode}
->
-  <div
-    style={{
-      height: "100%",
-      overflowY: "auto",
-      overflowX: "hidden",
-      padding: 10,
-      background: popupShellBg,
-      backdropFilter: popupBlur,
-      WebkitBackdropFilter: popupBlur,
-    }}
-  >
     <div style={{ display: "grid", gap: 10 }}>
       {weekSchedError ? <div style={{ fontWeight: 950, color: "#b91c1c" }}>Schedule error: {weekSchedError}</div> : null}
       {availError ? <div style={{ fontWeight: 950, color: "#b91c1c" }}>Availability error: {availError}</div> : null}
@@ -3209,8 +3238,6 @@ return (
             position: "sticky",
             top: -10,
             zIndex: 20,
-            display: "grid",
-            gap: 8,
             padding: 10,
             borderBottom: isGlass
               ? "1px solid rgba(255,255,255,0.18)"
@@ -3222,229 +3249,63 @@ return (
             WebkitBackdropFilter: popupBlur,
           }}
         >
-          <div
-            style={{
-              display: "flex",
-              alignItems: "flex-start",
-              justifyContent: "space-between",
-              gap: 10,
-              flexWrap: "wrap",
-            }}
-          >
-            <div style={{ minWidth: 0, flex: "1 1 420px" }}>
-              <div style={{ fontSize: 16, fontWeight: 1000, color: "#111827", lineHeight: 1.1 }}>
-                {shiftSummary ? shiftSummary.client : "Shift"}
-              </div>
-
-              {shiftSummary ? (
-                <div
-                  style={{
-                    marginTop: 6,
-                    display: "grid",
-                    gridTemplateColumns: "repeat(auto-fit, minmax(150px, max-content))",
-                    gap: 6,
-                    alignItems: "center",
-                  }}
-                >
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 6,
-                      minHeight: 32,
-                      padding: "6px 10px",
-                      borderRadius: 10,
-                      border: popupStrongBorder,
-                      background: popupSoftBg,
-                      color: "#0b1220",
-                      backdropFilter: popupLightBlur,
-                      WebkitBackdropFilter: popupLightBlur,
-                      boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.16)" : "none",
-                    }}
-                  >
-                    <span
-                      style={{
-                        fontSize: 10.5,
-                        fontWeight: 1000,
-                        color: "#64748b",
-                        textTransform: "uppercase",
-                        letterSpacing: 0.3,
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      Day
-                    </span>
-                    <span
-                      style={{
-                        fontSize: 12,
-                        fontWeight: 950,
-                        color: "#0b1220",
-                        minWidth: 0,
-                      }}
-                    >
-                      {formatFriendlyDate(shiftSummary.dateStr)}
-                    </span>
-                  </div>
-
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 6,
-                      minHeight: 32,
-                      padding: "6px 10px",
-                      borderRadius: 10,
-                      border: popupStrongBorder,
-                      background: popupSoftBg,
-                      color: "#0b1220",
-                      backdropFilter: popupLightBlur,
-                      WebkitBackdropFilter: popupLightBlur,
-                      boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.16)" : "none",
-                    }}
-                  >
-                    <span
-                      style={{
-                        fontSize: 10.5,
-                        fontWeight: 1000,
-                        color: "#64748b",
-                        textTransform: "uppercase",
-                        letterSpacing: 0.3,
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      Time
-                    </span>
-                    <span
-                      style={{
-                        fontSize: 12,
-                        fontWeight: 950,
-                        color: "#0b1220",
-                        minWidth: 0,
-                      }}
-                    >
-                      {shiftSummary.start}-{shiftSummary.end}
-                    </span>
-                  </div>
-
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 6,
-                      minHeight: 32,
-                      padding: "6px 10px",
-                      borderRadius: 10,
-                      border: popupStrongBorder,
-                      background: popupSoftBg,
-                      color: "#0b1220",
-                      backdropFilter: popupLightBlur,
-                      WebkitBackdropFilter: popupLightBlur,
-                      boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.16)" : "none",
-                    }}
-                    title="Currently scheduled caregiver for this shift"
-                  >
-                    <span
-                      style={{
-                        fontSize: 10.5,
-                        fontWeight: 1000,
-                        color: "#64748b",
-                        textTransform: "uppercase",
-                        letterSpacing: 0.3,
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      Scheduled
-                    </span>
-                    <span
-                      style={{
-                        fontSize: 12,
-                        fontWeight: 950,
-                        color: "#0b1220",
-                        minWidth: 0,
-                      }}
-                    >
-                      {shiftSummary.caregiver || "Open"}
-                    </span>
-                  </div>
-                </div>
-              ) : (
-                <div style={{ marginTop: 4, opacity: 0.8, fontWeight: 850, color: "#0b1220" }}>
-                  (No parsed time range for this cell)
-                </div>
-              )}
-
+          {shiftSummary ? (
+            <div style={{ display: "grid", gap: 6 }}>
               <div
                 style={{
-                  marginTop: 8,
                   display: "flex",
-                  alignItems: "flex-start",
-                  gap: 6,
-                  minHeight: 34,
-                  padding: "7px 10px",
-                  borderRadius: 10,
-                  border: popupStrongBorder,
-                  background: popupSoftBg,
-                  color: "#0b1220",
-                  backdropFilter: popupLightBlur,
-                  WebkitBackdropFilter: popupLightBlur,
-                  boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.16)" : "none",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 10,
+                  flexWrap: "wrap",
                 }}
               >
-                <span
+                <div
                   style={{
-                    fontSize: 10.5,
-                    fontWeight: 1000,
-                    color: "#64748b",
-                    textTransform: "uppercase",
-                    letterSpacing: 0.3,
-                    whiteSpace: "nowrap",
-                    paddingTop: 1,
-                  }}
-                >
-                  Destination
-                </span>
-
-                <span
-                  style={{
-                    fontSize: 12,
-                    fontWeight: 900,
-                    color: "#0b1220",
                     minWidth: 0,
-                    whiteSpace: "normal",
-                    lineHeight: 1.35,
+                    fontSize: 15,
+                    fontWeight: 1000,
+                    color: "#111827",
+                    lineHeight: 1.2,
                   }}
                 >
-                  {clientsLoading ? (
-                    <SkeletonLine w="320px" />
-                  ) : clientDestination ? (
-                    clientDestination
-                  ) : (
-                    <span style={{ color: "#b91c1c" }}>Missing client address</span>
-                  )}
-                </span>
+                  {shiftSummary.client} · {formatCompactShiftDate(shiftSummary.dateStr)} {shiftSummary.start}-{shiftSummary.end}
+                </div>
+                {(() => {
+                  const tone = shiftStatusPill(status);
+                  return (
+                    <span
+                      style={{
+                        border: `1px solid ${tone.border}`,
+                        background: tone.bg,
+                        color: tone.color,
+                        borderRadius: 999,
+                        padding: "4px 9px",
+                        fontSize: 11,
+                        fontWeight: 950,
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {tone.label}
+                    </span>
+                  );
+                })()}
               </div>
-            </div>
-          </div>
 
-          {showDesc ? (
-            <div
-              style={{
-                border: popupBorder,
-                borderRadius: 12,
-                padding: 10,
-                background: popupSectionBg,
-                color: "#0b1220",
-                fontWeight: 850,
-                whiteSpace: "pre-wrap",
-                backdropFilter: popupLightBlur,
-                WebkitBackdropFilter: popupLightBlur,
-                boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.16)" : "none",
-              }}
-            >
-              {norm(clientDescription) ? clientDescription : "No description on file."}
+              {shiftSummary.caregiver && shiftSummary.caregiver !== "Open" && shiftSummary.caregiver !== "Requested" ? (
+                <div style={{ fontSize: 12, fontWeight: 800, color: "#475569" }}>
+                  Current: {shiftSummary.caregiver}
+                </div>
+              ) : null}
             </div>
-          ) : null}
+          ) : (
+            <div style={{ opacity: 0.8, fontWeight: 850, color: "#0b1220" }}>
+              (No parsed time range for this cell)
+            </div>
+          )}
+        </div>
 
+        <div style={{ padding: 10, display: "grid", gap: 10 }}>
           <div
             style={{
               display: "flex",
@@ -3535,20 +3396,37 @@ return (
             <Pill clearMode={clearMode}>On schedule or availability: {stats.total}</Pill>
             <Pill clearMode={clearMode}>Conflicts: {stats.conflicts}</Pill>
             {availTabName ? <Pill clearMode={clearMode}>Source: {availTabName}</Pill> : null}
-
+            {clientDestination ? <Pill clearMode={clearMode}>Destination: {clientDestination}</Pill> : null}
             {histLoading ? <TinySpinner label="History…" /> : null}
             {driveLoading ? <TinySpinner label="Drive times…" /> : null}
             {histError ? <span style={{ fontWeight: 950, color: "#b91c1c" }}>{histError}</span> : null}
           </div>
+
+          {showDesc ? (
+            <div
+              style={{
+                border: popupBorder,
+                borderRadius: 12,
+                padding: 10,
+                background: popupSectionBg,
+                color: "#0b1220",
+                fontWeight: 850,
+                whiteSpace: "pre-wrap",
+                backdropFilter: popupLightBlur,
+                WebkitBackdropFilter: popupLightBlur,
+                boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.16)" : "none",
+              }}
+            >
+              {norm(clientDescription) ? clientDescription : "No description on file."}
+            </div>
+          ) : null}
 
           {availValues.length > 0 && (caregiverNameIdx < 0 || dayColIndexForSelectedDow < 0) ? (
             <div style={{ fontSize: 12, fontWeight: 900, color: "#b45309" }}>
               Heads up: availability headers didn’t match expected columns (Caregiver Name / day columns). We’ll still show caregivers already on the schedule.
             </div>
           ) : null}
-        </div>
 
-        <div style={{ padding: 10 }}>
           {(weekSchedLoading || availLoading || cgLoading || clientsLoading) && (
             <div
               style={{
@@ -4061,8 +3939,127 @@ return (
         </div>
       </div>
     </div>
-  </div>
-</FloatingPanel>
+    </div>
+  );
+
+  if (popupRenderMode === "inline") {
+    return popupOnly ? popupEngineContent : null;
+  }
+
+  return (
+    <FloatingPanel
+      open={menuOpen}
+      onClose={() => {
+        setMenuOpen(false);
+        if (popupOnly) onPopupOnlyClose?.();
+      }}
+      title={
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 10,
+            width: "100%",
+            minWidth: 0,
+          }}
+        >
+          <div
+            style={{
+              minWidth: 0,
+              flex: "1 1 auto",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              fontWeight: 950,
+              color: "#111827",
+            }}
+            title={
+              shiftSummary
+                ? `Shift Info • ${clientName} • ${shiftSummary.start}-${shiftSummary.end} • ${shiftSummary.caregiver || "Open"}`
+                : `Shift Info • ${clientName}`
+            }
+          >
+            {shiftSummary
+              ? `Shift Info • ${clientName} • ${shiftSummary.start}-${shiftSummary.end} • ${shiftSummary.caregiver || "Open"}`
+              : `Shift Info • ${clientName}`}
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              flex: "0 0 auto",
+              paddingRight: 6,
+            }}
+          >
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setClearMode((v) => !v);
+              }}
+              style={{
+                border: isGlass
+                  ? "1px solid rgba(255,255,255,0.32)"
+                  : "1px solid rgba(15,23,42,0.16)",
+                background: popupButtonBg,
+                borderRadius: 999,
+                padding: "7px 11px",
+                fontWeight: 950,
+                cursor: "pointer",
+                color: "#0b1220",
+                fontSize: 12,
+                whiteSpace: "nowrap",
+                backdropFilter: popupLightBlur,
+                WebkitBackdropFilter: popupLightBlur,
+                boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.18)" : "none",
+              }}
+              title="Toggle clear mode"
+            >
+              {clearMode ? "Solid mode" : "Clear mode"}
+            </button>
+
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowDesc((vv) => !vv);
+              }}
+              style={{
+                border: isGlass
+                  ? "1px solid rgba(255,255,255,0.32)"
+                  : "1px solid rgba(15,23,42,0.16)",
+                background: popupButtonBg,
+                borderRadius: 999,
+                padding: "7px 11px",
+                fontWeight: 950,
+                cursor: "pointer",
+                color: "#0b1220",
+                fontSize: 12,
+                whiteSpace: "nowrap",
+                backdropFilter: popupLightBlur,
+                WebkitBackdropFilter: popupLightBlur,
+                boxShadow: isGlass ? "inset 0 1px 0 rgba(255,255,255,0.18)" : "none",
+              }}
+              title="Toggle description"
+            >
+              {showDesc ? "Hide description" : "Case description"}
+            </button>
+
+            {initialMenuLoading ? <TinySpinner label="Loading…" /> : null}
+          </div>
+        </div>
+      }
+      storageKey={currentPanelStorageKey}
+      initial={panelInitial ?? { w: 720, h: 520 }}
+      clearMode={clearMode}
+    >
+      {popupEngineContent}
+    </FloatingPanel>
+  );
+})()}
 {popupWindows.map((popup, idx) => (
   <ShiftCard
     key={popup.id}

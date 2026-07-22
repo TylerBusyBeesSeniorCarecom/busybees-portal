@@ -9,6 +9,9 @@
       "lint": "eslint"
    },
    "dependencies": {
+      "@opentelemetry/api": "^1.9.1",
+      "firebase": "^12.15.0",
+      "firebase-admin": "^13.9.0",
       "google-auth-library": "^10.5.0",
       "googleapis": "^170.1.0",
       "jose": "^6.1.3",

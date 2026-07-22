@@ -1,4 +1,7 @@
+import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
+
+import { buildApiJsonResponse, requireAdminSession } from "@/lib/apiAuth";
 
 export const dynamic = "force-dynamic";
 
@@ -50,13 +53,16 @@ async function parseJsonResponse(r: Response, context: string) {
   };
 }
 
-export async function GET(req: Request) {
+export async function GET(request: NextRequest) {
   try {
+    const { response } = await requireAdminSession(request);
+    if (response) return response;
+
     console.log("--------------------------------------------------");
     console.log("[ScheduleEditLog] Incoming GET request");
 
     const base = getBase();
-    const { searchParams } = new URL(req.url);
+    const { searchParams } = new URL(request.url);
 
     const weekType = searchParams.get("weekType") || "";
     const weekOf = searchParams.get("weekOf") || "";
@@ -88,28 +94,32 @@ export async function GET(req: Request) {
     const parsed = await parseJsonResponse(r, "GET");
     if (!parsed.ok) return parsed.response;
 
-    return NextResponse.json(parsed.data, { status: r.ok ? 200 : 500 });
+    return buildApiJsonResponse(request, parsed.data, r.ok ? 200 : 500);
   } catch (err: any) {
     console.error("[ScheduleEditLog] ❌ GET ERROR OCCURRED:");
     console.error(err);
 
-    return NextResponse.json(
+    return buildApiJsonResponse(
+      request,
       {
         ok: false,
         error: err?.message ?? "Unknown error",
       },
-      { status: 500 }
+      500
     );
   }
 }
 
-export async function POST(req: Request) {
+export async function POST(request: NextRequest) {
   try {
+    const { response } = await requireAdminSession(request);
+    if (response) return response;
+
     console.log("--------------------------------------------------");
     console.log("[ScheduleEditLog] Incoming POST request");
 
     const base = getBase();
-    const body = await req.json();
+    const body = await request.json();
 
     console.log("[ScheduleEditLog] Request payload received:");
     console.log(JSON.stringify(body, null, 2));
@@ -137,17 +147,18 @@ export async function POST(req: Request) {
     const parsed = await parseJsonResponse(r, "POST");
     if (!parsed.ok) return parsed.response;
 
-    return NextResponse.json(parsed.data, { status: r.ok ? 200 : 500 });
+    return buildApiJsonResponse(request, parsed.data, r.ok ? 200 : 500);
   } catch (err: any) {
     console.error("[ScheduleEditLog] ❌ ERROR OCCURRED:");
     console.error(err);
 
-    return NextResponse.json(
+    return buildApiJsonResponse(
+      request,
       {
         ok: false,
         error: err?.message ?? "Unknown error",
       },
-      { status: 500 }
+      500
     );
   }
 }

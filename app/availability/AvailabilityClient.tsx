@@ -460,7 +460,7 @@ export default function AvailabilityClient() {
 
   // Build visible columns (hide caregiver id + week start date)
   const baseVisibleColIndexes = useMemo(() => {
-    const hidden = new Set<number>([caregiverIdIdx, weekStartIdx].filter((n) => n >= 0));
+    const hidden = new Set<number>([caregiverIdIdx, weekStartIdx, desiredHoursIdx].filter((n) => n >= 0));
     const idxs: number[] = [];
 
     for (let i = 0; i < headers.length; i++) {
@@ -474,23 +474,14 @@ export default function AvailabilityClient() {
       return [caregiverNameIdx, ...filtered];
     }
     return idxs;
-  }, [headers, caregiverIdIdx, weekStartIdx, caregiverNameIdx]);
+  }, [headers, caregiverIdIdx, weekStartIdx, caregiverNameIdx, desiredHoursIdx]);
 
-  // Insert virtual "Total Hours" between Saturday and Desired Hours
-  type ColSpec = { kind: "real"; colIndex: number } | { kind: "virtual_total_hours" };
+  type ColSpec = { kind: "real"; colIndex: number };
 
   const visibleColsAllDays: ColSpec[] = useMemo(() => {
-    const specs: ColSpec[] = [];
-    for (const i of baseVisibleColIndexes) {
-      specs.push({ kind: "real", colIndex: i });
-      if (i === saturdayIdx && desiredHoursIdx !== -1) {
-        specs.push({ kind: "virtual_total_hours" });
-      }
-    }
-    return specs;
-  }, [baseVisibleColIndexes, saturdayIdx, desiredHoursIdx]);
+    return baseVisibleColIndexes.map((i) => ({ kind: "real", colIndex: i }));
+  }, [baseVisibleColIndexes]);
 
-  // ✅ If a day is selected, only keep that day column (plus Caregiver + Total Hours + Desired Hours)
   const visibleCols = useMemo((): ColSpec[] => {
     if (selectedDow == null) return visibleColsAllDays;
 
@@ -504,30 +495,19 @@ export default function AvailabilityClient() {
       out.push({ kind: "real", colIndex: dayColIndex });
     }
 
-    const hasTotalHours = visibleColsAllDays.some((c) => c.kind === "virtual_total_hours");
-    if (hasTotalHours) out.push({ kind: "virtual_total_hours" });
-
-    if (desiredHoursIdx >= 0 && desiredHoursIdx !== caregiverNameIdx && desiredHoursIdx !== dayColIndex) {
-      out.push({ kind: "real", colIndex: desiredHoursIdx });
-    }
-
     return out;
-  }, [selectedDow, visibleColsAllDays, dayCols, caregiverNameIdx, desiredHoursIdx]);
+  }, [selectedDow, visibleColsAllDays, dayCols, caregiverNameIdx]);
 
   const visibleHeaders = useMemo(() => {
-    return visibleCols.map((c) => {
-      if (c.kind === "virtual_total_hours") return "Total Hours";
-      return headers[(c as any).colIndex] ?? "";
-    });
+    return visibleCols.map((c) => headers[c.colIndex] ?? "");
   }, [visibleCols, headers]);
 
   function colWidthPx(col: ColSpec): number {
-    if (col.kind === "virtual_total_hours") return 110;
-    const i = (col as any).colIndex as number;
+    const i = col.colIndex;
     if (i === caregiverNameIdx) return 160;
 
     const isDay = dayCols.some((d) => d.colIndex === i);
-    if (isDay) return 170;
+    if (isDay) return 190;
 
     return 110;
   }
@@ -1246,42 +1226,16 @@ export default function AvailabilityClient() {
                         const totalHrs = caregiverKey ? (scheduleHoursByCaregiverKey[caregiverKey] ?? 0) : 0;
 
                         const desiredMeta = desiredHoursSortValue(r, desiredHoursIdx);
-                        const desiredLabel = desiredMeta.wantsMax ? "As many as possible" : `${desiredMeta.hours}`;
-                        const gapValue = desiredMeta.wantsMax ? null : desiredMeta.hours - totalHrs;
+                        const desiredRaw = desiredHoursIdx >= 0 ? norm(r[desiredHoursIdx]) : "";
+                        const hoursLine = [showSchedule ? `${totalHrs.toFixed(1)}h` : null, desiredRaw || null]
+                          .filter(Boolean)
+                          .join(" / ");
 
                         return (
                           <tr key={`row_${rowIndex}`}>
                             {visibleCols.map((col, vColIdx) => {
                               const width = colWidthPx(col);
-
-                              if (col.kind === "virtual_total_hours") {
-                                return (
-                                  <td
-                                    key={`cell_${rowIndex}_totalHours`}
-                                    style={{
-                                      background: zebraBg,
-                                      padding: "8px 8px",
-                                      borderBottom: `1px solid ${UI.borderSoft}`,
-                                      fontSize: 12,
-                                      fontWeight: 900,
-                                      color: UI.text,
-                                      width,
-                                      minWidth: width,
-                                      maxWidth: width,
-                                      verticalAlign: "top",
-                                    }}
-                                    title={
-                                      desiredHoursIdx >= 0
-                                        ? `Desired: ${desiredLabel} • Gap: ${gapValue == null ? "—" : gapValue.toFixed(1)}`
-                                        : undefined
-                                    }
-                                  >
-                                    {showSchedule ? totalHrs.toFixed(1) : <span style={{ color: "#9ca3af" }}>—</span>}
-                                  </td>
-                                );
-                              }
-
-                              const colIndex = (col as any).colIndex as number;
+                              const colIndex = col.colIndex;
                               const val = norm(r[colIndex]);
                               const sticky = colIndex === caregiverNameIdx;
 
@@ -1315,7 +1269,23 @@ export default function AvailabilityClient() {
                                   }}
                                 >
                                   {sticky ? (
-                                    val || "—"
+                                    <div style={{ display: "grid", gap: 4 }}>
+                                      <div style={{ fontWeight: 900, color: val ? UI.text : "#9ca3af" }}>
+                                        {val || "—"}
+                                      </div>
+                                      {hoursLine ? (
+                                        <div
+                                          style={{
+                                            fontSize: 11,
+                                            fontWeight: 700,
+                                            color: UI.textDim,
+                                            lineHeight: 1.3,
+                                          }}
+                                        >
+                                          {hoursLine}
+                                        </div>
+                                      ) : null}
+                                    </div>
                                   ) : (
                                     <div style={{ display: "grid", gap: 8 }}>
                                       <div>

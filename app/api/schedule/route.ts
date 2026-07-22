@@ -1,5 +1,10 @@
-import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
 import { google } from "googleapis";
+
+import { buildApiJsonResponse, requireAdminSession } from "@/lib/apiAuth";
+import { adminDb } from "@/lib/firebaseAdmin";
+
+const EMPTY_SCHEDULE_REASON = "The schedule for this week has not been created yet.";
 
 async function getSheetsClient() {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
@@ -15,11 +20,79 @@ async function getSheetsClient() {
   return google.sheets({ version: "v4", auth });
 }
 
+function isEmptyScheduleRangeError(err: any) {
+  const code = Number(err?.code || err?.status || 0);
+  const message = String(err?.message ?? "").toLowerCase();
+  return (
+    code === 400 &&
+    (message.includes("the number of rows in the range must be at least 1") ||
+      message.includes("unable to parse range"))
+  );
+}
+
+async function getSheetRowCount(
+  sheets: Awaited<ReturnType<typeof getSheetsClient>>,
+  spreadsheetId: string,
+  tabName: string
+) {
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: "sheets(properties(title,gridProperties(rowCount)))",
+  });
+  const match = meta.data.sheets?.find(
+    (sheet) => String(sheet.properties?.title ?? "").trim() === tabName
+  );
+  return match?.properties?.gridProperties?.rowCount ?? null;
+}
+
+function buildEmptyScheduleResponse(args: {
+  request: NextRequest;
+  week: string;
+  tabName: string;
+  appTabName: string;
+  locationTabName: string;
+}) {
+  return buildApiJsonResponse(
+    args.request,
+    {
+      ok: true,
+      week: args.week,
+      tabName: args.tabName,
+      appTabName: args.appTabName,
+      locationTabName: args.locationTabName,
+      values: [],
+      shifts: [],
+      rowCount: 0,
+      empty: true,
+      emptyReason: EMPTY_SCHEDULE_REASON,
+      clockMap: {},
+      clockSourceMap: {},
+      locationMap: {},
+      debug: {
+        scheduleShiftIdCount: 0,
+        clockMapCount: 0,
+        locationMapCount: 0,
+        locationMapWithAnyVerdictCount: 0,
+        firebaseClockCount: 0,
+        firebaseLocationCount: 0,
+      },
+    },
+    200
+  );
+}
+
 export const dynamic = "force-dynamic";
 
 type ClockEntry = {
   clockInTime: string | null;
   clockOutTime: string | null;
+};
+
+type ClockSource = "google_sheets" | "firebase";
+
+type ClockSourceEntry = {
+  clockInSource: ClockSource | null;
+  clockOutSource: ClockSource | null;
 };
 
 type LocationEntry = {
@@ -59,12 +132,159 @@ function parseTimestampToMs(raw: any): number | null {
   return Number.isNaN(t) ? null : t;
 }
 
-export async function GET(req: Request) {
+function toIsoString(raw: any): string | null {
+  if (raw == null) return null;
+
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const parsed = Date.parse(trimmed);
+    return Number.isNaN(parsed) ? trimmed : new Date(parsed).toISOString();
+  }
+
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return new Date(raw).toISOString();
+  }
+
+  if (typeof raw?.toDate === "function") {
+    try {
+      return raw.toDate().toISOString();
+    } catch {
+      return null;
+    }
+  }
+
+  if (raw instanceof Date) {
+    return Number.isNaN(raw.getTime()) ? null : raw.toISOString();
+  }
+
+  return null;
+}
+
+function ensureLocationEntry(
+  locationMap: Record<string, LocationEntry>,
+  sid: string
+) {
+  if (!locationMap[sid]) {
+    locationMap[sid] = {
+      clockIn: { timestamp: null, verdict: null },
+      clockOut: { timestamp: null, verdict: null },
+    };
+  }
+  return locationMap[sid];
+}
+
+async function overlayFirebaseClockAndLocationData(args: {
+  shiftIds: string[];
+  clockMap: Record<string, ClockEntry>;
+  clockSourceMap: Record<string, ClockSourceEntry>;
+  locationMap: Record<string, LocationEntry>;
+}) {
+  const { shiftIds, clockMap, clockSourceMap, locationMap } = args;
+  if (!shiftIds.length) return { firebaseClockCount: 0, firebaseLocationCount: 0 };
+
+  const chunkSize = 30;
+  const chunks: string[][] = [];
+  for (let i = 0; i < shiftIds.length; i += chunkSize) {
+    chunks.push(shiftIds.slice(i, i + chunkSize));
+  }
+
+  let firebaseClockCount = 0;
+  for (const chunk of chunks) {
+    const snapshot = await adminDb
+      .collection("timeEntries")
+      .where("shiftID", "in", chunk)
+      .get();
+
+    for (const doc of snapshot.docs) {
+      const row = doc.data();
+      const shiftId = String(row?.shiftID ?? row?.shiftId ?? doc.id ?? "").trim();
+      if (!shiftId) continue;
+
+      const clockInTime =
+        toIsoString(row?.clockInOverrideTime) ??
+        toIsoString(row?.clockInTime);
+      const clockOutTime =
+        toIsoString(row?.clockOutOverrideTime) ??
+        toIsoString(row?.clockOutTime);
+
+      if (!clockInTime && !clockOutTime) continue;
+
+      firebaseClockCount += 1;
+      clockMap[shiftId] = {
+        clockInTime: clockInTime ?? clockMap[shiftId]?.clockInTime ?? null,
+        clockOutTime: clockOutTime ?? clockMap[shiftId]?.clockOutTime ?? null,
+      };
+      clockSourceMap[shiftId] = {
+        clockInSource:
+          clockInTime != null
+            ? "firebase"
+            : clockSourceMap[shiftId]?.clockInSource ?? null,
+        clockOutSource:
+          clockOutTime != null
+            ? "firebase"
+            : clockSourceMap[shiftId]?.clockOutSource ?? null,
+      };
+    }
+  }
+
+  const latestInMs: Record<string, number> = {};
+  const latestOutMs: Record<string, number> = {};
+  let firebaseLocationCount = 0;
+
+  for (const chunk of chunks) {
+    const snapshot = await adminDb
+      .collection("locationEvents")
+      .where("shiftID", "in", chunk)
+      .get();
+
+    for (const doc of snapshot.docs) {
+      const row = doc.data();
+      const shiftId = String(row?.shiftID ?? row?.shiftId ?? "").trim();
+      if (!shiftId) continue;
+
+      const action = String(row?.action ?? "").trim().toLowerCase();
+      if (action !== "clock_in" && action !== "clock_out") continue;
+
+      const timestamp = toIsoString(row?.timestamp);
+      const timestampMs = parseTimestampToMs(timestamp);
+      const verdict = String(row?.verdict ?? "").trim() || null;
+      const entry = ensureLocationEntry(locationMap, shiftId);
+
+      firebaseLocationCount += 1;
+
+      if (action === "clock_in") {
+        const prev = latestInMs[shiftId];
+        if (timestampMs != null && (prev == null || timestampMs >= prev)) {
+          latestInMs[shiftId] = timestampMs;
+          entry.clockIn = { timestamp, verdict };
+        } else if (prev == null && !entry.clockIn.timestamp && timestamp) {
+          entry.clockIn = { timestamp, verdict };
+        }
+      } else {
+        const prev = latestOutMs[shiftId];
+        if (timestampMs != null && (prev == null || timestampMs >= prev)) {
+          latestOutMs[shiftId] = timestampMs;
+          entry.clockOut = { timestamp, verdict };
+        } else if (prev == null && !entry.clockOut.timestamp && timestamp) {
+          entry.clockOut = { timestamp, verdict };
+        }
+      }
+    }
+  }
+
+  return { firebaseClockCount, firebaseLocationCount };
+}
+
+export async function GET(request: NextRequest) {
   try {
+    const { response } = await requireAdminSession(request);
+    if (response) return response;
+
     const spreadsheetId = process.env.TEST_SHEET_ID;
     if (!spreadsheetId) throw new Error("Missing TEST_SHEET_ID");
 
-    const url = new URL(req.url);
+    const url = new URL(request.url);
     const week = (url.searchParams.get("week") || "cw").toLowerCase();
 
     const cwTab = process.env.CW_SCHEDULE_TAB_NAME || "All Shifts";
@@ -77,13 +297,47 @@ export async function GET(req: Request) {
     const sheets = await getSheetsClient();
 
     const scheduleRange = `'${tabName}'!A1:I5000`;
-    const scheduleRes = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: scheduleRange,
-      valueRenderOption: "FORMATTED_VALUE",
-    });
+    const scheduleRowCount = await getSheetRowCount(sheets, spreadsheetId, tabName);
+    if (scheduleRowCount != null && scheduleRowCount < 2) {
+      return buildEmptyScheduleResponse({
+        request,
+        week,
+        tabName,
+        appTabName,
+        locationTabName,
+      });
+    }
+
+    let scheduleRes;
+    try {
+      scheduleRes = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range: scheduleRange,
+        valueRenderOption: "FORMATTED_VALUE",
+      });
+    } catch (err: any) {
+      if (isEmptyScheduleRangeError(err)) {
+        return buildEmptyScheduleResponse({
+          request,
+          week,
+          tabName,
+          appTabName,
+          locationTabName,
+        });
+      }
+      throw err;
+    }
 
     const values = scheduleRes.data.values ?? [];
+    if (values.length === 0) {
+      return buildEmptyScheduleResponse({
+        request,
+        week,
+        tabName,
+        appTabName,
+        locationTabName,
+      });
+    }
 
     let shiftIds: string[] = [];
     if (values.length > 1) {
@@ -112,6 +366,7 @@ export async function GET(req: Request) {
 
     const appValues = appRes.data.values ?? [];
     const clockMap: Record<string, ClockEntry> = {};
+    const clockSourceMap: Record<string, ClockSourceEntry> = {};
 
     if (appValues.length > 1) {
       const appHeaders = appValues[0] ?? [];
@@ -133,6 +388,16 @@ export async function GET(req: Request) {
           clockMap[sid] = {
             clockInTime: clockInRaw || prev?.clockInTime || null,
             clockOutTime: clockOutRaw || prev?.clockOutTime || null,
+          };
+          clockSourceMap[sid] = {
+            clockInSource:
+              clockInRaw
+                ? "google_sheets"
+                : clockSourceMap[sid]?.clockInSource ?? null,
+            clockOutSource:
+              clockOutRaw
+                ? "google_sheets"
+                : clockSourceMap[sid]?.clockOutSource ?? null,
           };
         }
       }
@@ -156,16 +421,6 @@ export async function GET(req: Request) {
       const idxAction = findHeaderIndex(headers, "Action");
       const idxShiftId = findHeaderIndex(headers, "Shift ID");
       const idxVerdict = findHeaderIndex(headers, "Verdict");
-
-      const ensure = (sid: string) => {
-        if (!locationMap[sid]) {
-          locationMap[sid] = {
-            clockIn: { timestamp: null, verdict: null },
-            clockOut: { timestamp: null, verdict: null },
-          };
-        }
-        return locationMap[sid];
-      };
 
       const latestInMs: Record<string, number> = {};
       const latestOutMs: Record<string, number> = {};
@@ -191,7 +446,7 @@ export async function GET(req: Request) {
 
         const verdict = String(verdictRaw ?? "").trim() || null;
 
-        const entry = ensure(sid);
+        const entry = ensureLocationEntry(locationMap, sid);
 
         if (action === "clock_in") {
           const prev = latestInMs[sid];
@@ -213,28 +468,42 @@ export async function GET(req: Request) {
       }
     }
 
-    return NextResponse.json({
-      ok: true,
-      week,
-      tabName,
-      appTabName,
-      locationTabName,
-      values,
+    const firebaseDebug = await overlayFirebaseClockAndLocationData({
+      shiftIds,
       clockMap,
+      clockSourceMap,
       locationMap,
-      debug: {
-        scheduleShiftIdCount: shiftIds.length,
-        clockMapCount: Object.keys(clockMap).length,
-        locationMapCount: Object.keys(locationMap).length,
-        locationMapWithAnyVerdictCount: Object.values(locationMap).filter(
-          (e) => !!e.clockIn.verdict || !!e.clockOut.verdict
-        ).length,
-      },
     });
+
+    return buildApiJsonResponse(
+      request,
+      {
+        ok: true,
+        week,
+        tabName,
+        appTabName,
+        locationTabName,
+        values,
+        clockMap,
+        clockSourceMap,
+        locationMap,
+        debug: {
+          scheduleShiftIdCount: shiftIds.length,
+          clockMapCount: Object.keys(clockMap).length,
+          locationMapCount: Object.keys(locationMap).length,
+          locationMapWithAnyVerdictCount: Object.values(locationMap).filter(
+            (e) => !!e.clockIn.verdict || !!e.clockOut.verdict
+          ).length,
+          ...firebaseDebug,
+        },
+      },
+      200
+    );
   } catch (err: any) {
-    return NextResponse.json(
+    return buildApiJsonResponse(
+      request,
       { ok: false, error: err?.message ?? "Unknown error" },
-      { status: 500 }
+      500
     );
   }
 }

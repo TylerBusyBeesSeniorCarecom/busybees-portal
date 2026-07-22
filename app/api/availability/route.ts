@@ -1,6 +1,8 @@
 // app/api/availability/route.ts
-import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
 import { google } from "googleapis";
+
+import { buildApiJsonResponse, requireAdminSession } from "@/lib/apiAuth";
 
 async function getSheetsClient() {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
@@ -51,8 +53,11 @@ async function getSheetsClient() {
 
 export const dynamic = "force-dynamic";
 
-export async function GET(req: Request) {
+export async function GET(request: NextRequest) {
   try {
+    const { response } = await requireAdminSession(request);
+    if (response) return response;
+
     const spreadsheetId = process.env.TEST_SHEET_ID;
     console.log("[availability] TEST_SHEET_ID exists:", Boolean(spreadsheetId));
 
@@ -60,7 +65,7 @@ export async function GET(req: Request) {
       throw new Error("Missing TEST_SHEET_ID");
     }
 
-    const url = new URL(req.url);
+    const url = new URL(request.url);
     const week = (url.searchParams.get("week") || "cw").toLowerCase();
 
     const cwTab = process.env.CW_AVAIL_TAB_NAME || "CW Availability";
@@ -86,18 +91,23 @@ export async function GET(req: Request) {
       res.data.values ? res.data.values.length : 0
     );
 
-    return NextResponse.json({
-      ok: true,
-      week,
-      tabName,
-      values: res.data.values ?? [],
-    });
+    return buildApiJsonResponse(
+      request,
+      {
+        ok: true,
+        week,
+        tabName,
+        values: res.data.values ?? [],
+      },
+      200
+    );
   } catch (err: any) {
     console.error("[availability] Route error:", err);
 
-    return NextResponse.json(
+    return buildApiJsonResponse(
+      request,
       { ok: false, error: err?.message ?? "Unknown error" },
-      { status: 500 }
+      500
     );
   }
 }

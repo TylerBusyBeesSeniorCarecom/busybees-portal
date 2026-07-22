@@ -2,7 +2,16 @@
 import { NextResponse } from "next/server";
 import { google } from "googleapis";
 
+import { adminDb } from "@/lib/firebaseAdmin";
+
 export const dynamic = "force-dynamic";
+
+type ClockSource = "google_sheets" | "firebase";
+
+type ClockSourceEntry = {
+  clockInSource: ClockSource | null;
+  clockOutSource: ClockSource | null;
+};
 
 async function getSheetsClient() {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
@@ -25,6 +34,43 @@ function idx(headers: string[], name: string) {
   return headers.findIndex((h) => norm(h).toLowerCase() === name.toLowerCase());
 }
 
+function parseTimestampToMs(raw: any): number | null {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? null : t;
+}
+
+function toIsoString(raw: any): string | null {
+  if (raw == null) return null;
+
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const parsed = Date.parse(trimmed);
+    return Number.isNaN(parsed) ? trimmed : new Date(parsed).toISOString();
+  }
+
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    return new Date(raw).toISOString();
+  }
+
+  if (typeof raw?.toDate === "function") {
+    try {
+      return raw.toDate().toISOString();
+    } catch {
+      return null;
+    }
+  }
+
+  if (raw instanceof Date) {
+    return Number.isNaN(raw.getTime()) ? null : raw.toISOString();
+  }
+
+  return null;
+}
+
 export async function GET(req: Request) {
   try {
     const spreadsheetId = process.env.SCHEDULE_SPREADSHEET_ID;
@@ -38,7 +84,12 @@ export async function GET(req: Request) {
 
     const histRes = await fetch(
       `${origin}/api/historical-data?weekStart=${encodeURIComponent(weekStart)}&limit=5000`,
-      { cache: "no-store" }
+      {
+        cache: "no-store",
+        headers: {
+          cookie: req.headers.get("cookie") || "",
+        },
+      }
     );
     const hist = await histRes.json();
     if (!histRes.ok || !hist?.ok) {
@@ -49,8 +100,10 @@ export async function GET(req: Request) {
       (hist.rows || []).map((r: any) => norm(r.shiftId)).filter(Boolean)
     );
     if (shiftIds.size === 0) {
-      return NextResponse.json({ ok: true, clockMap: {}, locationMap: {} });
+      return NextResponse.json({ ok: true, clockMap: {}, clockSourceMap: {}, locationMap: {} });
     }
+
+    const shiftIdList = Array.from(shiftIds);
 
     const sheets = await getSheetsClient();
 
@@ -72,14 +125,21 @@ export async function GET(req: Request) {
     const iCout = idx(appHeaders, "Clock Out Time");
 
     const clockMap: Record<string, { clockInTime: string | null; clockOutTime: string | null }> = {};
+    const clockSourceMap: Record<string, ClockSourceEntry> = {};
 
     for (const r of appRows) {
       const sid = iShift >= 0 ? norm(r[iShift]) : "";
       if (!sid || !shiftIds.has(sid)) continue;
 
+      const clockInTime = iCin >= 0 ? norm(r[iCin]) || null : null;
+      const clockOutTime = iCout >= 0 ? norm(r[iCout]) || null : null;
       clockMap[sid] = {
-        clockInTime: iCin >= 0 ? norm(r[iCin]) || null : null,
-        clockOutTime: iCout >= 0 ? norm(r[iCout]) || null : null,
+        clockInTime,
+        clockOutTime,
+      };
+      clockSourceMap[sid] = {
+        clockInSource: clockInTime ? "google_sheets" : null,
+        clockOutSource: clockOutTime ? "google_sheets" : null,
       };
     }
 
@@ -136,7 +196,87 @@ export async function GET(req: Request) {
       }
     }
 
-    return NextResponse.json({ ok: true, clockMap, locationMap });
+    const chunkSize = 30;
+    const latestInMs: Record<string, number> = {};
+    const latestOutMs: Record<string, number> = {};
+
+    for (let i = 0; i < shiftIdList.length; i += chunkSize) {
+      const chunk = shiftIdList.slice(i, i + chunkSize);
+
+      const timeSnapshot = await adminDb
+        .collection("timeEntries")
+        .where("shiftID", "in", chunk)
+        .get();
+
+      for (const doc of timeSnapshot.docs) {
+        const row = doc.data();
+        const sid = norm(row?.shiftID ?? row?.shiftId ?? doc.id);
+        if (!sid) continue;
+
+        const clockInTime =
+          toIsoString(row?.clockInOverrideTime) ??
+          toIsoString(row?.clockInTime);
+        const clockOutTime =
+          toIsoString(row?.clockOutOverrideTime) ??
+          toIsoString(row?.clockOutTime);
+
+        if (!clockInTime && !clockOutTime) continue;
+
+        clockMap[sid] = {
+          clockInTime: clockInTime ?? clockMap[sid]?.clockInTime ?? null,
+          clockOutTime: clockOutTime ?? clockMap[sid]?.clockOutTime ?? null,
+        };
+        clockSourceMap[sid] = {
+          clockInSource:
+            clockInTime != null
+              ? "firebase"
+              : clockSourceMap[sid]?.clockInSource ?? null,
+          clockOutSource:
+            clockOutTime != null
+              ? "firebase"
+              : clockSourceMap[sid]?.clockOutSource ?? null,
+        };
+      }
+
+      const locSnapshot = await adminDb
+        .collection("locationEvents")
+        .where("shiftID", "in", chunk)
+        .get();
+
+      for (const doc of locSnapshot.docs) {
+        const row = doc.data();
+        const sid = norm(row?.shiftID ?? row?.shiftId);
+        if (!sid) continue;
+
+        const action = norm(row?.action).toLowerCase();
+        if (action !== "clock_in" && action !== "clock_out") continue;
+
+        const verdict = norm(row?.verdict) || null;
+        const timestamp = toIsoString(row?.timestamp);
+        const tsMs = parseTimestampToMs(timestamp);
+        const entry = ensure(sid);
+
+        if (action === "clock_in") {
+          const prev = latestInMs[sid];
+          if (tsMs != null && (prev == null || tsMs >= prev)) {
+            latestInMs[sid] = tsMs;
+            entry.clockIn = { timestamp, verdict };
+          } else if (prev == null && !entry.clockIn.timestamp && timestamp) {
+            entry.clockIn = { timestamp, verdict };
+          }
+        } else {
+          const prev = latestOutMs[sid];
+          if (tsMs != null && (prev == null || tsMs >= prev)) {
+            latestOutMs[sid] = tsMs;
+            entry.clockOut = { timestamp, verdict };
+          } else if (prev == null && !entry.clockOut.timestamp && timestamp) {
+            entry.clockOut = { timestamp, verdict };
+          }
+        }
+      }
+    }
+
+    return NextResponse.json({ ok: true, clockMap, clockSourceMap, locationMap });
   } catch (e: any) {
     return NextResponse.json(
       { ok: false, error: e?.message || "Unknown error" },

@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { google } from "googleapis";
 import path from "path";
 
+const EMPTY_SCHEDULE_REASON = "The schedule for this week has not been created yet.";
+
 async function getSheetsClient() {
   const keyFile = process.env.GOOGLE_APPLICATION_CREDENTIALS;
   if (!keyFile) {
@@ -19,6 +21,27 @@ async function getSheetsClient() {
   });
 }
 
+function isEmptyScheduleRangeError(err: any) {
+  const code = Number(err?.code || err?.status || 0);
+  const message = String(err?.message ?? "").toLowerCase();
+  return (
+    code === 400 &&
+    (message.includes("the number of rows in the range must be at least 1") ||
+      message.includes("unable to parse range"))
+  );
+}
+
+async function getSheetRowCount(sheets: any, spreadsheetId: string, tabName: string) {
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: "sheets(properties(title,gridProperties(rowCount)))",
+  });
+  const match = meta.data.sheets?.find(
+    (sheet: any) => String(sheet.properties?.title ?? "").trim() === tabName
+  );
+  return match?.properties?.gridProperties?.rowCount ?? null;
+}
+
 export async function GET() {
   try {
     const spreadsheetId = process.env.TEST_SHEET_ID;
@@ -30,16 +53,43 @@ export async function GET() {
     const sheets = await getSheetsClient();
 
     const range = `'${tabName}'!A1:I500`;
+    const rowCount = await getSheetRowCount(sheets, spreadsheetId, tabName);
+    if (rowCount != null && rowCount < 2) {
+      return NextResponse.json({
+        ok: true,
+        values: [],
+        rowCount: 0,
+        empty: true,
+        emptyReason: EMPTY_SCHEDULE_REASON,
+      });
+    }
 
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range,
-      valueRenderOption: "FORMATTED_VALUE",
-    });
+    let res;
+    try {
+      res = await sheets.spreadsheets.values.get({
+        spreadsheetId,
+        range,
+        valueRenderOption: "FORMATTED_VALUE",
+      });
+    } catch (err: any) {
+      if (isEmptyScheduleRangeError(err)) {
+        return NextResponse.json({
+          ok: true,
+          values: [],
+          rowCount: 0,
+          empty: true,
+          emptyReason: EMPTY_SCHEDULE_REASON,
+        });
+      }
+      throw err;
+    }
 
     return NextResponse.json({
       ok: true,
       values: res.data.values ?? [],
+      rowCount: (res.data.values ?? []).length > 1 ? (res.data.values ?? []).length - 1 : 0,
+      empty: (res.data.values ?? []).length === 0,
+      emptyReason: (res.data.values ?? []).length === 0 ? EMPTY_SCHEDULE_REASON : undefined,
     });
   } catch (err: any) {
     return NextResponse.json(

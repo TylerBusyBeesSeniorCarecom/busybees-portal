@@ -26,6 +26,13 @@ type ClockEntry = {
   clockOutTime: string | null;
 };
 
+type ClockSource = "google_sheets" | "firebase";
+
+type ClockSourceEntry = {
+  clockInSource: ClockSource | null;
+  clockOutSource: ClockSource | null;
+};
+
 type LocationEntry = {
   clockIn: { timestamp: string | null; verdict: string | null };
   clockOut: { timestamp: string | null; verdict: string | null };
@@ -36,6 +43,7 @@ type ScheduleMapsApiResponse = {
   values?: RawValues;
   rows?: ShiftRow[];
   clockMap?: Record<string, ClockEntry>;
+  clockSourceMap?: Record<string, ClockSourceEntry>;
   locationMap?: Record<string, LocationEntry>;
   error?: string;
 };
@@ -45,6 +53,39 @@ type PayrollArchiveRow = Record<string, any>;
 type PayrollArchiveApiResponse = {
   ok: boolean;
   rows?: PayrollArchiveRow[];
+  error?: string;
+};
+
+type HistoricalDataRow = {
+  shiftId: string;
+  date: string;
+  client: string;
+  caregiver: string;
+  caregiverId: string;
+  startTime: string;
+  endTime: string;
+  status: string;
+  conflict?: string;
+};
+
+type HistoricalDataApiResponse = {
+  ok: boolean;
+  rows?: HistoricalDataRow[];
+  error?: string;
+};
+
+type HistoricalWeekOption = {
+  weekStart: string;
+  weekEnd: string;
+  label?: string;
+  count?: number;
+  filledHours?: number;
+  lastDate?: string;
+};
+
+type HistoricalWeeksApiResponse = {
+  ok: boolean;
+  weeks?: HistoricalWeekOption[];
   error?: string;
 };
 
@@ -249,6 +290,7 @@ const UI = {
 };
 
 const DEFAULT_EXPORT_PAY_RATE = 16;
+const GOOGLE_SHEETS_TIME_ONLY_OFFSET_MINUTES = 8 * 60;
 
 function money(n: number) {
   if (!isFinite(n)) return "$0.00";
@@ -260,6 +302,18 @@ function norm(s: any) {
 function normalizeName(s: string) {
   return norm(s).toLowerCase();
 }
+
+function sortNameByLastNameValue(s: string) {
+  const parts = norm(s)
+    .split(/\s+/)
+    .map((part: string) => norm(part))
+    .filter(Boolean);
+  if (!parts.length) return "";
+  const last = normalizeName(parts[parts.length - 1]);
+  const firsts = normalizeName(parts.slice(0, -1).join(" "));
+  return `${last}|${firsts}`;
+}
+
 function parseRate(raw: string): number | null {
   const s = norm(raw);
   if (!s) return null;
@@ -277,6 +331,23 @@ function parseNumber(raw: string): number | null {
   return isFinite(v) ? v : null;
 }
 
+async function parseApiJson<T>(res: Response, fallbackLabel: string): Promise<T> {
+  const text = await res.text();
+
+  if (!text) {
+    return { ok: false, error: `${fallbackLabel} returned an empty response` } as T;
+  }
+
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return {
+      ok: false,
+      error: `${fallbackLabel} returned a non-JSON response (${res.status}): ${text.slice(0, 180)}`,
+    } as T;
+  }
+}
+
 function formatHoursLabel(hours: number) {
   const rounded = Math.round(hours * 100) / 100;
   const label = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
@@ -288,6 +359,43 @@ function toIsoDate(d: Date) {
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
+}
+
+function startOfSundayWeek(date: Date) {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - d.getDay());
+  return d;
+}
+
+function getCurrentWeekOption(): ArchivedWeekOption {
+  const weekStart = startOfSundayWeek(new Date());
+  const weekEnd = new Date(weekStart);
+  weekEnd.setDate(weekEnd.getDate() + 6);
+  return {
+    weekStartDate: toIsoDate(weekStart),
+    weekEndDate: toIsoDate(weekEnd),
+  };
+}
+
+function mergeWeekOptionsWithCurrentWeek(weeks: ArchivedWeekOption[]) {
+  const liveWeek = getCurrentWeekOption();
+  const byStart = new Map<string, ArchivedWeekOption>();
+
+  for (const week of weeks) {
+    const start = norm(week.weekStartDate);
+    if (!start) continue;
+    byStart.set(start, week);
+  }
+
+  if (!byStart.has(liveWeek.weekStartDate)) {
+    byStart.set(liveWeek.weekStartDate, liveWeek);
+  }
+
+  return Array.from(byStart.values()).sort(
+    (a, b) =>
+      new Date(b.weekStartDate).getTime() - new Date(a.weekStartDate).getTime()
+  );
 }
 
 function getDateRangeFromShifts(rows: ShiftRow[]) {
@@ -302,6 +410,12 @@ function getDateRangeFromShifts(rows: ShiftRow[]) {
     dateFrom: toIsoDate(dates[0]),
     dateTo: toIsoDate(dates[dates.length - 1]),
   };
+}
+
+function formatClockSourceLabel(source: ClockSource | null | undefined) {
+  if (source === "firebase") return "Firebase";
+  if (source === "google_sheets") return "Google Sheet";
+  return "Unknown";
 }
 
 function buildPayRateMapFromApi(rows: any[] | undefined) {
@@ -467,8 +581,24 @@ function normalizeScheduleValues(values: RawValues): ShiftRow[] {
         endTime: norm(safe[iEnd]),
         status: norm(safe[iStatus]),
         conflict: norm(safe[iConflict]),
+        dow: toDateSafe(norm(safe[iDate]))?.getDay(),
       };
     });
+}
+
+function normalizeHistoricalRows(rows: HistoricalDataRow[] | undefined): ShiftRow[] {
+  return (rows || []).map((row) => ({
+    shiftId: norm(row.shiftId),
+    date: norm(row.date),
+    client: norm(row.client),
+    caregiver: norm(row.caregiver),
+    caregiverId: norm(row.caregiverId),
+    startTime: norm(row.startTime),
+    endTime: norm(row.endTime),
+    status: norm(row.status),
+    conflict: norm(row.conflict),
+    dow: toDateSafe(norm(row.date))?.getDay(),
+  }));
 }
 
 /** ---------- Time parsing helpers ---------- */
@@ -515,26 +645,80 @@ function formatArchiveTime(raw: string) {
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return value;
 
-  let hours = d.getUTCHours();
-  const minutes = String(d.getUTCMinutes()).padStart(2, "0");
+  const minutesFromMidnight = getArchiveWallClockMinutes(
+    d,
+    GOOGLE_SHEETS_TIME_ONLY_OFFSET_MINUTES
+  );
+  const normalizedMinutes =
+    ((minutesFromMidnight % (24 * 60)) + 24 * 60) % (24 * 60);
+
+  let hours = Math.floor(normalizedMinutes / 60);
+  const minutes = String(normalizedMinutes % 60).padStart(2, "0");
   const ap = hours >= 12 ? "PM" : "AM";
   if (hours === 0) hours = 12;
   else if (hours > 12) hours -= 12;
   return `${hours}:${minutes} ${ap}`;
 }
 
+function getArchiveWallClockMinutes(d: Date, offsetMinutes: number) {
+  return (
+    d.getUTCHours() * 60 +
+    d.getUTCMinutes() -
+    offsetMinutes
+  );
+}
+
+function nthWeekdayOfMonthUtc(year: number, monthIndex: number, weekday: number, nth: number) {
+  const first = new Date(Date.UTC(year, monthIndex, 1));
+  const firstWeekday = first.getUTCDay();
+  return 1 + ((weekday - firstWeekday + 7) % 7) + (nth - 1) * 7;
+}
+
+function getPacificArchiveOffsetMinutes(d: Date) {
+  const year = d.getUTCFullYear();
+  const dstStartDay = nthWeekdayOfMonthUtc(year, 2, 0, 2);
+  const dstEndDay = nthWeekdayOfMonthUtc(year, 10, 0, 1);
+  const dstStartUtc = Date.UTC(year, 2, dstStartDay, 10, 0, 0);
+  const dstEndUtc = Date.UTC(year, 10, dstEndDay, 9, 0, 0);
+  const t = d.getTime();
+  return t >= dstStartUtc && t < dstEndUtc ? 7 * 60 : 8 * 60;
+}
+
+function archiveDateTimeToWallClockDate(raw: string) {
+  const value = norm(raw);
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+
+  const wallClockMinutes = getArchiveWallClockMinutes(
+    d,
+    getPacificArchiveOffsetMinutes(d)
+  );
+  const dayOffset = Math.floor(wallClockMinutes / (24 * 60));
+  const normalizedMinutes =
+    ((wallClockMinutes % (24 * 60)) + 24 * 60) % (24 * 60);
+
+  const yyyy = d.getUTCFullYear();
+  const mm = d.getUTCMonth();
+  const dd = d.getUTCDate() + dayOffset;
+  const hh = Math.floor(normalizedMinutes / 60);
+  const min = normalizedMinutes % 60;
+
+  return new Date(yyyy, mm, dd, hh, min, d.getUTCSeconds(), 0);
+}
+
 function archiveDateTimeToLocalValue(raw: string) {
   const value = norm(raw);
   if (!value) return "";
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return value;
+  const d = archiveDateTimeToWallClockDate(value);
+  if (!d) return value;
 
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  const hh = String(d.getUTCHours()).padStart(2, "0");
-  const min = String(d.getUTCMinutes()).padStart(2, "0");
-  const ss = String(d.getUTCSeconds()).padStart(2, "0");
+  const yyyy = String(d.getFullYear());
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const min = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
 
   return `${yyyy}-${mm}-${dd}T${hh}:${min}:${ss}`;
 }
@@ -1224,6 +1408,7 @@ function buildRuleIdFromName(ruleName: string) {
 /** ---------- Payroll Shift type ---------- */
 type PayrollShift = ShiftRow & {
   durationHours: number;
+  actualDurationHours: number;
   confirmState: ConfirmEval["state"];
   reasons: string[];
   inVerdict: string | null;
@@ -1744,6 +1929,9 @@ export default function BillingPayrollClient() {
 
   const [shifts, setShifts] = useState<ShiftRow[]>([]);
   const [clockMap, setClockMap] = useState<Record<string, ClockEntry>>({});
+  const [clockSourceMap, setClockSourceMap] = useState<Record<string, ClockSourceEntry>>(
+    {}
+  );
   const [locationMap, setLocationMap] = useState<Record<string, LocationEntry>>(
     {}
   );
@@ -1844,7 +2032,6 @@ export default function BillingPayrollClient() {
     string,
     { startTime: string; endTime: string }
   >>({});
-
   // Editable pay due per shift
   const [payDueOverrideByShiftId, setPayDueOverrideByShiftId] = useState<
     Record<string, string>
@@ -1879,7 +2066,10 @@ export default function BillingPayrollClient() {
       { cache: "no-store" }
     );
 
-    const rateJson = (await rateRes.json()) as ShiftRatesApiResponse;
+    const rateJson = await parseApiJson<ShiftRatesApiResponse>(
+      rateRes,
+      "Shift rates API"
+    );
 
     if (!rateJson.ok) {
       throw new Error(rateJson.error || "Failed to load shift rates");
@@ -1903,14 +2093,17 @@ export default function BillingPayrollClient() {
       try {
         // 1) archived payroll rows
         const archiveRes = await fetch(`/api/payroll-archive`, { cache: "no-store" });
-        const archiveJson = (await archiveRes.json()) as PayrollArchiveApiResponse;
+        const archiveJson = await parseApiJson<PayrollArchiveApiResponse>(
+          archiveRes,
+          "Payroll archive API"
+        );
         if (!archiveRes.ok || !archiveJson.ok) {
           throw new Error(archiveJson.error || "Failed to load payroll archive");
         }
 
         const archiveRows = Array.isArray(archiveJson.rows) ? archiveJson.rows : [];
-        const weekOptions = Array.from(
-          archiveRows.reduce((map, row) => {
+        const archivedWeekOptions: ArchivedWeekOption[] = Array.from(
+          archiveRows.reduce<Map<string, ArchivedWeekOption>>((map, row) => {
             const weekStartDate = norm(row?.["Week Start Date"]);
             const weekEndDate = norm(row?.["Week End Date"]);
             if (!weekStartDate) return map;
@@ -1926,12 +2119,51 @@ export default function BillingPayrollClient() {
             new Date(b.weekStartDate).getTime() - new Date(a.weekStartDate).getTime()
         );
 
+        const historicalWeeksRes = await fetch(`/api/historical-weeks?tailWeeks=52`, {
+          cache: "no-store",
+        });
+        const historicalWeeksJson = await parseApiJson<HistoricalWeeksApiResponse>(
+          historicalWeeksRes,
+          "Historical weeks API"
+        );
+        if (!historicalWeeksRes.ok || !historicalWeeksJson.ok) {
+          throw new Error(historicalWeeksJson.error || "Failed to load historical weeks");
+        }
+
+        const historicalWeekOptions: ArchivedWeekOption[] = (historicalWeeksJson.weeks || [])
+          .map((week) => ({
+            weekStartDate: norm(week.weekStart),
+            weekEndDate: norm(week.weekEnd),
+          }))
+          .filter((week) => week.weekStartDate);
+
+        const mergedWeekMap = new Map<string, ArchivedWeekOption>();
+        for (const week of historicalWeekOptions) {
+          mergedWeekMap.set(week.weekStartDate, week);
+        }
+        for (const week of archivedWeekOptions) {
+          const existing = mergedWeekMap.get(week.weekStartDate);
+          if (!existing || (!existing.weekEndDate && week.weekEndDate)) {
+            mergedWeekMap.set(week.weekStartDate, week);
+          }
+        }
+
+        const weekOptions = mergeWeekOptionsWithCurrentWeek(
+          Array.from(mergedWeekMap.values()).sort(
+            (a, b) =>
+              new Date(b.weekStartDate).getTime() - new Date(a.weekStartDate).getTime()
+          )
+        );
+        const liveWeekStart = getCurrentWeekOption().weekStartDate;
+
         const weekStarts = weekOptions.map((week) => week.weekStartDate);
 
         const effectiveWeekStart =
           selectedWeekStartDate && weekStarts.includes(selectedWeekStartDate)
             ? selectedWeekStartDate
             : weekStarts[0] || "";
+
+        const isLiveWeek = effectiveWeekStart === liveWeekStart;
 
         const filteredArchiveRows = effectiveWeekStart
           ? archiveRows.filter((row) => norm(row?.["Week Start Date"]) === effectiveWeekStart)
@@ -1941,7 +2173,10 @@ export default function BillingPayrollClient() {
 
         // 2) clients rates
         const clientsRes = await fetch(`/api/clients`, { cache: "no-store" });
-        const clientsJson = (await clientsRes.json()) as ClientsApiResponse;
+        const clientsJson = await parseApiJson<ClientsApiResponse>(
+          clientsRes,
+          "Clients API"
+        );
         if (!clientsJson.ok)
           throw new Error(clientsJson.error || "Failed to load clients");
 
@@ -1973,39 +2208,98 @@ export default function BillingPayrollClient() {
         let byId: Record<string, CaregiverProfile> = {};
         try {
           const cgRes = await fetch(`/api/caregivers`, { cache: "no-store" });
-          const cgJson = (await cgRes.json()) as CaregiversApiResponse;
+          const cgJson = await parseApiJson<CaregiversApiResponse>(
+            cgRes,
+            "Caregivers API"
+          );
           if (cgJson.ok && cgJson.byId) byId = cgJson.byId;
         } catch {
           // ignore; fallback will be schedule names
         }
 
-                           // 4) shift rates for the displayed week
-        const rateMapByShift = normalizedArchive.payRateByShift;
-        const rateMetaMapByShift = normalizedArchive.shiftRateMetaByShift;
+        let shiftsForWeek = normalizedArchive.shifts;
+        let clockMapForWeek = normalizedArchive.clockMap;
+        let clockSourceMapForWeek: Record<string, ClockSourceEntry> = {};
+        let locationMapForWeek = normalizedArchive.locationMap;
+        let archiveMetaByShiftForWeek = normalizedArchive.archiveMetaByShift;
+        let rateMapByShift = normalizedArchive.payRateByShift;
+        let rateMetaMapByShift = normalizedArchive.shiftRateMetaByShift;
 
-        // 5) payroll messages for the displayed week
-        let groupedPayrollMessages: Record<string, PayrollMessagesByCaregiverEntry> = {};
-        let payrollMessagesLoadError: string | null = null;
+        if (isLiveWeek) {
+          const scheduleRes = await fetch(`/api/schedule?week=cw`, {
+            cache: "no-store",
+          });
+          const scheduleJson = await parseApiJson<ScheduleMapsApiResponse>(
+            scheduleRes,
+            "Schedule API"
+          );
 
-        try {
-          const range = getDateRangeFromShifts(normalizedArchive.shifts);
+          if (!scheduleRes.ok || !scheduleJson.ok) {
+            throw new Error(scheduleJson.error || "Failed to load current week schedule");
+          }
+
+          shiftsForWeek = normalizeScheduleValues(scheduleJson.values || []);
+          clockMapForWeek = scheduleJson.clockMap || {};
+          clockSourceMapForWeek = scheduleJson.clockSourceMap || {};
+          locationMapForWeek = scheduleJson.locationMap || {};
+          archiveMetaByShiftForWeek = {};
+
+          const range = getDateRangeFromShifts(shiftsForWeek);
           if (range) {
-            const msgRes = await fetch(
-              `/api/payroll-messages?dateFrom=${encodeURIComponent(range.dateFrom)}&dateTo=${encodeURIComponent(range.dateTo)}&groupByCaregiver=true`,
+            const rateRes = await fetch(
+              `/api/shift-rates?dateFrom=${encodeURIComponent(range.dateFrom)}&dateTo=${encodeURIComponent(range.dateTo)}`,
               { cache: "no-store" }
             );
+            const rateJson = await parseApiJson<ShiftRatesApiResponse>(
+              rateRes,
+              "Shift rates API"
+            );
 
-            const msgJson = (await msgRes.json()) as PayrollMessagesApiResponse;
-
-            if (!msgJson.ok) {
-              throw new Error(msgJson.error || "Failed to load payroll messages");
+            if (!rateJson.ok) {
+              throw new Error(rateJson.error || "Failed to load shift rates");
             }
 
-            groupedPayrollMessages = msgJson.grouped || {};
+            const rawRows = rateJson.rows || rateJson.rates || [];
+            rateMapByShift = buildPayRateMapFromApi(rawRows);
+            rateMetaMapByShift = buildShiftRateMetaMapFromApi(rawRows);
+          } else {
+            rateMapByShift = {};
+            rateMetaMapByShift = {};
           }
-        } catch (err: any) {
-          console.error("[billing-payroll] failed to load payroll messages:", err);
-          payrollMessagesLoadError = err?.message || "Failed to load payroll messages";
+        } else if (effectiveWeekStart) {
+          const historicalDataRes = await fetch(
+            `/api/historical-data?weekStart=${encodeURIComponent(effectiveWeekStart)}&limit=5000`,
+            { cache: "no-store" }
+          );
+          const historicalDataJson = await parseApiJson<HistoricalDataApiResponse>(
+            historicalDataRes,
+            "Historical data API"
+          );
+
+          if (!historicalDataRes.ok || !historicalDataJson.ok) {
+            throw new Error(historicalDataJson.error || "Failed to load historical data");
+          }
+
+          const mapsRes = await fetch(
+            `/api/historical-maps?weekStart=${encodeURIComponent(effectiveWeekStart)}`,
+            { cache: "no-store" }
+          );
+          const mapsJson = await parseApiJson<ScheduleMapsApiResponse>(
+            mapsRes,
+            "Historical maps API"
+          );
+
+          if (!mapsRes.ok || !mapsJson.ok) {
+            throw new Error(mapsJson.error || "Failed to load historical maps");
+          }
+
+          shiftsForWeek = normalizeHistoricalRows(historicalDataJson.rows);
+          clockMapForWeek = mapsJson.clockMap || {};
+          clockSourceMapForWeek = mapsJson.clockSourceMap || {};
+          locationMapForWeek = mapsJson.locationMap || {};
+          archiveMetaByShiftForWeek = normalizedArchive.archiveMetaByShift;
+          rateMapByShift = normalizedArchive.payRateByShift;
+          rateMetaMapByShift = normalizedArchive.shiftRateMetaByShift;
         }
 
         if (cancelled) return;
@@ -2014,24 +2308,24 @@ export default function BillingPayrollClient() {
         if (effectiveWeekStart !== selectedWeekStartDate) {
           setSelectedWeekStartDate(effectiveWeekStart);
         }
-        setShifts(normalizedArchive.shifts);
-        setClockMap(normalizedArchive.clockMap);
-        setLocationMap(normalizedArchive.locationMap);
-        setArchiveMetaByShift(normalizedArchive.archiveMetaByShift);
+        setShifts(shiftsForWeek);
+        setClockMap(clockMapForWeek);
+        setClockSourceMap(clockSourceMapForWeek);
+        setLocationMap(locationMapForWeek);
+        setArchiveMetaByShift(archiveMetaByShiftForWeek);
         setClientRateMap(rateMap);
         setClientOptions(sortedClientOptions);
         setCaregiverById(byId);
         setPayRateByShift(rateMapByShift);
         setOriginalPayRateByShift(rateMapByShift);
         setShiftRateMetaByShift(rateMetaMapByShift);
-        setPayrollMessagesByCaregiver(groupedPayrollMessages);
-        setPayrollMessagesError(payrollMessagesLoadError);
+        setPayrollMessagesByCaregiver({});
+        setPayrollMessagesError(null);
 
                // reset expansions/searches on week change
-                      setExpandedClients({});
+        setExpandedClients({});
         setExpandedCaregivers({});
         setExpandedRateDetailsByShift({});
-        setPayrollMessagesByCaregiver(groupedPayrollMessages);
         setBillingSearch("");
         setPayrollSearch("");
         setAddRuleOpen(false);
@@ -2055,6 +2349,43 @@ export default function BillingPayrollClient() {
         setClientRateOverride({});
         setClientScheduledOverride({});
         setClientAdjustOverride({});
+        setLoading(false);
+
+        // 5) payroll messages for the displayed week. This is intentionally
+        // loaded after the report data so a slow messages API cannot block payroll.
+        try {
+          setPayrollMessagesLoading(true);
+          const range = getDateRangeFromShifts(shiftsForWeek);
+          if (range) {
+            const controller = new AbortController();
+            const timeout = window.setTimeout(() => controller.abort(), 30000);
+            const msgRes = await fetch(
+              `/api/payroll-messages?dateFrom=${encodeURIComponent(range.dateFrom)}&dateTo=${encodeURIComponent(range.dateTo)}&groupByCaregiver=true`,
+              { cache: "no-store", signal: controller.signal }
+            ).finally(() => window.clearTimeout(timeout));
+
+            const msgJson = await parseApiJson<PayrollMessagesApiResponse>(
+              msgRes,
+              "Payroll messages API"
+            );
+
+            if (!msgJson.ok) {
+              throw new Error(msgJson.error || "Failed to load payroll messages");
+            }
+
+            if (!cancelled) {
+              setPayrollMessagesByCaregiver(msgJson.grouped || {});
+              setPayrollMessagesError(null);
+            }
+          }
+        } catch (err: any) {
+          console.error("[billing-payroll] failed to load payroll messages:", err);
+          if (!cancelled) {
+            setPayrollMessagesError(err?.message || "Failed to load payroll messages");
+          }
+        } finally {
+          if (!cancelled) setPayrollMessagesLoading(false);
+        }
       } catch (e: any) {
         if (!cancelled) setError(e?.message || "Unknown error");
          } finally {
@@ -2091,6 +2422,30 @@ export default function BillingPayrollClient() {
     });
   }, [shiftRateMetaByShift]);
   const workedShifts = useMemo(() => shifts.filter(isWorkedShift), [shifts]);
+  const clockSourceSummary = useMemo(() => {
+    let firebaseShiftCount = 0;
+    let googleSheetShiftCount = 0;
+    let mixedShiftCount = 0;
+
+    for (const shift of workedShifts) {
+      const entry = clockSourceMap[norm(shift.shiftId)];
+      const usesFirebase =
+        entry?.clockInSource === "firebase" || entry?.clockOutSource === "firebase";
+      const usesGoogleSheet =
+        entry?.clockInSource === "google_sheets" ||
+        entry?.clockOutSource === "google_sheets";
+
+      if (usesFirebase && usesGoogleSheet) mixedShiftCount += 1;
+      else if (usesFirebase) firebaseShiftCount += 1;
+      else if (usesGoogleSheet) googleSheetShiftCount += 1;
+    }
+
+    return {
+      firebaseShiftCount,
+      googleSheetShiftCount,
+      mixedShiftCount,
+    };
+  }, [workedShifts, clockSourceMap]);
 
   const weekLabel = useMemo(() => {
     const dates = shifts
@@ -2369,6 +2724,7 @@ export default function BillingPayrollClient() {
     const map = new Map<
       string,
       {
+        caregiverGroupKey: string;
         caregiverId: string;
         caregiverLabel: string;
         nameOnSchedule: string;
@@ -2380,8 +2736,10 @@ export default function BillingPayrollClient() {
     for (const s00 of workedShifts) {
       const s0 = applyTimeOverride(s00);
 
-      const caregiverId = norm(s0.caregiverId) || "Unknown";
       const scheduleName = norm(s0.caregiver) || "Unknown Caregiver";
+      const caregiverId = norm(s0.caregiverId);
+      const caregiverGroupKey =
+        caregiverId || `name:${normalizeName(scheduleName)}` || "Unknown";
       const profile = caregiverById[caregiverId];
 
       const fullName = caregiverDisplayName(caregiverId, scheduleName);
@@ -2398,11 +2756,18 @@ export default function BillingPayrollClient() {
       const archiveMeta = sid ? archiveMetaByShift[sid] : undefined;
       const clockInTime = shiftClock?.clockInTime ?? null;
       const clockOutTime = shiftClock?.clockOutTime ?? null;
+      const clockInLabel = clockInTime ? formatClockStamp(clockInTime) : "";
+      const clockOutLabel = clockOutTime ? formatClockStamp(clockOutTime) : "";
+      const actualDurationHours =
+        clockInLabel && clockOutLabel
+          ? hoursBetween(clockInLabel, clockOutLabel)
+          : 0;
 
       const payRateRaw = norm(payRateByShift[sid] ?? "");
       const payRate = parseRate(payRateRaw) ?? DEFAULT_EXPORT_PAY_RATE;
 
-      const prev = map.get(caregiverId) || {
+      const prev = map.get(caregiverGroupKey) || {
+        caregiverGroupKey,
         caregiverId,
         caregiverLabel: fullName,
         nameOnSchedule: nos,
@@ -2410,11 +2775,13 @@ export default function BillingPayrollClient() {
         shifts: [] as PayrollShift[],
       };
 
+      prev.caregiverGroupKey = caregiverGroupKey;
+      prev.caregiverId = caregiverId;
       prev.caregiverLabel = fullName;
       prev.nameOnSchedule = nos;
       prev.hasProfile = Boolean(profile);
 
-      const payrollShift: PayrollShift = {
+        const payrollShift: PayrollShift = {
         shiftId: s0.shiftId,
         date: s0.date,
         client: s0.client,
@@ -2443,6 +2810,7 @@ export default function BillingPayrollClient() {
 
         clockInTime,
         clockOutTime,
+        actualDurationHours,
         clockInSite: archiveMeta?.clockInSite || "",
         clockOutSite: archiveMeta?.clockOutSite || "",
         approvalStatus: archiveMeta?.approvalStatus || "Not Approved",
@@ -2454,7 +2822,7 @@ export default function BillingPayrollClient() {
       };
 
       prev.shifts.push(payrollShift);
-      map.set(caregiverId, prev);
+      map.set(caregiverGroupKey, prev);
     }
 
     let groups = Array.from(map.values()).map((g) => {
@@ -2510,7 +2878,11 @@ export default function BillingPayrollClient() {
       });
     }
 
-    groups.sort((a, b) => a.caregiverLabel.localeCompare(b.caregiverLabel));
+    groups.sort((a, b) =>
+      sortNameByLastNameValue(a.caregiverLabel).localeCompare(
+        sortNameByLastNameValue(b.caregiverLabel)
+      )
+    );
     return groups;
   }, [
     workedShifts,
@@ -2567,7 +2939,7 @@ export default function BillingPayrollClient() {
     let allNonFutureConfirmed = true;
 
     for (const s of g.shifts) {
-      if (s.confirmState === "future") {
+      if (s.confirmState === "future") {4
         hasFuture = true;
         continue;
       }
@@ -2576,6 +2948,26 @@ export default function BillingPayrollClient() {
     }
     return !hasFuture && hasNonFuture && allNonFutureConfirmed;
   };
+
+  const allPayrollApproveCount = useMemo(() => {
+    let count = 0;
+
+    for (const s of workedShifts) {
+      const sid = norm(s.shiftId);
+      if (!sid) continue;
+
+      const state = effectiveConfirmState(sid, evalByShiftId[sid]);
+      if (
+        state !== "future" &&
+        !isApprovedStatus(archiveMetaByShift[sid]?.approvalStatus) &&
+        !manualConfirmByShiftId[sid]
+      ) {
+        count += 1;
+      }
+    }
+
+    return count;
+  }, [workedShifts, evalByShiftId, archiveMetaByShift, manualConfirmByShiftId]);
 
     function csvEscape(value: any) {
     const s = norm(value);
@@ -2754,7 +3146,7 @@ export default function BillingPayrollClient() {
         const confirmShiftLocal = (shiftId: string) => {
     const sid = norm(shiftId);
     if (!sid) return;
-    setManualConfirmByShiftId((prev) => ({ ...prev, [sid]: true }));
+        approveShiftLocal(sid);
   };
 
   const syncShiftRates = async () => {
@@ -2781,7 +3173,7 @@ export default function BillingPayrollClient() {
         }),
       });
 
-      const json = await res.json();
+      const json = await parseApiJson<any>(res, "Shift rates sync API");
 
       if (!res.ok || !json?.ok) {
         throw new Error(json?.error || "Failed to sync shift rates");
@@ -2828,7 +3220,7 @@ export default function BillingPayrollClient() {
         }),
       });
 
-      const json = await res.json();
+      const json = await parseApiJson<any>(res, "Shift rates API");
       if (!res.ok || !json?.ok) {
         throw new Error(json?.error || "Failed to save shift rate");
       }
@@ -2902,14 +3294,26 @@ export default function BillingPayrollClient() {
       .filter(Boolean);
 
     if (!nextEntries.length) return;
+    for (const shiftId of nextEntries) approveShiftLocal(shiftId);
+  };
 
-    setManualConfirmByShiftId((prev) => {
-      const next = { ...prev };
-      for (const shiftId of nextEntries) {
-        next[shiftId] = true;
-      }
-      return next;
-    });
+  const approveAllPayrollShifts = () => {
+    const nextEntries = workedShifts
+      .filter((s) => {
+        const sid = norm(s.shiftId);
+        if (!sid) return false;
+        const state = effectiveConfirmState(sid, evalByShiftId[sid]);
+        return (
+          state !== "future" &&
+          !isApprovedStatus(archiveMetaByShift[sid]?.approvalStatus) &&
+          !manualConfirmByShiftId[sid]
+        );
+      })
+      .map((s) => norm(s.shiftId))
+      .filter(Boolean);
+
+    if (!nextEntries.length) return;
+    for (const shiftId of nextEntries) approveShiftLocal(shiftId);
   };
 
      const updateRateRuleForm: RateRuleFormChange = (key, value) => {
@@ -3026,7 +3430,10 @@ export default function BillingPayrollClient() {
         }),
       });
 
-      const json = (await res.json()) as CreateRateRuleApiResponse;
+      const json = await parseApiJson<CreateRateRuleApiResponse>(
+        res,
+        "Create rate rule API"
+      );
 
       if (!res.ok || !json?.ok) {
         throw new Error(json?.error || "Failed to create rate rule");
@@ -3063,6 +3470,34 @@ export default function BillingPayrollClient() {
       };
       return { ...prev, [sid]: next };
     });
+  };
+
+  const approveShiftLocal = (shiftId: string) => {
+    const sid = norm(shiftId);
+    if (!sid) return;
+
+    setManualConfirmByShiftId((prev) => ({ ...prev, [sid]: true }));
+    setArchiveMetaByShift((prev) => ({
+      ...prev,
+      [sid]: {
+        archiveId: prev[sid]?.archiveId || "",
+        weekStartDate: prev[sid]?.weekStartDate || selectedWeekStartDate,
+        weekEndDate: prev[sid]?.weekEndDate || "",
+        caregiverName: prev[sid]?.caregiverName || "",
+        nameOnSchedule: prev[sid]?.nameOnSchedule || "",
+        clockInSite: prev[sid]?.clockInSite || "",
+        clockOutSite: prev[sid]?.clockOutSite || "",
+        scheduledHours: prev[sid]?.scheduledHours || 0,
+        overtimeHours: prev[sid]?.overtimeHours || 0,
+        overtimePay: prev[sid]?.overtimePay || 0,
+        totalPay: prev[sid]?.totalPay || 0,
+        edits: prev[sid]?.edits || "",
+        lastEditedAt: prev[sid]?.lastEditedAt || "",
+        lastEditedBy: prev[sid]?.lastEditedBy || "",
+        approvalStatus: "Approved",
+        reason: prev[sid]?.reason || "",
+      },
+    }));
   };
 
     
@@ -3271,6 +3706,27 @@ export default function BillingPayrollClient() {
                 text={`Future: ${totalsConfirm.futureCount}`}
                 bg="rgba(148,163,184,0.25)"
                 color="#334155"
+              />
+            ) : null}
+            {clockSourceSummary.firebaseShiftCount ? (
+              <Pill
+                text={`Firebase: ${clockSourceSummary.firebaseShiftCount}`}
+                bg="rgba(37,99,235,0.14)"
+                color="#1d4ed8"
+              />
+            ) : null}
+            {clockSourceSummary.googleSheetShiftCount ? (
+              <Pill
+                text={`Google Sheet: ${clockSourceSummary.googleSheetShiftCount}`}
+                bg="rgba(245,158,11,0.16)"
+                color="#92400e"
+              />
+            ) : null}
+            {clockSourceSummary.mixedShiftCount ? (
+              <Pill
+                text={`Mixed: ${clockSourceSummary.mixedShiftCount}`}
+                bg="rgba(124,58,237,0.14)"
+                color="#6d28d9"
               />
             ) : null}
           </div>
@@ -4002,7 +4458,43 @@ export default function BillingPayrollClient() {
                     </div>
                   </div>
 
-                  <MiniSearch value={payrollSearch} onChange={setPayrollSearch} placeholder="Search caregivers…" />
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      flexWrap: "wrap",
+                      justifyContent: "flex-end",
+                    }}
+                  >
+                    <button
+                      type="button"
+                      onClick={approveAllPayrollShifts}
+                      disabled={allPayrollApproveCount === 0}
+                      style={{
+                        padding: "7px 10px",
+                        borderRadius: 9,
+                        border: `1px solid ${UI.green}`,
+                        background:
+                          allPayrollApproveCount === 0
+                            ? "rgba(22,101,52,0.08)"
+                            : UI.green,
+                        color: allPayrollApproveCount === 0 ? UI.green : "#fff",
+                        fontWeight: 900,
+                        fontSize: 12,
+                        cursor:
+                          allPayrollApproveCount === 0
+                            ? "not-allowed"
+                            : "pointer",
+                        opacity: allPayrollApproveCount === 0 ? 0.65 : 1,
+                      }}
+                      title="Approve all non-future payroll shifts for the selected week"
+                    >
+                      Approve All Shifts
+                    </button>
+
+                    <MiniSearch value={payrollSearch} onChange={setPayrollSearch} placeholder="Search caregivers…" />
+                  </div>
                 </div>
 
                <div style={{ padding: "8px 10px", color: UI.textDim, fontSize: 12 }}>
@@ -4033,7 +4525,10 @@ export default function BillingPayrollClient() {
                     const open = !!expandedCaregivers[g.caregiverId];
                     const finished = isCaregiverFinished(g);
                     const caregiverApproveAllCount = g.shifts.filter(
-                      (s) => s.confirmState !== "future"
+                      (s) =>
+                        s.confirmState !== "future" &&
+                        !isApprovedStatus(s.approvalStatus) &&
+                        !manualConfirmByShiftId[norm(s.shiftId)]
                     ).length;
                     return (
                       <div
@@ -4184,10 +4679,8 @@ export default function BillingPayrollClient() {
                                   {[
   "Date",
   "Client",
-  "Start",
-  "End",
-  "Clock In",
-  "Clock Out",
+  "Scheduled",
+  "Actual",
   "Pay Rate / Rules",
   "Final Pay",
   "Approved",
@@ -4215,6 +4708,7 @@ export default function BillingPayrollClient() {
   const id = norm(s.shiftId);
   const rateMeta = shiftRateMetaByShift[id];
   const approvalPill = getApprovalPill(rateMeta);
+  const shiftApproved = isApprovedStatus(s.approvalStatus) || !!manualConfirmByShiftId[id];
   const currentRateInput = norm(payRateByShift[id] ?? "");
   const parsedCurrentRate = parseRate(currentRateInput);
   const originalRateInput = norm(originalPayRateByShift[id] ?? "");
@@ -4223,7 +4717,21 @@ export default function BillingPayrollClient() {
     currentRateInput !== "" &&
     parsedCurrentRate != null &&
     parsedCurrentRate !== (parsedOriginalRate ?? null);
-  const rowBg = normalizeName(s.approvalStatus).includes("approved") && !normalizeName(s.approvalStatus).includes("not approved")
+  const scheduledStartValue = timeOverrideByShiftId[id]?.startTime ?? s.startTime;
+  const scheduledEndValue = timeOverrideByShiftId[id]?.endTime ?? s.endTime;
+  const clockInValue = s.clockInTime ? formatClockStamp(s.clockInTime) : "";
+  const clockOutValue = s.clockOutTime ? formatClockStamp(s.clockOutTime) : "";
+  const sourceEntry = clockSourceMap[id];
+  const clockInSource = sourceEntry?.clockInSource ?? null;
+  const clockOutSource = sourceEntry?.clockOutSource ?? null;
+  const scheduledHours = hoursBetween(scheduledStartValue, scheduledEndValue);
+  const actualHours = s.actualDurationHours;
+  const hoursDifference = roundHours(actualHours - scheduledHours);
+  const differenceLabel =
+    clockInValue && clockOutValue
+      ? `${hoursDifference > 0 ? "+" : ""}${hoursDifference.toFixed(2)}h`
+      : "—";
+  const rowBg = shiftApproved
       ? "rgba(22,101,52,0.04)"
       : "transparent";
 
@@ -4257,42 +4765,65 @@ export default function BillingPayrollClient() {
         style={{
           padding: "6px 7px",
           borderBottom: `1px solid ${UI.borderSoft}`,
-          whiteSpace: "nowrap",
           verticalAlign: "top",
           fontSize: 12.5,
         }}
       >
-        {s.startTime}
-      </td>
-
-      <td
-        style={{
-          padding: "6px 7px",
-          borderBottom: `1px solid ${UI.borderSoft}`,
-          whiteSpace: "nowrap",
-          verticalAlign: "top",
-          fontSize: 12.5,
-        }}
-      >
-        {s.endTime}
-      </td>
-
-      <td
-        style={{
-          padding: "6px 7px",
-          borderBottom: `1px solid ${UI.borderSoft}`,
-          verticalAlign: "top",
-          fontSize: 12.5,
-        }}
-      >
-        <div
-          style={{
-            display: "grid",
-            gap: 2,
-          }}
-        >
-          <div style={{ fontWeight: 800, color: UI.text }}>{formatClockStamp(s.clockInTime)}</div>
-          <div style={{ color: UI.textDim, fontSize: 11.5 }}>{formatSiteLabel(s.clockInSite)}</div>
+        <div style={{ display: "grid", gap: 4, minWidth: 210 }}>
+          <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+            <select
+              value={scheduledStartValue}
+              onChange={(e) =>
+                setShiftTimeLocal(id, {
+                  startTime: e.target.value,
+                  endTime: scheduledEndValue,
+                })
+              }
+              style={{
+                padding: "4px 6px",
+                borderRadius: 8,
+                border: `1px solid ${UI.border}`,
+                background: UI.panelBg,
+                fontWeight: 800,
+                fontSize: 12,
+                cursor: "pointer",
+              }}
+            >
+              {timeOptions.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+            <span style={{ color: UI.textDim, fontWeight: 900 }}>–</span>
+            <select
+              value={scheduledEndValue}
+              onChange={(e) =>
+                setShiftTimeLocal(id, {
+                  startTime: scheduledStartValue,
+                  endTime: e.target.value,
+                })
+              }
+              style={{
+                padding: "4px 6px",
+                borderRadius: 8,
+                border: `1px solid ${UI.border}`,
+                background: UI.panelBg,
+                fontWeight: 800,
+                fontSize: 12,
+                cursor: "pointer",
+              }}
+            >
+              {timeOptions.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div style={{ color: UI.textDim, fontSize: 11.5 }}>
+            {scheduledHours.toFixed(2)}h scheduled
+          </div>
         </div>
       </td>
 
@@ -4304,9 +4835,33 @@ export default function BillingPayrollClient() {
           fontSize: 12.5,
         }}
       >
-        <div style={{ display: "grid", gap: 2 }}>
-          <div style={{ fontWeight: 800, color: UI.text }}>{formatClockStamp(s.clockOutTime)}</div>
-          <div style={{ color: UI.textDim, fontSize: 11.5 }}>{formatSiteLabel(s.clockOutSite)}</div>
+        <div style={{ display: "grid", gap: 4, minWidth: 210 }}>
+          <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ fontWeight: 800, color: UI.text }}>
+              {clockInValue || "—"}
+            </span>
+            <span style={{ color: UI.textDim, fontWeight: 900 }}>–</span>
+            <span style={{ fontWeight: 800, color: UI.text }}>
+              {clockOutValue || "—"}
+            </span>
+          </div>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ color: UI.textDim, fontSize: 11.5 }}>
+              IN source: {clockInValue ? formatClockSourceLabel(clockInSource) : "—"}
+            </span>
+            <span style={{ color: UI.textDim, fontSize: 11.5 }}>
+              OUT source: {clockOutValue ? formatClockSourceLabel(clockOutSource) : "—"}
+            </span>
+          </div>
+          <div style={{ color: UI.textDim, fontSize: 11.5 }}>
+            {clockInValue && clockOutValue ? `${actualHours.toFixed(2)}h actual` : "Hours unavailable"}
+          </div>
+          <div style={{ color: hoursDifference === 0 ? UI.textDim : hoursDifference > 0 ? UI.orange : UI.blue, fontSize: 11.5, fontWeight: 800 }}>
+            Diff vs scheduled: {differenceLabel}
+          </div>
+          <div style={{ color: UI.textDim, fontSize: 11.5 }}>
+            {formatSiteLabel(s.clockInSite)} / {formatSiteLabel(s.clockOutSite)}
+          </div>
         </div>
       </td>
 
@@ -4488,9 +5043,9 @@ export default function BillingPayrollClient() {
       >
         <div style={{ display: "grid", gap: 6 }}>
           <Pill
-            text={s.approvalStatus || approvalPill.text}
-            bg={approvalPill.bg}
-            color={approvalPill.color}
+            text={shiftApproved ? "Approved" : s.approvalStatus || approvalPill.text}
+            bg={shiftApproved ? "rgba(34,197,94,0.10)" : approvalPill.bg}
+            color={shiftApproved ? "#166534" : approvalPill.color}
           />
           {s.archiveReason ? (
             <div style={{ color: UI.textDim, fontWeight: 800, fontSize: 11.5, lineHeight: 1.35, maxWidth: 220 }}>
@@ -4508,7 +5063,29 @@ export default function BillingPayrollClient() {
         }}
       >
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          <span style={{ color: UI.textDim, fontWeight: 900 }}>—</span>
+          {s.confirmState !== "future" ? (
+            <button
+              type="button"
+              onClick={() => approveShiftLocal(id)}
+              disabled={shiftApproved}
+              style={{
+                padding: "6px 10px",
+                borderRadius: 8,
+                border: `1px solid ${UI.green}`,
+                background: shiftApproved ? "rgba(22,101,52,0.08)" : UI.green,
+                color: shiftApproved ? UI.green : "#fff",
+                fontWeight: 900,
+                fontSize: 12,
+                cursor: shiftApproved ? "not-allowed" : "pointer",
+                opacity: shiftApproved ? 0.7 : 1,
+              }}
+              title="Approve this shift locally"
+            >
+              {shiftApproved ? "Approved" : "Approve"}
+            </button>
+          ) : (
+            <span style={{ color: UI.textDim, fontWeight: 900 }}>—</span>
+          )}
         </div>
       </td>
     </tr>

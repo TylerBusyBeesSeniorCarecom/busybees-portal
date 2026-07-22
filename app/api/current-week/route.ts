@@ -1,4 +1,6 @@
-import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+
+import { buildApiJsonResponse, requireAdminSession } from "@/lib/apiAuth";
 
 export const dynamic = "force-dynamic";
 
@@ -8,10 +10,13 @@ function getBase() {
   return base;
 }
 
-export async function GET(req: Request) {
+export async function GET(request: NextRequest) {
   try {
+    const { response } = await requireAdminSession(request);
+    if (response) return response;
+
     const base = getBase();
-    const url = new URL(req.url);
+    const url = new URL(request.url);
     const action = url.searchParams.get("action") || "getCurrentWeekGrid";
 
     const r = await fetch(`${base}?action=${encodeURIComponent(action)}`, {
@@ -22,19 +27,23 @@ export async function GET(req: Request) {
     // Apps Script always returns JSON, but keep this safe:
     const data = text ? JSON.parse(text) : null;
 
-    return NextResponse.json(data, { status: r.ok ? 200 : 500 });
+    return buildApiJsonResponse(request, data ?? {}, r.ok ? 200 : 500);
   } catch (err: any) {
-    return NextResponse.json(
+    return buildApiJsonResponse(
+      request,
       { ok: false, error: err?.message ?? "Unknown error" },
-      { status: 500 }
+      500
     );
   }
 }
 
-export async function POST(req: Request) {
+export async function POST(request: NextRequest) {
   try {
+    const { response } = await requireAdminSession(request);
+    if (response) return response;
+
     const base = getBase();
-    const body = await req.json();
+    const body = await request.json();
 
     const r = await fetch(base, {
       method: "POST",
@@ -46,11 +55,12 @@ export async function POST(req: Request) {
     const text = await r.text();
     const data = text ? JSON.parse(text) : null;
 
-    return NextResponse.json(data, { status: r.ok ? 200 : 500 });
+    return buildApiJsonResponse(request, data ?? {}, r.ok ? 200 : 500);
   } catch (err: any) {
-    return NextResponse.json(
+    return buildApiJsonResponse(
+      request,
       { ok: false, error: err?.message ?? "Unknown error" },
-      { status: 500 }
+      500
     );
   }
 }

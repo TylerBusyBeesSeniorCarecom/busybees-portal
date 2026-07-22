@@ -108,6 +108,9 @@ export async function GET(req: Request) {
 
     const res = await fetch(`${origin}/api/historical-data?tailWeeks=${tailWeeks}&limit=20000`, {
       cache: "no-store",
+      headers: {
+        cookie: req.headers.get("cookie") || "",
+      },
     });
     const j = await res.json();
 

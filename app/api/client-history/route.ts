@@ -1,6 +1,8 @@
 // app/api/client-history/route.ts
-import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
 import { google } from "googleapis";
+
+import { buildApiJsonResponse, requireAdminSession } from "@/lib/apiAuth";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -36,15 +38,18 @@ async function getSheetsClient() {
   return google.sheets({ version: "v4", auth });
 }
 
-export async function GET(req: Request) {
+export async function GET(request: NextRequest) {
   try {
+    const { response } = await requireAdminSession(request);
+    if (response) return response;
+
     const spreadsheetId = process.env.SCHEDULE_SPREADSHEET_ID;
     if (!spreadsheetId) throw new Error("Missing SCHEDULE_SPREADSHEET_ID");
 
-    const url = new URL(req.url);
+    const url = new URL(request.url);
     const client = norm(url.searchParams.get("client"));
     if (!client) {
-      return NextResponse.json({ ok: false, error: "Missing client" }, { status: 400 });
+      return buildApiJsonResponse(request, { ok: false, error: "Missing client" }, 400);
     }
 
     const tailWeeks = toInt(url.searchParams.get("tailWeeks"), 26);
@@ -148,21 +153,26 @@ export async function GET(req: Request) {
       }))
       .sort((a, b) => b.count - a.count || a.caregiverName.localeCompare(b.caregiverName));
 
-    return NextResponse.json({
-      ok: true,
-      clientName: client,
-      meta: {
-        tabName,
-        startRow,
-        endRow,
-        tailWeeks,
+    return buildApiJsonResponse(
+      request,
+      {
+        ok: true,
+        clientName: client,
+        meta: {
+          tabName,
+          startRow,
+          endRow,
+          tailWeeks,
+        },
+        items,
       },
-      items,
-    });
+      200
+    );
   } catch (e: any) {
-    return NextResponse.json(
+    return buildApiJsonResponse(
+      request,
       { ok: false, error: e?.message || "Unknown error" },
-      { status: 500 }
+      500
     );
   }
 }

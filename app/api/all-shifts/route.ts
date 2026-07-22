@@ -4,6 +4,7 @@ import { google } from "googleapis";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+const EMPTY_SCHEDULE_REASON = "The schedule for this week has not been created yet.";
 
 type ShiftRow = {
   shiftId: string;
@@ -69,6 +70,27 @@ async function getSheetsClient() {
     version: "v4",
     auth,
   });
+}
+
+function isEmptyScheduleRangeError(err: any) {
+  const code = Number(err?.code || err?.status || 0);
+  const message = norm(err?.message).toLowerCase();
+  return (
+    code === 400 &&
+    (message.includes("the number of rows in the range must be at least 1") ||
+      message.includes("unable to parse range"))
+  );
+}
+
+async function getSheetRowCount(sheets: any, spreadsheetId: string, tabName: string) {
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: "sheets(properties(title,gridProperties(rowCount)))",
+  });
+  const match = meta.data.sheets?.find(
+    (sheet: any) => String(sheet.properties?.title ?? "").trim() === tabName
+  );
+  return match?.properties?.gridProperties?.rowCount ?? null;
 }
 
 function parseRows(values: string[][]): ShiftRow[] {
@@ -167,9 +189,13 @@ async function readTabWithRetry(
   tabName: string,
   rangeSuffix = "A1:I1000",
   maxAttempts = 3
-): Promise<string[][]> {
+): Promise<{ values: string[][]; empty: boolean; emptyReason?: string }> {
   const range = `'${tabName}'!${rangeSuffix}`;
   let lastErr: any = null;
+  const rowCount = await getSheetRowCount(sheets, spreadsheetId, tabName);
+  if (rowCount != null && rowCount < 2) {
+    return { values: [], empty: true, emptyReason: EMPTY_SCHEDULE_REASON };
+  }
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -188,9 +214,22 @@ async function readTabWithRetry(
         `[all-shifts] ✅ Success reading "${tabName}" on attempt ${attempt}. Rows returned: ${values.length}`
       );
 
-      return values;
+      return {
+        values,
+        empty: values.length === 0,
+        emptyReason: values.length === 0 ? EMPTY_SCHEDULE_REASON : undefined,
+      };
     } catch (err: any) {
       lastErr = err;
+
+      if (isEmptyScheduleRangeError(err)) {
+        console.warn(`[all-shifts] Treating "${tabName}" as empty schedule tab`, {
+          code: err?.code,
+          status: err?.status,
+          message: err?.message,
+        });
+        return { values: [], empty: true, emptyReason: EMPTY_SCHEDULE_REASON };
+      }
 
       console.error(
         `[all-shifts] ❌ Failed reading "${tabName}" on attempt ${attempt}/${maxAttempts}`,
@@ -235,8 +274,10 @@ export async function GET() {
     const sheets = await getSheetsClient();
 
     // Read sequentially instead of Promise.all to reduce transient API abort/conflict issues
-    const cwValues = await readTabWithRetry(sheets, spreadsheetId, cwTab);
-    const nwValues = await readTabWithRetry(sheets, spreadsheetId, nwTab);
+    const cwSchedule = await readTabWithRetry(sheets, spreadsheetId, cwTab);
+    const nwSchedule = await readTabWithRetry(sheets, spreadsheetId, nwTab);
+    const cwValues = cwSchedule.values;
+    const nwValues = nwSchedule.values;
 
     const currentWeekRows = parseRows(cwValues);
     const nextWeekRows = parseRows(nwValues);
@@ -252,12 +293,16 @@ export async function GET() {
       },
       currentWeek: {
         rowCount: currentWeekRows.length,
+        empty: cwSchedule.empty,
+        emptyReason: cwSchedule.emptyReason || null,
         scheduledCount: currentWeekScheduled.length,
         caregivers: currentWeekScheduled,
         rows: currentWeekRows,
       },
       nextWeek: {
         rowCount: nextWeekRows.length,
+        empty: nwSchedule.empty,
+        emptyReason: nwSchedule.emptyReason || null,
         scheduledCount: nextWeekScheduled.length,
         caregivers: nextWeekScheduled,
         rows: nextWeekRows,

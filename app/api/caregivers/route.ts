@@ -1,7 +1,9 @@
 // app/api/caregivers/route.ts
 
-import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
 import { google } from "googleapis";
+
+import { buildApiJsonResponse, requireAdminSession } from "@/lib/apiAuth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -28,8 +30,11 @@ function normalizeKey(s: string) {
   return norm(s).toLowerCase();
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
+    const { response } = await requireAdminSession(request);
+    if (response) return response;
+
     const spreadsheetId = process.env.SCHEDULE_SPREADSHEET_ID;
     if (!spreadsheetId) {
       throw new Error("Missing SCHEDULE_SPREADSHEET_ID in .env.local");
@@ -47,12 +52,16 @@ export async function GET() {
 
     const values = (resp.data.values ?? []) as string[][];
     if (values.length === 0) {
-      return NextResponse.json({
-        ok: true,
-        caregivers: [],
-        byId: {},
-        idByNameOnSchedule: {},
-      });
+      return buildApiJsonResponse(
+        request,
+        {
+          ok: true,
+          caregivers: [],
+          byId: {},
+          idByNameOnSchedule: {},
+        },
+        200
+      );
     }
 
     const headers = values[0].map((h) => norm(h));
@@ -130,16 +139,21 @@ export async function GET() {
       }
     }
 
-    return NextResponse.json({
-      ok: true,
-      caregivers,
-      byId,
-      idByNameOnSchedule,
-    });
+    return buildApiJsonResponse(
+      request,
+      {
+        ok: true,
+        caregivers,
+        byId,
+        idByNameOnSchedule,
+      },
+      200
+    );
   } catch (err: any) {
-    return NextResponse.json(
+    return buildApiJsonResponse(
+      request,
       { ok: false, error: err?.message ?? "Unknown error" },
-      { status: 500 }
+      500
     );
   }
 }

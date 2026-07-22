@@ -1,6 +1,8 @@
 // app/api/clients/route.ts
-import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
 import { google } from "googleapis";
+
+import { buildApiJsonResponse, requireAdminSession } from "@/lib/apiAuth";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -37,13 +39,17 @@ function normalizeHeaders(row: any[]) {
   return (row || []).map((h) => (h ?? "").toString().trim());
 }
 
-export async function GET(_req: Request) {
+export async function GET(request: NextRequest) {
   try {
+    const { response } = await requireAdminSession(request);
+    if (response) return response;
+
     const spreadsheetId = process.env.SCHEDULE_SPREADSHEET_ID;
     if (!spreadsheetId) {
-      return NextResponse.json<ClientsPayload>(
+      return buildApiJsonResponse(
+        request,
         { ok: false, error: "Missing env var: SCHEDULE_SPREADSHEET_ID" },
-        { status: 500 }
+        500
       );
     }
 
@@ -60,16 +66,20 @@ export async function GET(_req: Request) {
 
     const values = (res.data.values || []) as any[][];
     if (values.length === 0) {
-      return NextResponse.json<ClientsPayload>({
-        ok: true,
-        meta: {
-          sheet: tabName,
-          range: `${tabName}!${range}`,
-          fetchedAt: new Date().toISOString(),
+      return buildApiJsonResponse(
+        request,
+        {
+          ok: true,
+          meta: {
+            sheet: tabName,
+            range: `${tabName}!${range}`,
+            fetchedAt: new Date().toISOString(),
+          },
+          headers: [],
+          rows: [],
         },
-        headers: [],
-        rows: [],
-      });
+        200
+      );
     }
 
     const headers = normalizeHeaders(values[0]);
@@ -79,34 +89,39 @@ export async function GET(_req: Request) {
       return padded;
     });
 
-    return NextResponse.json<ClientsPayload>({
-      ok: true,
-      meta: {
-        sheet: tabName,
-        range: `${tabName}!${range}`,
-        fetchedAt: new Date().toISOString(),
+    return buildApiJsonResponse(
+      request,
+      {
+        ok: true,
+        meta: {
+          sheet: tabName,
+          range: `${tabName}!${range}`,
+          fetchedAt: new Date().toISOString(),
+        },
+        headers,
+        rows,
       },
-      headers,
-      rows,
-    });
+      200
+    );
   } catch (err: any) {
-    return NextResponse.json<ClientsPayload>(
+    return buildApiJsonResponse(
+      request,
       { ok: false, error: err?.message || String(err) || "Unknown error" },
-      { status: 500 }
+      500
     );
   }
 }
 
-export async function POST(req: Request) {
+export async function POST(request: NextRequest) {
   try {
-    const body = await req.json();
+    const { response } = await requireAdminSession(request);
+    if (response) return response;
+
+    const body = await request.json();
     const action = String(body?.action || "").trim();
 
     if (!action) {
-      return NextResponse.json(
-        { ok: false, error: "Missing action" },
-        { status: 400 }
-      );
+      return buildApiJsonResponse(request, { ok: false, error: "Missing action" }, 400);
     }
 
     if (action === "updateClientDescription") {
@@ -117,9 +132,10 @@ export async function POST(req: Request) {
       const updatedByEmail = String(body?.updatedByEmail || "").trim();
 
       if (!clientName) {
-        return NextResponse.json(
+        return buildApiJsonResponse(
+          request,
           { ok: false, error: "Missing clientName" },
-          { status: 400 }
+          400
         );
       }
 
@@ -159,20 +175,26 @@ export async function POST(req: Request) {
         throw new Error(data?.error || "Apps Script returned not ok");
       }
 
-      return NextResponse.json({
-        ok: true,
-        result: data,
-      });
+      return buildApiJsonResponse(
+        request,
+        {
+          ok: true,
+          result: data,
+        },
+        200
+      );
     }
 
-    return NextResponse.json(
+    return buildApiJsonResponse(
+      request,
       { ok: false, error: `Unknown action: ${action}` },
-      { status: 400 }
+      400
     );
   } catch (err: any) {
-    return NextResponse.json(
+    return buildApiJsonResponse(
+      request,
       { ok: false, error: err?.message || String(err) || "Unknown error" },
-      { status: 500 }
+      500
     );
   }
 }

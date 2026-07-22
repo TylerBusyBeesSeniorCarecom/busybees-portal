@@ -1,5 +1,7 @@
 // app/api/drive-time/route.ts
-import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+
+import { buildApiJsonResponse, requireAdminSession } from "@/lib/apiAuth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -19,18 +21,22 @@ function cacheKey(origin: string, destination: string, mode: string) {
   return `${origin.toLowerCase()}__${destination.toLowerCase()}__${mode.toLowerCase()}`;
 }
 
-export async function GET(req: Request) {
+export async function GET(request: NextRequest) {
   try {
-    const url = new URL(req.url);
+    const { response } = await requireAdminSession(request);
+    if (response) return response;
+
+    const url = new URL(request.url);
     const origin = norm(url.searchParams.get("origin") || "");
     const destination = norm(url.searchParams.get("destination") || "");
     const mode = norm(url.searchParams.get("mode") || "driving") || "driving";
     const ttlMin = Number(url.searchParams.get("ttlMin") || "180"); // default 3 hours
 
     if (!origin || !destination) {
-      return NextResponse.json(
+      return buildApiJsonResponse(
+        request,
         { ok: false, error: "Missing origin or destination" },
-        { status: 400 }
+        400
       );
     }
 
@@ -38,14 +44,15 @@ export async function GET(req: Request) {
     const now = Date.now();
     const hit = cache.get(key);
     if (hit && hit.expiresAt > now) {
-      return NextResponse.json({ ok: true, cached: true, ...hit.data });
+      return buildApiJsonResponse(request, { ok: true, cached: true, ...hit.data }, 200);
     }
 
     const apiKey = process.env.GOOGLE_MAPS_API_KEY;
     if (!apiKey) {
-      return NextResponse.json(
+      return buildApiJsonResponse(
+        request,
         { ok: false, error: "Missing GOOGLE_MAPS_API_KEY" },
-        { status: 500 }
+        500
       );
     }
 
@@ -60,9 +67,10 @@ export async function GET(req: Request) {
     const j = await r.json();
 
     if (!r.ok) {
-      return NextResponse.json(
+      return buildApiJsonResponse(
+        request,
         { ok: false, error: `Google Distance Matrix HTTP ${r.status}`, raw: j },
-        { status: 502 }
+        502
       );
     }
 
@@ -70,9 +78,10 @@ export async function GET(req: Request) {
     const el = row?.elements?.[0];
 
     if (!el || el.status !== "OK") {
-      return NextResponse.json(
+      return buildApiJsonResponse(
+        request,
         { ok: false, error: `No route: ${el?.status || "UNKNOWN"}`, raw: j },
-        { status: 200 }
+        200
       );
     }
 
@@ -91,11 +100,12 @@ export async function GET(req: Request) {
 
     cache.set(key, { expiresAt: now + ttlMin * 60_000, data });
 
-    return NextResponse.json({ ok: true, cached: false, ...data });
+    return buildApiJsonResponse(request, { ok: true, cached: false, ...data }, 200);
   } catch (e: any) {
-    return NextResponse.json(
+    return buildApiJsonResponse(
+      request,
       { ok: false, error: e?.message ?? "Unknown drive-time error" },
-      { status: 500 }
+      500
     );
   }
 }

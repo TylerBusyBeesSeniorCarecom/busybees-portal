@@ -43,3 +43,8 @@ next-env.d.ts
 # Busy Bees portal secrets
 app/schedule/secrets/
 app/schedule/secrets/*.json
+
+# Local scratch / test-only, not for production
+.stage3-smartmatch/
+app/api/firebase-test/
+app/dev/

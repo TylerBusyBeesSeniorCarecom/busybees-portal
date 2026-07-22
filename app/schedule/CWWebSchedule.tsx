@@ -1,7 +1,7 @@
 // app/schedule/CWWebSchedule.tsx
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation"; // ✅ NEW
 import { useSession } from "next-auth/react";
 import ShiftCard, { type ShiftStatus as ShiftCardStatus } from "./components/ShiftCard";
@@ -13,6 +13,14 @@ import CaregiverWebSchedulePanel from "./components/CaregiverWebSchedulePanel";
 import ServiceRequestsPanel from "./components/AppServiceRequests";
 import OnboardingPanel from "./components/OnboardingPanel";
 import SupraesophagealGanglionPanel from "./components/SupraesophagealGanglionPanel";
+import BulkEditPanel, {
+  bulkStatusTone,
+  formatBulkMessageDate,
+} from "../sheets-tools/components/BulkEditPanel";
+import type {
+  BulkEditPanelHandle,
+  BulkSelectedCell,
+} from "../sheets-tools/components/bulkEdit.types";
 import useDraftSchedule from "./hooks/useDraftSchedule";
 import {
   buildShiftSaveToast,
@@ -22,7 +30,6 @@ import {
 } from "./utils/shiftSaveFeedback";
 import {
   parseScheduleShiftCell,
-  convertScheduleShiftStatus,
   type BaseShiftStatus,
 } from "./utils/scheduleShiftStatus";
 /**
@@ -551,24 +558,6 @@ type ScheduleEditLogGetResponse = {
   rows?: ScheduleEditLogRow[];
   error?: string;
 };
-type BulkSelectedCell = {
-  a1: string;
-  week: WeekKind;
-  clientName: string;
-  dateStr: string;
-  dayLabel: string;
-  originalValue: string;
-};
-
-type BulkTargetStatus = Exclude<BaseShiftStatus, "Unknown">;
-
-type BulkSmartStatusFilter =
-  | "Any"
-  | "Open"
-  | "Filled"
-  | "Offered"
-  | "Considering"
-  | "PendingClientApproval";
 /** ---------- Status logic ---------- */
 
 export type ShiftStatus =
@@ -2515,20 +2504,6 @@ const STICKY_DATE_ROW_TOP = STICKY_DAY_ROW_HEIGHT;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams]);
 
-  useEffect(() => {
-    const id = "cw_bulk_step_anim";
-    if (document.getElementById(id)) return;
-    const style = document.createElement("style");
-    style.id = id;
-    style.textContent = `
-      @keyframes cwBulkStepSlideIn {
-        from { opacity: 0; transform: translateX(28px); }
-        to { opacity: 1; transform: translateX(0); }
-      }
-    `;
-    document.head.appendChild(style);
-  }, []);
-
   // Messages UI
   const messagesUI = useMessagesUI();
   const { openPanel } = messagesUI;
@@ -2734,40 +2709,30 @@ const [unpublishedModalOpen, setUnpublishedModalOpen] = useState(false);
     // shift save feedback toast
   const [saveToast, setSaveToast] = useState<{
     id: number;
-    kind: "success" | "warning" | "error";
+    kind: "success" | "warning" | "error" | "loading";
     title: string;
     lines: string[];
+    actions?: Array<{
+      label: string;
+      onClick: () => void;
+      variant?: "primary" | "secondary";
+    }>;
   } | null>(null);
 
   // ✅ remembers which just-saved cell has a conflict
-    const [conflictHighlight, setConflictHighlight] = useState<{
+ const [conflictHighlight, setConflictHighlight] = useState<{
     a1: string;
     conflicts: ShiftConflictMatch[];
   } | null>(null);
 
- const [cellEditHistoryPresence, setCellEditHistoryPresence] =
+const [cellEditHistoryPresence, setCellEditHistoryPresence] =
   useState<CellEditHistoryPresenceMap>({});
-// bulk editing
 const [bulkMode, setBulkMode] = useState(false);
-const [selectedBulkCells, setSelectedBulkCells] = useState<Record<string, BulkSelectedCell>>({});
-const [bulkApplying, setBulkApplying] = useState(false);
-
-const [bulkSmartCaregiver, setBulkSmartCaregiver] = useState("");
-const [bulkSmartClient, setBulkSmartClient] = useState("");
-const [bulkSmartStatus, setBulkSmartStatus] = useState<BulkSmartStatusFilter>("Any");
-const [bulkCancelledTarget, setBulkCancelledTarget] = useState<
-  "keep" | "cancelled" | "not_cancelled"
->("keep");
-
-const [bulkSelectionMode, setBulkSelectionMode] = useState<
-  "caregiver" | "client" | "status" | "manual"
->("caregiver");
-const [bulkStepTwoArmed, setBulkStepTwoArmed] = useState(false);
-
-const [showCaregiverSuggestions, setShowCaregiverSuggestions] = useState(false);
-const [showClientSuggestions, setShowClientSuggestions] = useState(false);
-
-const selectedBulkCount = Object.keys(selectedBulkCells).length;
+const bulkEditPanelRef = useRef<BulkEditPanelHandle | null>(null);
+const [, forceBulkSelectionRender] = useState(0);
+const handleBulkSelectionChange = useCallback(() => {
+  forceBulkSelectionRender((value) => value + 1);
+}, []);
     function openClientProfile(clientName: string) {
     const n = norm(clientName);
     if (!n) return;
@@ -3002,8 +2967,15 @@ const [availTabName, setAvailTabName] = useState<string>("");
         args?.includeGhosts ? refreshGhostShiftsForWeek(week) : Promise.resolve(),
         args?.includeEditLog ? refreshScheduleEditLogForWeek(week) : Promise.resolve(),
       ]);
-    } catch (e) {
-      console.error("[CWWebSchedule] background refresh failed", e);
+    } catch (error) {
+      console.error(
+        "[CWWebSchedule] background refresh failed",
+        error instanceof Error
+          ? error.message
+          : error instanceof Event
+          ? `Unexpected ${error.type || "event"} event`
+          : error
+      );
     }
   }
 
@@ -3423,17 +3395,6 @@ useEffect(() => {
   }
 }, [draftMode]);
 
-useEffect(() => {
-  if (!bulkMode) {
-    setSelectedBulkCells({});
-    setBulkSelectionMode("caregiver");
-    setBulkSmartCaregiver("");
-    setBulkSmartClient("");
-    setBulkSmartStatus("Any");
-    setShowCaregiverSuggestions(false);
-    setShowClientSuggestions(false);
-  }
-}, [bulkMode]);
   /** ---------- Week window (for ghost shifts) ---------- */
 
   const weekStartYmd = useMemo(() => {
@@ -3693,332 +3654,6 @@ const selectedCellHistoryRows = useMemo(() => {
 
     return out;
   }, [rows, visibleDows, draftMode, getDraftValue, week, dateHeaders, dayHeaders]);
-function smartSelectByCaregiver(caregiverName: string) {
-  const target = normalizeKey(caregiverName);
-  if (!target) return;
-
-  const matches = visibleBulkCandidates.filter((cell) => {
-    const parsed = parseScheduleShiftCell(cell.originalValue);
-    return normalizeKey(parsed.caregiverName || "") === target;
-  });
-
-  const next: Record<string, BulkSelectedCell> = {};
-  for (const m of matches) next[m.a1] = m;
-  setSelectedBulkCells(next);
-  setBulkStepTwoArmed(true);
-}
-
-function smartSelectByClient(clientName: string) {
-  const target = normalizeKey(clientName);
-  if (!target) return;
-
-  const matches = visibleBulkCandidates.filter(
-    (cell) => normalizeKey(cell.clientName) === target
-  );
-
-  const next: Record<string, BulkSelectedCell> = {};
-  for (const m of matches) next[m.a1] = m;
-  setSelectedBulkCells(next);
-  setBulkStepTwoArmed(true);
-}
-
-function smartSelectByStatus(status: Exclude<BulkSmartStatusFilter, "Any">) {
-  const matches = visibleBulkCandidates.filter((cell) => {
-    const parsed = parseScheduleShiftCell(cell.originalValue);
-    return parsed.baseStatus === status;
-  });
-
-  const next: Record<string, BulkSelectedCell> = {};
-  for (const m of matches) next[m.a1] = m;
-  setSelectedBulkCells(next);
-  setBulkStepTwoArmed(true);
-}
-
-function smartSelectByCaregiverAndStatus(
-  caregiverName: string,
-  status: BulkSmartStatusFilter
-) {
-  const target = normalizeKey(caregiverName);
-  if (!target) return;
-
-  const matches = visibleBulkCandidates.filter((cell) => {
-    const parsed = parseScheduleShiftCell(cell.originalValue);
-    const caregiverMatch = normalizeKey(parsed.caregiverName || "") === target;
-    const statusMatch = status === "Any" ? true : parsed.baseStatus === status;
-    return caregiverMatch && statusMatch;
-  });
-
-  const next: Record<string, BulkSelectedCell> = {};
-  for (const m of matches) next[m.a1] = m;
-  setSelectedBulkCells(next);
-  setBulkStepTwoArmed(true);
-}
-
-function selectAllVisibleShifts() {
-  const next: Record<string, BulkSelectedCell> = {};
-  for (const c of visibleBulkCandidates) next[c.a1] = c;
-  setSelectedBulkCells(next);
-  setBulkStepTwoArmed(true);
-}
-
-const bulkCaregiverSuggestions = useMemo(() => {
-  const names = Array.from(
-    new Set(
-      visibleBulkCandidates
-        .map((cell) => parseScheduleShiftCell(cell.originalValue).caregiverName || "")
-        .map((name) => norm(name))
-        .filter(Boolean)
-    )
-  ).sort((a, b) => a.localeCompare(b));
-
-  const q = normalizeKey(bulkSmartCaregiver);
-  if (!q) return names.slice(0, 8);
-
-  return names.filter((name) => normalizeKey(name).includes(q)).slice(0, 8);
-}, [visibleBulkCandidates, bulkSmartCaregiver]);
-
-const bulkClientSuggestions = useMemo(() => {
-  const names = Array.from(
-    new Set(visibleBulkCandidates.map((cell) => norm(cell.clientName)).filter(Boolean))
-  ).sort((a, b) => a.localeCompare(b));
-
-  const q = normalizeKey(bulkSmartClient);
-  if (!q) return names.slice(0, 8);
-
-  return names.filter((name) => normalizeKey(name).includes(q)).slice(0, 8);
-}, [visibleBulkCandidates, bulkSmartClient]);
-
-const bulkPreviewCandidates = useMemo(() => {
-  if (bulkSelectionMode === "manual") {
-    return Object.values(selectedBulkCells);
-  }
-
-  if (!bulkStepTwoArmed) return [];
-
-  if (bulkSelectionMode === "caregiver") {
-    const target = normalizeKey(bulkSmartCaregiver);
-    if (!target) return [];
-    return visibleBulkCandidates.filter((cell) => {
-      const parsed = parseScheduleShiftCell(cell.originalValue);
-      const caregiverMatch = normalizeKey(parsed.caregiverName || "") === target;
-      const statusMatch = bulkSmartStatus === "Any" ? true : parsed.baseStatus === bulkSmartStatus;
-      return caregiverMatch && statusMatch;
-    });
-  }
-
-  if (bulkSelectionMode === "client") {
-    const target = normalizeKey(bulkSmartClient);
-    if (!target) return [];
-    return visibleBulkCandidates.filter((cell) => normalizeKey(cell.clientName) === target);
-  }
-
-  if (bulkSelectionMode === "status") {
-    if (bulkSmartStatus === "Any") return [];
-    return visibleBulkCandidates.filter((cell) => parseScheduleShiftCell(cell.originalValue).baseStatus === bulkSmartStatus);
-  }
-
-  return [];
-}, [
-  bulkSelectionMode,
-  bulkSmartCaregiver,
-  bulkSmartClient,
-  bulkSmartStatus,
-  bulkStepTwoArmed,
-  selectedBulkCells,
-  visibleBulkCandidates,
-]);
-
-const bulkShiftList = useMemo(() => {
-  return bulkPreviewCandidates
-    .map((cell) => {
-      const parsed = parseScheduleShiftCell(cell.originalValue);
-      return {
-        ...cell,
-        caregiverName: parsed.caregiverName || "Open",
-        status: parsed.baseStatus,
-        startTime: parsed.startTime || "",
-        endTime: parsed.endTime || "",
-        selected: Boolean(selectedBulkCells[cell.a1]),
-      };
-    })
-    .sort((a, b) => {
-      const dateCmp = dateKey(a.dateStr).localeCompare(dateKey(b.dateStr));
-      if (dateCmp !== 0) return dateCmp;
-      const timeCmp = (parseTimeToMinutes(a.startTime) ?? 0) - (parseTimeToMinutes(b.startTime) ?? 0);
-      if (timeCmp !== 0) return timeCmp;
-      return a.clientName.localeCompare(b.clientName);
-    });
-}, [bulkPreviewCandidates, selectedBulkCells]);
-
-const bulkStepOneReady = Boolean(bulkSelectionMode);
-const bulkStepTwoVisible = bulkStepOneReady;
-const bulkStepThreeVisible =
-  bulkSelectionMode === "manual" ? selectedBulkCount > 0 : bulkStepTwoArmed && bulkShiftList.length > 0;
-
-const bulkMessageTarget = useMemo(() => {
-  const cells = Object.values(selectedBulkCells);
-  if (!cells.length) {
-    return {
-      caregiverId: "",
-      caregiverName: "",
-      reason: "Select at least one shift to paste a message.",
-    };
-  }
-
-  const uniqueNames = Array.from(
-    new Set(
-      cells
-        .map((cell) => parseScheduleShiftCell(cell.originalValue).caregiverName || "")
-        .map((name) => norm(name))
-        .filter(Boolean)
-    )
-  );
-
-  let caregiverName = "";
-
-  if (uniqueNames.length === 1) {
-    caregiverName = uniqueNames[0];
-  } else if (uniqueNames.length > 1) {
-    return {
-      caregiverId: "",
-      caregiverName: "",
-      reason: "Messaging from bulk edit only works when all selected shifts belong to one caregiver.",
-    };
-  } else if (bulkSelectionMode === "caregiver" && norm(bulkSmartCaregiver)) {
-    caregiverName = norm(bulkSmartCaregiver);
-  } else {
-    return {
-      caregiverId: "",
-      caregiverName: "",
-      reason: "Choose one caregiver first, then select shifts to message.",
-    };
-  }
-
-  const caregiverId = idByNameOnSchedule[normalizeKey(caregiverName)] || "";
-  if (!caregiverId) {
-    return {
-      caregiverId: "",
-      caregiverName,
-      reason: `Could not find a caregiver ID for ${caregiverName}.`,
-    };
-  }
-
-  const profile = caregiversById[caregiverId];
-  return {
-    caregiverId,
-    caregiverName: norm(profile?.nameOnSchedule) || norm(profile?.name) || caregiverName,
-    reason: "",
-  };
-}, [bulkSelectionMode, bulkSmartCaregiver, caregiversById, idByNameOnSchedule, selectedBulkCells]);
-
-function openBulkOfferMessage() {
-  const target = bulkMessageTarget;
-  if (!target.caregiverId || !target.caregiverName) {
-    setSaveToast({
-      id: Date.now(),
-      kind: "warning",
-      title: "Cannot open bulk message",
-      lines: [target.reason || "Choose one caregiver and at least one shift first."],
-    });
-    return;
-  }
-
-  const selectedItems = Object.values(selectedBulkCells)
-    .map((cell) => {
-      const parsed = parseScheduleShiftCell(cell.originalValue);
-      return {
-        clientName: cell.clientName,
-        dateStr: cell.dateStr,
-        startTime: parsed.startTime || "",
-        endTime: parsed.endTime || "",
-      };
-    })
-    .sort((a, b) => {
-      const dateCmp = dateKey(a.dateStr).localeCompare(dateKey(b.dateStr));
-      if (dateCmp !== 0) return dateCmp;
-      return (parseTimeToMinutes(a.startTime) ?? 0) - (parseTimeToMinutes(b.startTime) ?? 0);
-    });
-
-  if (!selectedItems.length) {
-    setSaveToast({
-      id: Date.now(),
-      kind: "warning",
-      title: "No shifts selected",
-      lines: ["Select one or more shifts before opening a message draft."],
-    });
-    return;
-  }
-
-  const intro =
-    week === "nw"
-      ? "Hi -  here is your schedule for the upcoming week:"
-      : "Hi -  here is your schedule for this week:";
-  const lines = selectedItems.map(
-    (item) =>
-      `${formatBulkMessageDate(item.dateStr)} ${formatBulkTimeLabel(item.startTime)}-${formatBulkTimeLabel(item.endTime)} w/ ${item.clientName}`
-  );
-  const text = `${intro}\n\n${lines.join("\n")}\n\nPlease let me know if this works for you. Thank you!`;
-
-  messagesUI.openCompose({
-    caregiverId: target.caregiverId,
-    caregiverName: target.caregiverName,
-    category: "Scheduling",
-    text,
-    replaceText: true,
-    focusComposer: true,
-  });
-}
-
-function bulkStatusTone(status: BulkSmartStatusFilter | BaseShiftStatus) {
-  if (status === "Filled") {
-    return { bg: "#ecfdf5", border: "#22c55e", text: "#166534" };
-  }
-  if (status === "Considering") {
-    return { bg: "#fff7ed", border: "#fb923c", text: "#9a3412" };
-  }
-  if (status === "Offered") {
-    return { bg: "#eff6ff", border: "#60a5fa", text: "#1d4ed8" };
-  }
-  if (status === "PendingClientApproval") {
-    return { bg: "#faf5ff", border: "#c084fc", text: "#7e22ce" };
-  }
-  if (status === "Open") {
-    return { bg: "#fef2f2", border: "#f87171", text: "#b91c1c" };
-  }
-  return { bg: "#f8fafc", border: UI.border, text: UI.textDim };
-}
-
-function formatBulkMessageDate(dateStr: string) {
-  const d = toDateSafe(dateStr);
-  if (!d) return dateStr;
-  return d.toLocaleDateString(undefined, {
-    weekday: "long",
-  });
-}
-
-function formatBulkTimeLabel(raw: string) {
-  const s = String(raw || "").trim();
-  if (!s) return "";
-  if (/[ap]m/i.test(s) && s.length <= 10) return s.replace(/\s+/g, "");
-  const m = s.match(/^(\d{1,2}):(\d{2})$/);
-  if (!m) return s.replace(/\s+/g, "");
-  let hh = Number(m[1]);
-  const mm = m[2];
-  const ap = hh >= 12 ? "PM" : "AM";
-  hh = hh % 12;
-  if (hh === 0) hh = 12;
-  return `${hh}:${mm}${ap}`;
-}
-
-function resetBulkSearchUi(mode: "caregiver" | "client" | "status" | "manual") {
-  setBulkSelectionMode(mode);
-  setBulkStepTwoArmed(false);
-  setBulkSmartCaregiver("");
-  setBulkSmartClient("");
-  setBulkSmartStatus("Any");
-  setShowCaregiverSuggestions(false);
-  setShowClientSuggestions(false);
-}
     const clientWorstStatus = useMemo(() => {
     const map = new Map<string, ShiftStatus>();
 
@@ -4949,20 +4584,11 @@ const weekProgress = useMemo(() => {
   }
 
   function toggleBulkCellSelection(cell: BulkSelectedCell) {
-    setSelectedBulkCells((prev) => {
-      const next = { ...prev };
-      if (next[cell.a1]) delete next[cell.a1];
-      else next[cell.a1] = cell;
-      return next;
-    });
-  }
-
-  function clearBulkSelection() {
-    setSelectedBulkCells({});
+    bulkEditPanelRef.current?.toggleBulkCellSelection(cell);
   }
 
   function isBulkCellSelected(a1: string) {
-    return Boolean(selectedBulkCells[a1]);
+    return bulkEditPanelRef.current?.isBulkCellSelected(a1) ?? false;
   }
 
   function showDraftShiftFeedback(args: {
@@ -5394,112 +5020,6 @@ async function saveDraftScheduleToSheet() {
     });
   } finally {
     setLoading(false);
-  }
-}
-async function applyBulkStatusChange(args: {
-  targetBaseStatus: BulkTargetStatus;
-  targetCancelled?: "keep" | boolean;
-  caregiverNameOverride?: string | null;
-}) {
-  const cells = Object.values(selectedBulkCells);
-
-  if (!cells.length) {
-    setSaveToast({
-      id: Date.now(),
-      kind: "warning",
-      title: "No shifts selected",
-      lines: ["Select one or more shifts first."],
-    });
-    return;
-  }
-
-  try {
-    setBulkApplying(true);
-
-    const successes: string[] = [];
-    const failures: string[] = [];
-
-    for (const cell of cells) {
-      const parsed = parseScheduleShiftCell(cell.originalValue);
-
-      const targetCancelled =
-        args.targetCancelled === "keep"
-          ? parsed.isCancelled
-          : typeof args.targetCancelled === "boolean"
-          ? args.targetCancelled
-          : parsed.isCancelled;
-
-      const result = convertScheduleShiftStatus({
-        rawText: cell.originalValue,
-        targetBaseStatus: args.targetBaseStatus,
-        caregiverNameOverride: args.caregiverNameOverride ?? undefined,
-        targetCancelled,
-      });
-
-      if (!result.ok || !result.newText) {
-        failures.push(
-          `${cell.clientName} • ${cell.dayLabel} • ${result.error || "Conversion failed"}`
-        );
-        continue;
-      }
-
-      if (draftMode) {
-        setDraftCell({
-          a1: cell.a1,
-          week: cell.week,
-          originalValue: cell.originalValue,
-          draftValue: result.newText,
-          clientName: cell.clientName,
-          dateStr: cell.dateStr,
-          dayLabel: cell.dayLabel,
-        });
-        successes.push(`${cell.clientName} • ${cell.dayLabel}`);
-      } else {
-        await saveInlineEdit({
-          a1: cell.a1,
-          newVal: result.newText,
-          clientName: cell.clientName,
-          shiftDateForSave: cell.dateStr,
-          dayLabel: cell.dayLabel,
-          weekOf: weekStartYmd,
-          backgroundRefresh: false,
-        });
-        successes.push(`${cell.clientName} • ${cell.dayLabel}`);
-      }
-    }
-
-    if (!draftMode && successes.length) {
-      void refreshScheduleStateInBackground({
-        includeGrid: false,
-        includeEditLog: true,
-      });
-    }
-
-    setSaveToast({
-      id: Date.now(),
-      kind: failures.length ? "warning" : "success",
-      title: failures.length
-        ? "Bulk update finished with warnings"
-        : draftMode
-        ? "Bulk draft update complete"
-        : "Bulk update complete",
-      lines: [
-        `${successes.length} shift${successes.length === 1 ? "" : "s"} updated.`,
-        ...failures.slice(0, 8),
-        ...(failures.length > 8 ? [`+${failures.length - 8} more issue(s)`] : []),
-      ],
-    });
-
-    clearBulkSelection();
-  } catch (err: any) {
-    setSaveToast({
-      id: Date.now(),
-      kind: "error",
-      title: "Bulk update failed",
-      lines: [err?.message ?? "Unable to apply bulk changes."],
-    });
-  } finally {
-    setBulkApplying(false);
   }
 }
 async function handleOpenEditHistory(payload: EditHistoryOpenPayload) {
@@ -6109,16 +5629,7 @@ async function handleCaregiverDropToShift(args: {
 
             <button
               type="button"
-              onClick={() => {
-                setBulkMode((v) => !v);
-                setSelectedBulkCells({});
-                setBulkSelectionMode("caregiver");
-                setBulkSmartCaregiver("");
-                setBulkSmartClient("");
-                setBulkSmartStatus("Any");
-                setShowCaregiverSuggestions(false);
-                setShowClientSuggestions(false);
-              }}
+              onClick={() => setBulkMode((v) => !v)}
               style={{
                 border: `1px solid ${bulkMode ? UI.accent : UI.border}`,
                 background: bulkMode ? UI.accentSoft : UI.headerBg,
@@ -6219,7 +5730,7 @@ async function handleCaregiverDropToShift(args: {
                   setExpandedA1ByWeek((prev) => ({ ...prev, [week]: new Set() }));
                   setEditingA1(null);
                   setDraftByA1({});
-                  setSelectedBulkCells({});
+                  bulkEditPanelRef.current?.clearBulkSelection();
                   resetDraft();
                   await loadGridForWeek(week);
                   await Promise.all([
@@ -6702,776 +6213,25 @@ async function handleCaregiverDropToShift(args: {
     ) : null}
 
     {bulkMode ? (
-      <div
-        style={{
-          marginTop: 12,
-          display: "grid",
-          gap: 14,
-          padding: "14px",
-          borderRadius: 16,
-          border: `1px solid ${UI.border}`,
-          background: UI.panelBg,
-        }}
-      >
-        <div
-          style={{
-            display: "flex",
-            gap: 10,
-            alignItems: "center",
-            flexWrap: "wrap",
-            justifyContent: "space-between",
-          }}
-        >
-          <div style={{ display: "flex", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
-            <div style={{ fontSize: 14, fontWeight: 1000, color: UI.text }}>Bulk Edit Mode</div>
-            <div style={{ fontSize: 12, fontWeight: 900, color: UI.textDim }}>
-              {selectedBulkCount} selected
-            </div>
-            <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 800 }}>
-              Highlighted shifts stay marked directly on the schedule.
-            </div>
-          </div>
-
-          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-            <button
-              type="button"
-              onClick={selectAllVisibleShifts}
-              style={{
-                border: `1px solid ${UI.border}`,
-                background: UI.headerBg,
-                color: UI.text,
-                borderRadius: 10,
-                padding: "6px 10px",
-                fontSize: 12,
-                cursor: "pointer",
-                fontWeight: 900,
-              }}
-            >
-              Select All Visible
-            </button>
-
-            <button
-              type="button"
-              onClick={clearBulkSelection}
-              disabled={!selectedBulkCount}
-              style={{
-                border: `1px solid ${UI.border}`,
-                background: selectedBulkCount ? UI.headerBg : "#f3f4f6",
-                color: selectedBulkCount ? UI.text : "#9ca3af",
-                borderRadius: 10,
-                padding: "6px 10px",
-                fontSize: 12,
-                cursor: selectedBulkCount ? "pointer" : "default",
-                fontWeight: 900,
-              }}
-            >
-              Clear Selection
-            </button>
-          </div>
-        </div>
-
-        <div
-          style={{
-            display: "grid",
-            gap: 12,
-            gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
-            alignItems: "start",
-          }}
-        >
-          <div
-            style={{
-              display: "grid",
-              gap: 10,
-              padding: 14,
-              border: `1px solid ${UI.borderSoft}`,
-              borderRadius: 14,
-              background: UI.headerBg,
-              minHeight: 220,
-            }}
-          >
-            <div style={{ fontSize: 12, fontWeight: 1000, color: UI.text }}>Step 1</div>
-            <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 900 }}>
-              Choose how you want to find shifts.
-            </div>
-
-            <div style={{ display: "grid", gap: 8 }}>
-              <button
-                type="button"
-                onClick={() => resetBulkSearchUi("caregiver")}
-                style={{
-                  border: `1px solid ${bulkSelectionMode === "caregiver" ? "#111827" : UI.border}`,
-                  background: bulkSelectionMode === "caregiver" ? "#111827" : "#fff",
-                  color: bulkSelectionMode === "caregiver" ? "#fff" : UI.text,
-                  borderRadius: 12,
-                  padding: "10px 12px",
-                  fontSize: 12,
-                  cursor: "pointer",
-                  fontWeight: 900,
-                  textAlign: "left",
-                }}
-              >
-                By Caregiver
-              </button>
-
-              <button
-                type="button"
-                onClick={() => resetBulkSearchUi("client")}
-                style={{
-                  border: `1px solid ${bulkSelectionMode === "client" ? "#111827" : UI.border}`,
-                  background: bulkSelectionMode === "client" ? "#111827" : "#fff",
-                  color: bulkSelectionMode === "client" ? "#fff" : UI.text,
-                  borderRadius: 12,
-                  padding: "10px 12px",
-                  fontSize: 12,
-                  cursor: "pointer",
-                  fontWeight: 900,
-                  textAlign: "left",
-                }}
-              >
-                By Client
-              </button>
-
-              <button
-                type="button"
-                onClick={() => resetBulkSearchUi("status")}
-                style={{
-                  border: `1px solid ${bulkSelectionMode === "status" ? "#111827" : UI.border}`,
-                  background: bulkSelectionMode === "status" ? "#111827" : "#fff",
-                  color: bulkSelectionMode === "status" ? "#fff" : UI.text,
-                  borderRadius: 12,
-                  padding: "10px 12px",
-                  fontSize: 12,
-                  cursor: "pointer",
-                  fontWeight: 900,
-                  textAlign: "left",
-                }}
-              >
-                By Status
-              </button>
-
-              <button
-                type="button"
-                onClick={() => resetBulkSearchUi("manual")}
-                style={{
-                  border: `1px solid ${bulkSelectionMode === "manual" ? "#111827" : UI.border}`,
-                  background: bulkSelectionMode === "manual" ? "#111827" : "#fff",
-                  color: bulkSelectionMode === "manual" ? "#fff" : UI.text,
-                  borderRadius: 12,
-                  padding: "10px 12px",
-                  fontSize: 12,
-                  cursor: "pointer",
-                  fontWeight: 900,
-                  textAlign: "left",
-                }}
-              >
-                Manual Select
-              </button>
-            </div>
-          </div>
-
-          {bulkStepTwoVisible ? (
-            <div
-              style={{
-                display: "grid",
-                gap: 10,
-                padding: 14,
-                border: `1px solid ${UI.borderSoft}`,
-                borderRadius: 14,
-                background: UI.headerBg,
-                minHeight: 220,
-                animation: "cwBulkStepSlideIn 220ms ease both",
-              }}
-            >
-              <div style={{ fontSize: 12, fontWeight: 1000, color: UI.text }}>Step 2</div>
-              <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 900 }}>
-                {bulkSelectionMode === "manual"
-                  ? "Click the schedule cells you want to include."
-                  : bulkSelectionMode === "caregiver"
-                  ? "Choose a caregiver and optional status filter."
-                  : bulkSelectionMode === "client"
-                  ? "Choose a client to pull matching shifts."
-                  : "Choose which status to target."}
-              </div>
-
-              {bulkSelectionMode === "caregiver" ? (
-                <>
-                  <div style={{ position: "relative" }}>
-                    <input
-                      value={bulkSmartCaregiver}
-                      onChange={(e) => {
-                        setBulkSmartCaregiver(e.target.value);
-                        setBulkStepTwoArmed(false);
-                        setShowCaregiverSuggestions(true);
-                      }}
-                      onFocus={() => setShowCaregiverSuggestions(true)}
-                      placeholder="Search caregiver…"
-                      style={{
-                        width: "100%",
-                        border: `1px solid ${UI.border}`,
-                        borderRadius: 12,
-                        padding: "10px 12px",
-                        fontSize: 12,
-                        outline: "none",
-                        background: UI.panelBg,
-                        boxSizing: "border-box",
-                      }}
-                    />
-
-                        {showCaregiverSuggestions && bulkCaregiverSuggestions.length > 0 ? (
-                      <div
-                        style={{
-                          position: "absolute",
-                          top: "calc(100% + 4px)",
-                          left: 0,
-                          right: 0,
-                          background: "#fff",
-                          border: `1px solid ${UI.border}`,
-                          borderRadius: 12,
-                          boxShadow: "0 8px 20px rgba(0,0,0,0.12)",
-                          zIndex: TOPNAV_Z + 20,
-                          overflow: "hidden",
-                        }}
-                      >
-                        {bulkCaregiverSuggestions.map((name) => (
-                          <button
-                            key={name}
-                            type="button"
-                            onClick={() => {
-                              setBulkSmartCaregiver(name);
-                              setShowCaregiverSuggestions(false);
-                              smartSelectByCaregiverAndStatus(name, bulkSmartStatus);
-                            }}
-                            style={{
-                              width: "100%",
-                              textAlign: "left",
-                              border: "none",
-                              background: "#fff",
-                              padding: "10px 12px",
-                              fontSize: 12,
-                              cursor: "pointer",
-                              fontWeight: 800,
-                            }}
-                          >
-                            {name}
-                          </button>
-                        ))}
-                      </div>
-                    ) : null}
-                  </div>
-
-                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                    <select
-                      value={bulkSmartStatus}
-                      onChange={(e) => {
-                        setBulkSmartStatus(e.target.value as BulkSmartStatusFilter);
-                        setBulkStepTwoArmed(false);
-                      }}
-                      style={{
-                        border: `1px solid ${UI.border}`,
-                        borderRadius: 12,
-                        padding: "10px 12px",
-                        fontSize: 12,
-                        outline: "none",
-                        background: UI.panelBg,
-                        fontWeight: 800,
-                      }}
-                    >
-                      <option value="Any">Any status</option>
-                      <option value="Open">Open</option>
-                      <option value="Filled">Filled</option>
-                      <option value="Offered">Offered</option>
-                      <option value="Considering">Considering</option>
-                      <option value="PendingClientApproval">Pending Approval</option>
-                    </select>
-
-                    <button
-                      type="button"
-                      onClick={() =>
-                        smartSelectByCaregiverAndStatus(bulkSmartCaregiver, bulkSmartStatus)
-                      }
-                      style={{
-                        border: `1px solid ${UI.border}`,
-                        background: "#fff",
-                        color: UI.text,
-                        borderRadius: 12,
-                        padding: "10px 12px",
-                        fontSize: 12,
-                        cursor: "pointer",
-                        fontWeight: 900,
-                      }}
-                    >
-                      Select Matching Shifts
-                    </button>
-                  </div>
-                </>
-              ) : null}
-
-              {bulkSelectionMode === "client" ? (
-                <>
-                  <div style={{ position: "relative" }}>
-                    <input
-                      value={bulkSmartClient}
-                      onChange={(e) => {
-                        setBulkSmartClient(e.target.value);
-                        setBulkStepTwoArmed(false);
-                        setShowClientSuggestions(true);
-                      }}
-                      onFocus={() => setShowClientSuggestions(true)}
-                      placeholder="Search client…"
-                      style={{
-                        width: "100%",
-                        border: `1px solid ${UI.border}`,
-                        borderRadius: 12,
-                        padding: "10px 12px",
-                        fontSize: 12,
-                        outline: "none",
-                        background: UI.panelBg,
-                        boxSizing: "border-box",
-                      }}
-                    />
-
-                    {showClientSuggestions && bulkClientSuggestions.length > 0 ? (
-                      <div
-                        style={{
-                          position: "absolute",
-                          top: "calc(100% + 4px)",
-                          left: 0,
-                          right: 0,
-                          background: "#fff",
-                          border: `1px solid ${UI.border}`,
-                          borderRadius: 12,
-                          boxShadow: "0 8px 20px rgba(0,0,0,0.12)",
-                          zIndex: TOPNAV_Z + 20,
-                          overflow: "hidden",
-                        }}
-                      >
-                        {bulkClientSuggestions.map((name) => (
-                          <button
-                            key={name}
-                            type="button"
-                            onClick={() => {
-                              setBulkSmartClient(name);
-                              setShowClientSuggestions(false);
-                              smartSelectByClient(name);
-                            }}
-                            style={{
-                              width: "100%",
-                              textAlign: "left",
-                              border: "none",
-                              background: "#fff",
-                              padding: "10px 12px",
-                              fontSize: 12,
-                              cursor: "pointer",
-                              fontWeight: 800,
-                            }}
-                          >
-                            {name}
-                          </button>
-                        ))}
-                      </div>
-                    ) : null}
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={() => smartSelectByClient(bulkSmartClient)}
-                    style={{
-                      border: `1px solid ${UI.border}`,
-                      background: "#fff",
-                      color: UI.text,
-                      borderRadius: 12,
-                      padding: "10px 12px",
-                      fontSize: 12,
-                      cursor: "pointer",
-                      fontWeight: 900,
-                      justifySelf: "start",
-                    }}
-                  >
-                    Select Matching Shifts
-                  </button>
-                </>
-              ) : null}
-
-              {bulkSelectionMode === "status" ? (
-                <div style={{ display: "grid", gap: 8 }}>
-                  <select
-                      value={bulkSmartStatus}
-                      onChange={(e) => {
-                        setBulkSmartStatus(e.target.value as BulkSmartStatusFilter);
-                        setBulkStepTwoArmed(false);
-                      }}
-                    style={{
-                      border: `1px solid ${UI.border}`,
-                      borderRadius: 12,
-                      padding: "10px 12px",
-                      fontSize: 12,
-                      outline: "none",
-                      background: UI.panelBg,
-                      fontWeight: 800,
-                    }}
-                  >
-                    <option value="Any">Any status</option>
-                    <option value="Open">Open</option>
-                    <option value="Filled">Filled</option>
-                    <option value="Offered">Offered</option>
-                    <option value="Considering">Considering</option>
-                    <option value="PendingClientApproval">Pending Approval</option>
-                  </select>
-
-                  <button
-                    type="button"
-                    disabled={bulkSmartStatus === "Any"}
-                    onClick={() => {
-                      if (bulkSmartStatus !== "Any") smartSelectByStatus(bulkSmartStatus);
-                    }}
-                    style={{
-                      border: `1px solid ${UI.border}`,
-                      background: "#fff",
-                      color: bulkSmartStatus === "Any" ? "#9ca3af" : UI.text,
-                      borderRadius: 12,
-                      padding: "10px 12px",
-                      fontSize: 12,
-                      cursor: bulkSmartStatus === "Any" ? "default" : "pointer",
-                      fontWeight: 900,
-                      justifySelf: "start",
-                    }}
-                  >
-                    Select Matching Shifts
-                  </button>
-                </div>
-              ) : null}
-
-              {bulkSelectionMode === "manual" ? (
-                <div
-                  style={{
-                    padding: 12,
-                    borderRadius: 12,
-                    border: `1px dashed ${UI.border}`,
-                    background: "#fff",
-                    fontSize: 12,
-                    color: UI.textDim,
-                    fontWeight: 800,
-                  }}
-                >
-                  Click any schedule cell to add or remove it from the bulk selection. Selected cells stay highlighted in gold on the schedule.
-                </div>
-              ) : null}
-            </div>
-          ) : null}
-
-          {bulkStepThreeVisible ? (
-            <div
-              style={{
-                display: "grid",
-                gap: 10,
-                padding: 14,
-                border: `1px solid ${UI.borderSoft}`,
-                borderRadius: 14,
-                background: UI.headerBg,
-                minHeight: 220,
-                animation: "cwBulkStepSlideIn 240ms ease both",
-              }}
-            >
-              <div style={{ fontSize: 12, fontWeight: 1000, color: UI.text }}>Step 3</div>
-              <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 900 }}>
-                Review all visible shifts here. Click any item to include or exclude it from the bulk update.
-              </div>
-
-              <div
-                style={{
-                  display: "grid",
-                  gap: 8,
-                  maxHeight: 310,
-                  overflow: "auto",
-                  paddingRight: 4,
-                }}
-              >
-                {bulkShiftList.length ? (
-                  bulkShiftList.map((cell) => {
-                    const tone = bulkStatusTone(cell.status);
-                    return (
-                      <button
-                        key={cell.a1}
-                        type="button"
-                        onClick={() =>
-                          toggleBulkCellSelection({
-                            a1: cell.a1,
-                            week: cell.week,
-                            clientName: cell.clientName,
-                            dateStr: cell.dateStr,
-                            dayLabel: cell.dayLabel,
-                            originalValue: cell.originalValue,
-                          })
-                        }
-                        style={{
-                          display: "grid",
-                          gap: 5,
-                          textAlign: "left",
-                          border: `2px solid ${cell.selected ? "#f59e0b" : tone.border}`,
-                          background: tone.bg,
-                          borderRadius: 12,
-                          padding: "10px 12px",
-                          cursor: "pointer",
-                          boxShadow: cell.selected ? "inset 0 0 0 2px rgba(245,158,11,0.25)" : "none",
-                        }}
-                      >
-                        <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline" }}>
-                          <div style={{ fontSize: 12, fontWeight: 1000, color: UI.text }}>{cell.clientName}</div>
-                          <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 900 }}>
-                            {cell.dayLabel} • {cell.dateStr}
-                          </div>
-                        </div>
-                        <div style={{ fontSize: 12, color: tone.text, fontWeight: 900 }}>
-                          {cell.status === "Unknown" ? "Unknown" : cell.status}
-                        </div>
-                        <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 800 }}>
-                          {cell.caregiverName}
-                          {cell.startTime && cell.endTime ? ` • ${cell.startTime}-${cell.endTime}` : ""}
-                        </div>
-                        <div style={{ fontSize: 11, color: cell.selected ? "#92400e" : UI.textDim, fontWeight: 900 }}>
-                          {cell.selected ? "Selected for bulk update" : "Click to include"}
-                        </div>
-                      </button>
-                    );
-                  })
-                ) : (
-                  <div
-                    style={{
-                      padding: 12,
-                      borderRadius: 12,
-                      border: `1px dashed ${UI.border}`,
-                      background: "#fff",
-                      fontSize: 12,
-                      color: UI.textDim,
-                      fontWeight: 800,
-                    }}
-                  >
-                    No visible shifts match the current schedule view.
-                  </div>
-                )}
-              </div>
-            </div>
-          ) : null}
-
-          {bulkStepThreeVisible ? (
-            <div
-              style={{
-                display: "grid",
-                gap: 10,
-                padding: 14,
-                border: `1px solid ${UI.borderSoft}`,
-                borderRadius: 14,
-                background: UI.headerBg,
-                minHeight: 220,
-                animation: "cwBulkStepSlideIn 260ms ease both",
-              }}
-            >
-              <div style={{ fontSize: 12, fontWeight: 1000, color: UI.text }}>Step 4</div>
-              <div style={{ fontSize: 12, color: UI.textDim, fontWeight: 900 }}>
-                Choose the new status for every selected shift.
-              </div>
-
-              <select
-                value={bulkCancelledTarget}
-                onChange={(e) => setBulkCancelledTarget(e.target.value as any)}
-                style={{
-                  border: `1px solid ${UI.border}`,
-                  borderRadius: 12,
-                  padding: "10px 12px",
-                  fontSize: 12,
-                  outline: "none",
-                  background: UI.panelBg,
-                  fontWeight: 800,
-                }}
-                title="Cancelled state behavior"
-              >
-                <option value="keep">Keep cancelled state</option>
-                <option value="cancelled">Make cancelled</option>
-                <option value="not_cancelled">Remove cancelled</option>
-              </select>
-
-              <div style={{ display: "grid", gap: 8 }}>
-                <button
-                  type="button"
-                  onClick={() =>
-                    applyBulkStatusChange({
-                      targetBaseStatus: "Considering",
-                      targetCancelled:
-                        bulkCancelledTarget === "keep"
-                          ? "keep"
-                          : bulkCancelledTarget === "cancelled",
-                    })
-                  }
-                  disabled={bulkApplying}
-                  style={{
-                    border: `1px solid ${UI.border}`,
-                    background: "#fff7ed",
-                    color: "#9a3412",
-                    borderRadius: 12,
-                    padding: "10px 12px",
-                    fontSize: 12,
-                    cursor: bulkApplying ? "default" : "pointer",
-                    fontWeight: 900,
-                    textAlign: "left",
-                  }}
-                >
-                  Change to Considering
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() =>
-                    applyBulkStatusChange({
-                      targetBaseStatus: "Offered",
-                      targetCancelled:
-                        bulkCancelledTarget === "keep"
-                          ? "keep"
-                          : bulkCancelledTarget === "cancelled",
-                    })
-                  }
-                  disabled={bulkApplying}
-                  style={{
-                    border: `1px solid ${UI.border}`,
-                    background: "#eff6ff",
-                    color: "#1d4ed8",
-                    borderRadius: 12,
-                    padding: "10px 12px",
-                    fontSize: 12,
-                    cursor: bulkApplying ? "default" : "pointer",
-                    fontWeight: 900,
-                    textAlign: "left",
-                  }}
-                >
-                  Change to Offered
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() =>
-                    applyBulkStatusChange({
-                      targetBaseStatus: "Filled",
-                      targetCancelled:
-                        bulkCancelledTarget === "keep"
-                          ? "keep"
-                          : bulkCancelledTarget === "cancelled",
-                    })
-                  }
-                  disabled={bulkApplying}
-                  style={{
-                    border: `1px solid ${UI.border}`,
-                    background: "#ecfdf5",
-                    color: "#166534",
-                    borderRadius: 12,
-                    padding: "10px 12px",
-                    fontSize: 12,
-                    cursor: bulkApplying ? "default" : "pointer",
-                    fontWeight: 900,
-                    textAlign: "left",
-                  }}
-                >
-                  Change to Filled
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() =>
-                    applyBulkStatusChange({
-                      targetBaseStatus: "PendingClientApproval",
-                      targetCancelled:
-                        bulkCancelledTarget === "keep"
-                          ? "keep"
-                          : bulkCancelledTarget === "cancelled",
-                    })
-                  }
-                  disabled={bulkApplying}
-                  style={{
-                    border: `1px solid ${UI.border}`,
-                    background: "#faf5ff",
-                    color: "#7e22ce",
-                    borderRadius: 12,
-                    padding: "10px 12px",
-                    fontSize: 12,
-                    cursor: bulkApplying ? "default" : "pointer",
-                    fontWeight: 900,
-                    textAlign: "left",
-                  }}
-                >
-                  Change to Pending Approval
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() =>
-                    applyBulkStatusChange({
-                      targetBaseStatus: "Open",
-                      targetCancelled:
-                        bulkCancelledTarget === "keep"
-                          ? "keep"
-                          : bulkCancelledTarget === "cancelled",
-                    })
-                  }
-                  disabled={bulkApplying}
-                  style={{
-                    border: `1px solid ${UI.border}`,
-                    background: "#fef2f2",
-                    color: "#b91c1c",
-                    borderRadius: 12,
-                    padding: "10px 12px",
-                    fontSize: 12,
-                    cursor: bulkApplying ? "default" : "pointer",
-                    fontWeight: 900,
-                    textAlign: "left",
-                  }}
-                >
-                  Change to Open
-                </button>
-              </div>
-
-              <div
-                style={{
-                  display: "grid",
-                  gap: 6,
-                  paddingTop: 6,
-                  borderTop: `1px solid ${UI.borderSoft}`,
-                }}
-              >
-                <button
-                  type="button"
-                  onClick={openBulkOfferMessage}
-                  disabled={!bulkMessageTarget.caregiverId}
-                  style={{
-                    border: `1px solid ${bulkMessageTarget.caregiverId ? "#2563eb" : UI.border}`,
-                    background: bulkMessageTarget.caregiverId ? "#eff6ff" : "#f3f4f6",
-                    color: bulkMessageTarget.caregiverId ? "#1d4ed8" : "#9ca3af",
-                    borderRadius: 12,
-                    padding: "10px 12px",
-                    fontSize: 12,
-                    cursor: bulkMessageTarget.caregiverId ? "pointer" : "default",
-                    fontWeight: 900,
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: 8,
-                    justifyContent: "center",
-                  }}
-                  title="Open Messages and paste the selected shifts into the caregiver conversation"
-                >
-                  <MessageBubbleIcon size={16} />
-                  Open Message Draft
-                </button>
-                <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>
-                  {bulkMessageTarget.caregiverId
-                    ? `Opens Messages for ${bulkMessageTarget.caregiverName} and pastes the draft only. It does not send automatically.`
-                    : bulkMessageTarget.reason}
-                </div>
-              </div>
-            </div>
-          ) : null}
-        </div>
-
-        <div style={{ fontSize: 11, color: UI.textDim, fontWeight: 800 }}>
-          Bulk mode now reveals each next step after the previous choice is made: pick a selection method, build the selection, review the shifts, then apply the change.
-        </div>
-      </div>
+      <BulkEditPanel
+        ref={bulkEditPanelRef}
+        week={week}
+        visibleBulkCandidates={visibleBulkCandidates}
+        draftMode={draftMode}
+        weekStartYmd={weekStartYmd}
+        currentUserName={currentUserName}
+        currentUserEmail={currentUserEmail}
+        shiftSaveCaregivers={shiftSaveCaregivers}
+        scheduleRows={scheduleRows}
+        idByNameOnSchedule={idByNameOnSchedule}
+        caregiversById={caregiversById}
+        messagesUI={messagesUI}
+        saveInlineEdit={saveInlineEdit}
+        setDraftCell={setDraftCell}
+        refreshScheduleStateInBackground={refreshScheduleStateInBackground}
+        setSaveToast={setSaveToast}
+        onSelectionChange={handleBulkSelectionChange}
+      />
     ) : null}
 
     {loading && <p style={{ opacity: 0.85, marginTop: 12 }}>Loading…</p>}
@@ -8858,7 +7618,7 @@ async function handleCaregiverDropToShift(args: {
                                   left: 0,
                                   zIndex: 2,
                                   background: groupBg,
-                                  padding: rowIsEmpty ? "6px 12px" : "10px 12px",
+                                  padding: rowIsEmpty ? "4px 12px" : "10px 12px",
                                   borderBottom: `1px solid ${UI.borderSoft}`,
                                   fontWeight: 800,
                                   fontSize: 13,
@@ -8876,10 +7636,10 @@ async function handleCaregiverDropToShift(args: {
                                 <div
                                   style={{
                                     display: "grid",
-                                    gap: 6,
+                                    gap: rowIsEmpty ? 4 : 6,
                                     minWidth: 0,
                                     position: "relative",
-                                    minHeight: rowIsEmpty ? 28 : undefined,
+                                    minHeight: rowIsEmpty ? 20 : undefined,
                                   }}
                                 >
                                   <div
@@ -8995,17 +7755,17 @@ async function handleCaregiverDropToShift(args: {
                                       position: rowIsEmpty ? "static" : "absolute",
                                       top: rowIsEmpty ? undefined : 0,
                                       right: rowIsEmpty ? undefined : 0,
-                                      width: 18,
-                                      height: 18,
+                                      width: rowIsEmpty ? 16 : 18,
+                                      height: rowIsEmpty ? 16 : 18,
                                       border: `1px solid ${UI.border}`,
                                       background: "#fff8e1",
                                       color: UI.text,
                                       borderRadius: 999,
                                       padding: 0,
-                                      fontSize: 11,
+                                      fontSize: rowIsEmpty ? 10 : 11,
                                       fontWeight: 1000,
                                       cursor: "pointer",
-                                      lineHeight: "16px",
+                                      lineHeight: rowIsEmpty ? "14px" : "16px",
                                       textAlign: "center",
                                       display: "inline-flex",
                                       alignItems: "center",
@@ -9075,16 +7835,20 @@ async function handleCaregiverDropToShift(args: {
                                       })
                                     : false;
 
-                                const isSaving = a1 ? isCellSaving(a1) : false;
-                                const cellStatus = statusFromCellValue(displayValue);
-
-                                const isExpanded = Boolean(a1) && expandedA1.has(a1);
-                                const isEditing = Boolean(a1) && editingA1 === a1;
-
                                 const ck = normalizeKey(name);
                                 const dk = dateKey(dateStrForDow);
                                 const ghostKey = `${ck}__${dk}`;
                                 const ghostShiftsForCell = ghostByCell[ghostKey] ?? [];
+                                const hasGhostRequest = ghostShiftsForCell.length > 0;
+
+                                const isSaving = a1 ? isCellSaving(a1) : false;
+                                const cellStatus =
+                                  !norm(displayValue) && hasGhostRequest
+                                    ? "requested"
+                                    : statusFromCellValue(displayValue);
+
+                                const isExpanded = Boolean(a1) && expandedA1.has(a1);
+                                const isEditing = Boolean(a1) && editingA1 === a1;
 
                                 const isBulkSelected = a1 ? isBulkCellSelected(a1) : false;
 
@@ -9161,7 +7925,8 @@ async function handleCaregiverDropToShift(args: {
                                     }}
                                     style={{
                                       verticalAlign: "top",
-                                      padding: rowIsEmpty ? 4 : 10,
+                                      padding:
+                                        !norm(displayValue) && hasGhostRequest ? 0 : rowIsEmpty ? 2 : 10,
                                       borderBottom: `1px solid ${UI.borderSoft}`,
                                       background:
                                         dragOverA1 === a1
@@ -9322,7 +8087,7 @@ async function handleCaregiverDropToShift(args: {
                                               );
                                             }
 
-                                            if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                                            if (e.key === "Enter" && !e.shiftKey) {
                                               e.preventDefault();
                                               void saveInlineEdit({
                                                 a1,
