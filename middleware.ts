@@ -5,6 +5,7 @@ import { getToken } from "next-auth/jwt";
 import { buildCorsHeaders, buildPreflightCorsHeaders, getAllowedCorsOrigin } from "@/lib/cors";
 
 const PUBLIC_PATHS = new Set(["/", "/extension-signin"]);
+const ALLOWED_PORTAL_ROLES = new Set(["admin", "scheduler", "beekeeper"]);
 const ROUTE_LEVEL_AUTH_API_PATHS = new Set([
   "/api/firebase-custom-token",
   "/api/availability",
@@ -33,6 +34,10 @@ function isApiPath(pathname: string) {
 
 function isNextAuthApiPath(pathname: string) {
   return pathname.startsWith("/api/auth");
+}
+
+function hasPortalAccess(role: unknown) {
+  return typeof role === "string" && ALLOWED_PORTAL_ROLES.has(role.toLowerCase());
 }
 
 function withCors(request: NextRequest, response: NextResponse) {
@@ -99,7 +104,7 @@ export async function middleware(request: NextRequest) {
         return jsonAuthError(request, { error: "not_signed_in" }, 401);
       }
 
-      if (typeof token.role !== "string" || token.role.toLowerCase() !== "admin") {
+      if (!hasPortalAccess(token.role)) {
         return jsonAuthError(request, { error: "forbidden" }, 403);
       }
     }
@@ -128,7 +133,7 @@ export async function middleware(request: NextRequest) {
     return response;
   }
 
-  if (typeof token.role !== "string" || token.role.toLowerCase() !== "admin") {
+  if (!hasPortalAccess(token.role)) {
     const response = NextResponse.redirect(new URL("/", request.url));
     response.cookies.delete("next-auth.session-token");
     response.cookies.delete("__Secure-next-auth.session-token");

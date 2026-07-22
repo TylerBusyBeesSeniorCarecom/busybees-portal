@@ -3,6 +3,8 @@ import GoogleProvider from "next-auth/providers/google";
 import CredentialsProvider from "next-auth/providers/credentials";
 import { google } from "googleapis";
 
+import { adminDb } from "@/lib/firebaseAdmin";
+
 function norm(v: unknown) {
   return (v ?? "").toString().trim();
 }
@@ -48,11 +50,69 @@ async function getCaregiversSheetRows() {
 
 type AuthUser = {
   id: string;
+  uid: string;
   name: string;
   email: string;
   role: string;
   caregiverId: string;
 };
+
+const ALLOWED_PORTAL_ROLES = new Set(["admin", "scheduler", "beekeeper"]);
+const GOOGLE_WORKSPACE_DOMAIN =
+  (process.env.GOOGLE_WORKSPACE_DOMAIN || "busybeeseniorcare.com").trim().toLowerCase();
+
+function isAllowedPortalRole(role: string) {
+  return ALLOWED_PORTAL_ROLES.has(normalizeKey(role));
+}
+
+function isAllowedGoogleWorkspaceEmail(email: string) {
+  const normalizedEmail = normalizeKey(email);
+  return normalizedEmail.endsWith(`@${GOOGLE_WORKSPACE_DOMAIN}`);
+}
+
+async function findPortalUserByEmail(email: string): Promise<AuthUser | null> {
+  const normalizedEmail = norm(email).toLowerCase();
+  if (!normalizedEmail) return null;
+
+  const candidates = [...new Set([norm(email), normalizedEmail])].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const snapshot = await adminDb
+      .collection("users")
+      .where("email", "==", candidate)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) continue;
+
+    const doc = snapshot.docs[0];
+    const data = doc.data() as Record<string, unknown>;
+    const role = norm(data.role);
+    if (!isAllowedPortalRole(role)) {
+      return null;
+    }
+
+    const caregiverId = norm(data.caregiverId) || doc.id;
+    const resolvedEmail = norm(data.email) || normalizedEmail;
+    const name =
+      norm(data.displayName) ||
+      norm(data.nameOnSchedule) ||
+      norm(data.name) ||
+      resolvedEmail ||
+      doc.id;
+
+    return {
+      id: doc.id,
+      uid: doc.id,
+      caregiverId,
+      email: resolvedEmail,
+      name,
+      role,
+    };
+  }
+
+  return null;
+}
 
 async function findAdminByCredentials(username: string, password: string): Promise<AuthUser | null> {
   const values = await getCaregiversSheetRows();
@@ -88,6 +148,7 @@ async function findAdminByCredentials(username: string, password: string): Promi
 
       return {
         id: caregiverId || rowEmail,
+        uid: caregiverId || rowEmail,
         caregiverId,
         name: fullName || scheduleName || rowEmail,
         email: rowEmail,
@@ -130,6 +191,7 @@ async function findAdminByEmail(email: string): Promise<AuthUser | null> {
 
       return {
         id: caregiverId || rowEmail,
+        uid: caregiverId || rowEmail,
         caregiverId,
         name: fullName || scheduleName || rowEmail,
         email: rowEmail,
@@ -184,19 +246,24 @@ export const authOptions: NextAuthOptions = {
 
   callbacks: {
     async signIn({ user, account, profile }) {
+      const email =
+        user?.email ||
+        (typeof profile?.email === "string" ? profile.email : "");
+
       if (account?.provider === "credentials") {
-        return true;
+        if (!email) return "/?error=portal_user_not_found";
+        const portalUser = await findPortalUserByEmail(email);
+        return portalUser ? true : "/?error=portal_user_not_found";
       }
 
       if (account?.provider === "google") {
-        const email =
-          user?.email ||
-          (typeof profile?.email === "string" ? profile.email : "");
-
         if (!email) return false;
+        if (!isAllowedGoogleWorkspaceEmail(email)) {
+          return "/?error=workspace_domain_required";
+        }
 
-        const adminUser = await findAdminByEmail(email);
-        return !!adminUser;
+        const portalUser = await findPortalUserByEmail(email);
+        return portalUser ? true : "/?error=portal_user_not_found";
       }
 
       return false;
@@ -216,20 +283,22 @@ export const authOptions: NextAuthOptions = {
 
         if (user?.image) token.picture = user.image;
 
-        if (typeof user?.role === "string") {
-          token.role = user.role;
-        }
-
-        if (typeof user?.caregiverId === "string") {
-          token.caregiverId = user.caregiverId;
-        }
-
-        if (account?.provider === "google" && token.email) {
-          const adminUser = await findAdminByEmail(String(token.email));
-          if (adminUser) {
-            token.role = adminUser.role;
-            token.caregiverId = adminUser.caregiverId;
+        if (account?.provider && token.email) {
+          const portalUser = await findPortalUserByEmail(String(token.email));
+          if (!portalUser) {
+            token.role = "";
+            token.caregiverId = "";
+            token.uid = "";
+            token.authError = "portal_user_not_found";
+            return token;
           }
+
+          token.role = portalUser.role;
+          token.caregiverId = portalUser.caregiverId;
+          token.uid = portalUser.uid;
+          token.name = portalUser.name || token.name;
+          token.email = portalUser.email || token.email;
+          delete token.authError;
         }
       }
 
@@ -243,6 +312,7 @@ export const authOptions: NextAuthOptions = {
         session.user.image =
           typeof token.picture === "string" ? token.picture : null;
         session.user.role = typeof token.role === "string" ? token.role : "";
+        session.user.uid = typeof token.uid === "string" ? token.uid : "";
         session.user.caregiverId =
           typeof token.caregiverId === "string" ? token.caregiverId : "";
       }

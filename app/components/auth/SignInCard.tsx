@@ -26,6 +26,18 @@ export default function SignInCard({
   const isBusy = isGoogleSigningIn || isCredentialsSigningIn;
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    const error = new URLSearchParams(window.location.search).get("error");
+    if (error === "workspace_domain_required") {
+      setErrorMessage("Use your Busy Bees Google Workspace account to sign in.");
+      return;
+    }
+    if (error === "portal_user_not_found" || error === "AccessDenied") {
+      setErrorMessage("Your Google account is not authorized for the portal.");
+    }
+  }, []);
+
+  useEffect(() => {
     if (!onSuccess || status !== "authenticated" || successCalledRef.current) return;
     successCalledRef.current = true;
     onSuccess();
@@ -271,6 +283,108 @@ export default function SignInCard({
         </>
       ) : null}
 
+      {!minimal ? (
+        <>
+          <button
+            type="button"
+            onClick={handleGoogleSignIn}
+            disabled={isBusy}
+            style={{
+              width: "100%",
+              padding: "15px 16px",
+              borderRadius: 14,
+              border: "1px solid #d1d5db",
+              background: isBusy
+                ? "#e5e7eb"
+                : "linear-gradient(180deg, #ffffff 0%, #f9fafb 100%)",
+              color: "#111827",
+              fontSize: 16,
+              fontWeight: 700,
+              cursor: isBusy ? "not-allowed" : "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 12,
+              boxShadow: isBusy ? "none" : "0 10px 24px rgba(15,23,42,0.08)",
+              transition: "all 0.18s ease",
+            }}
+          >
+            <span
+              style={{
+                width: 22,
+                height: 22,
+                borderRadius: 999,
+                background: "#fff",
+                border: "1px solid #e5e7eb",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                fontSize: 12,
+                fontWeight: 900,
+                flexShrink: 0,
+              }}
+            >
+              G
+            </span>
+            {isGoogleSigningIn ? "Signing you in..." : "Sign in with Google"}
+          </button>
+
+          <div
+            style={{
+              marginTop: 22,
+              marginBottom: 22,
+              display: "flex",
+              alignItems: "center",
+              gap: 12,
+            }}
+          >
+            <div style={{ flex: 1, height: 1, background: "#e5e7eb" }} />
+            <div
+              style={{
+                fontSize: 12,
+                fontWeight: 700,
+                color: "#9ca3af",
+                letterSpacing: 0.4,
+                textTransform: "uppercase",
+              }}
+            >
+              Or
+            </div>
+            <div style={{ flex: 1, height: 1, background: "#e5e7eb" }} />
+          </div>
+
+          <div
+            style={{
+              marginTop: 18,
+              fontSize: 12,
+              color: "#6b7280",
+              textAlign: "center",
+              lineHeight: 1.6,
+            }}
+          >
+            Need help accessing the portal? Contact a Busy Bees administrator or
+            your team lead.
+          </div>
+
+          <div
+            style={{
+              marginTop: 30,
+              paddingTop: 18,
+              borderTop: "1px solid #e5e7eb",
+              display: "flex",
+              justifyContent: "space-between",
+              gap: 12,
+              flexWrap: "wrap",
+              fontSize: 12,
+              color: "#6b7280",
+            }}
+          >
+            <span>Busy Bees Senior Care</span>
+            <span>Secure staff access</span>
+          </div>
+        </>
+      ) : null}
+
       <form
         onSubmit={handleCredentialsSignIn}
         style={{
@@ -380,108 +494,6 @@ export default function SignInCard({
           {isCredentialsSigningIn ? "Signing you in..." : "Sign in with username and password"}
         </button>
       </form>
-
-      {!minimal ? (
-        <>
-          <div
-            style={{
-              marginTop: 22,
-              marginBottom: 22,
-              display: "flex",
-              alignItems: "center",
-              gap: 12,
-            }}
-          >
-            <div style={{ flex: 1, height: 1, background: "#e5e7eb" }} />
-            <div
-              style={{
-                fontSize: 12,
-                fontWeight: 700,
-                color: "#9ca3af",
-                letterSpacing: 0.4,
-                textTransform: "uppercase",
-              }}
-            >
-              Or
-            </div>
-            <div style={{ flex: 1, height: 1, background: "#e5e7eb" }} />
-          </div>
-
-          <button
-            type="button"
-            onClick={handleGoogleSignIn}
-            disabled={isBusy}
-            style={{
-              width: "100%",
-              padding: "15px 16px",
-              borderRadius: 14,
-              border: "1px solid #d1d5db",
-              background: isBusy
-                ? "#e5e7eb"
-                : "linear-gradient(180deg, #ffffff 0%, #f9fafb 100%)",
-              color: "#111827",
-              fontSize: 16,
-              fontWeight: 700,
-              cursor: isBusy ? "not-allowed" : "pointer",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              gap: 12,
-              boxShadow: isBusy ? "none" : "0 10px 24px rgba(15,23,42,0.08)",
-              transition: "all 0.18s ease",
-            }}
-          >
-            <span
-              style={{
-                width: 22,
-                height: 22,
-                borderRadius: 999,
-                background: "#fff",
-                border: "1px solid #e5e7eb",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                fontSize: 12,
-                fontWeight: 900,
-                flexShrink: 0,
-              }}
-            >
-              G
-            </span>
-            {isGoogleSigningIn ? "Signing you in..." : "Continue with Google"}
-          </button>
-
-          <div
-            style={{
-              marginTop: 18,
-              fontSize: 12,
-              color: "#6b7280",
-              textAlign: "center",
-              lineHeight: 1.6,
-            }}
-          >
-            Need help accessing the portal? Contact a Busy Bees administrator or
-            your team lead.
-          </div>
-
-          <div
-            style={{
-              marginTop: 30,
-              paddingTop: 18,
-              borderTop: "1px solid #e5e7eb",
-              display: "flex",
-              justifyContent: "space-between",
-              gap: 12,
-              flexWrap: "wrap",
-              fontSize: 12,
-              color: "#6b7280",
-            }}
-          >
-            <span>Busy Bees Senior Care</span>
-            <span>Secure staff access</span>
-          </div>
-        </>
-      ) : null}
     </section>
   );
 }
