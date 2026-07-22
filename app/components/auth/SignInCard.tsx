@@ -6,9 +6,14 @@ import { signIn, useSession } from "next-auth/react";
 export interface SignInCardProps {
   minimal?: boolean;
   onSuccess?: () => void;
+  callbackUrl?: string;
 }
 
-export default function SignInCard({ minimal = false, onSuccess }: SignInCardProps) {
+export default function SignInCard({
+  minimal = false,
+  onSuccess,
+  callbackUrl,
+}: SignInCardProps) {
   const { status } = useSession();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -17,7 +22,7 @@ export default function SignInCard({ minimal = false, onSuccess }: SignInCardPro
   const [errorMessage, setErrorMessage] = useState("");
   const successCalledRef = useRef(false);
 
-  const callbackUrl = minimal ? "/extension-signin" : "/schedule";
+  const effectiveCallbackUrl = callbackUrl ?? (minimal ? "/extension-signin" : "/schedule");
   const isBusy = isGoogleSigningIn || isCredentialsSigningIn;
 
   useEffect(() => {
@@ -30,7 +35,7 @@ export default function SignInCard({ minimal = false, onSuccess }: SignInCardPro
     try {
       setErrorMessage("");
       setIsGoogleSigningIn(true);
-      await signIn("google", { callbackUrl });
+      await signIn("google", { callbackUrl: effectiveCallbackUrl });
     } catch (error) {
       console.error("Google sign-in failed:", error);
       setErrorMessage("Google sign-in failed. Please try again.");
@@ -57,7 +62,7 @@ export default function SignInCard({ minimal = false, onSuccess }: SignInCardPro
         username: cleanUsername,
         password,
         redirect: false,
-        callbackUrl,
+        callbackUrl: effectiveCallbackUrl,
       });
 
       if (!result) {
@@ -73,7 +78,7 @@ export default function SignInCard({ minimal = false, onSuccess }: SignInCardPro
       }
 
       if (!onSuccess) {
-        window.location.href = result.url || callbackUrl;
+        window.location.href = result.url || effectiveCallbackUrl;
       }
     } catch (error) {
       console.error("Credentials sign-in failed:", error);

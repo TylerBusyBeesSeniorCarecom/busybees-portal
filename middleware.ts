@@ -4,7 +4,7 @@ import { getToken } from "next-auth/jwt";
 
 import { buildCorsHeaders, buildPreflightCorsHeaders, getAllowedCorsOrigin } from "@/lib/cors";
 
-const PUBLIC_PATHS = new Set(["/"]);
+const PUBLIC_PATHS = new Set(["/", "/extension-signin"]);
 const ROUTE_LEVEL_AUTH_API_PATHS = new Set([
   "/api/firebase-custom-token",
   "/api/availability",

@@ -1,32 +1,38 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useSession } from "next-auth/react";
 
 import SignInCard from "@/app/components/auth/SignInCard";
 
 export default function ExtensionSignInPage() {
-  const { status } = useSession();
+  const { data: session, status } = useSession();
   const [showFallbackMessage, setShowFallbackMessage] = useState(false);
+  const successStartedRef = useRef(false);
 
   const handleSuccess = useCallback(() => {
     if (typeof window === "undefined") return;
+    if (status !== "authenticated" || !session?.user || successStartedRef.current) return;
 
-    window.opener?.postMessage({ type: "busybees-auth-success" }, "*");
-    window.close();
+    successStartedRef.current = true;
 
     window.setTimeout(() => {
-      if (!window.closed) {
-        setShowFallbackMessage(true);
-      }
-    }, 250);
-  }, []);
+      window.opener?.postMessage({ type: "busybees-auth-success" }, "*");
+      window.close();
+
+      window.setTimeout(() => {
+        if (!window.closed) {
+          setShowFallbackMessage(true);
+        }
+      }, 250);
+    }, 200);
+  }, [session?.user, status]);
 
   useEffect(() => {
-    if (status === "authenticated") {
+    if (status === "authenticated" && session?.user) {
       handleSuccess();
     }
-  }, [handleSuccess, status]);
+  }, [handleSuccess, session?.user, status]);
 
   return (
     <main
@@ -48,7 +54,11 @@ export default function ExtensionSignInPage() {
           gap: 12,
         }}
       >
-        <SignInCard minimal onSuccess={handleSuccess} />
+        <SignInCard
+          minimal
+          callbackUrl="/extension-signin"
+          onSuccess={handleSuccess}
+        />
         {showFallbackMessage ? (
           <div
             style={{
