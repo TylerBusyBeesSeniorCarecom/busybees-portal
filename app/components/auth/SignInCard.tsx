@@ -35,6 +35,7 @@ export default function SignInCard({
     try {
       setErrorMessage("");
       setIsGoogleSigningIn(true);
+      console.log("[bb-card] Google sign-in button clicked. callbackUrl:", effectiveCallbackUrl);
       await signIn("google", { callbackUrl: effectiveCallbackUrl });
     } catch (error) {
       console.error("Google sign-in failed:", error);
@@ -50,6 +51,7 @@ export default function SignInCard({
       setErrorMessage("");
 
       const cleanUsername = username.trim();
+      console.log("[bb-card] Credentials sign-in submitted. email:", cleanUsername);
 
       if (!cleanUsername || !password) {
         setErrorMessage("Please enter your username and password.");
@@ -63,6 +65,11 @@ export default function SignInCard({
         password,
         redirect: false,
         callbackUrl: effectiveCallbackUrl,
+      });
+      console.log("[bb-card] Credentials signIn result:", {
+        ok: result?.ok,
+        error: result?.error,
+        status: result?.status,
       });
 
       if (!result) {
@@ -78,7 +85,9 @@ export default function SignInCard({
       }
 
       if (onSuccess) {
+        console.log("[bb-card] onSuccess() will fire in 100ms");
         window.setTimeout(() => {
+          console.log("[bb-card] Calling onSuccess() now");
           onSuccess();
         }, 100);
         return;
