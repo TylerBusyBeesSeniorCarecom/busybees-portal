@@ -95,7 +95,23 @@ async function resolveGoogleBearerSubject(
   const emailVerified = String(tokenInfo.email_verified || "").trim().toLowerCase();
   const email = String(tokenInfo.email || "").trim().toLowerCase();
 
-  if (!email || emailVerified !== "true" || hostedDomain !== GOOGLE_WORKSPACE_DOMAIN) {
+  if (!email) {
+    console.log("[mint-token] rejected: no email in tokeninfo", tokenInfo);
+    return "unauthorized";
+  }
+
+  if (emailVerified !== "true") {
+    console.log("[mint-token] rejected: email_verified is", emailVerified);
+    return "unauthorized";
+  }
+
+  if (hostedDomain !== GOOGLE_WORKSPACE_DOMAIN) {
+    console.log(
+      "[mint-token] rejected: hd mismatch, got",
+      hostedDomain,
+      "expected",
+      GOOGLE_WORKSPACE_DOMAIN
+    );
     return "unauthorized";
   }
 
@@ -106,6 +122,7 @@ async function resolveGoogleBearerSubject(
     .get();
 
   if (snapshot.empty) {
+    console.log("[mint-token] rejected: no /users doc with workspaceEmail ==", email);
     return "unauthorized";
   }
 
