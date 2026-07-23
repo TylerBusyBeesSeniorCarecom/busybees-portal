@@ -57,7 +57,8 @@ function canPublish(role: string, email: string): boolean {
     "tyler@busybeesseniorcare.com",
     "office@busybeesseniorcare.com",
     "destinee@busybeesseniorcare.com",
-    "kristin@busybeesseniorcare.com",
+    "aaron@busybeesseniorcare.com",
+    "mackenzie@busybeesseniorcare.com",
   ].includes(normalizedEmail);
 }
 
