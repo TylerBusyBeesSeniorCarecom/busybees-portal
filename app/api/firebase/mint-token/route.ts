@@ -9,7 +9,7 @@ export const dynamic = "force-dynamic";
 
 const ALLOWED_PORTAL_ROLES = new Set(["admin", "scheduler", "beekeeper"]);
 const GOOGLE_WORKSPACE_DOMAIN =
-  (process.env.GOOGLE_WORKSPACE_DOMAIN || "busybeeseniorcare.com").trim().toLowerCase();
+  (process.env.GOOGLE_WORKSPACE_DOMAIN || "busybeesseniorcare.com").trim().toLowerCase();
 const TOKENINFO_CACHE_TTL_MS = 5 * 60 * 1000;
 
 type GoogleTokenInfo = {

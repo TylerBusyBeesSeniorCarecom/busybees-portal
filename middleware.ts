@@ -36,6 +36,11 @@ function isNextAuthApiPath(pathname: string) {
   return pathname.startsWith("/api/auth");
 }
 
+function hasBearerAuthorization(request: NextRequest) {
+  const authorization = request.headers.get("authorization") || "";
+  return authorization.startsWith("Bearer ");
+}
+
 function hasPortalAccess(role: unknown) {
   return typeof role === "string" && ALLOWED_PORTAL_ROLES.has(role.toLowerCase());
 }
@@ -92,6 +97,10 @@ export async function middleware(request: NextRequest) {
 
     if (!ROUTE_LEVEL_AUTH_API_PATHS.has(pathname)) {
       if (isPublicPath(pathname)) {
+        return withCors(request, NextResponse.next());
+      }
+
+      if (pathname === "/api/firebase/mint-token" && hasBearerAuthorization(request)) {
         return withCors(request, NextResponse.next());
       }
 
