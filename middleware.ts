@@ -4,7 +4,7 @@ import { getToken } from "next-auth/jwt";
 
 import { buildCorsHeaders, buildPreflightCorsHeaders, getAllowedCorsOrigin } from "@/lib/cors";
 
-const PUBLIC_PATHS = new Set(["/", "/extension-signin"]);
+const PUBLIC_PATHS = new Set(["/", "/extension-signin", "/privacy"]);
 const ALLOWED_PORTAL_ROLES = new Set(["admin", "scheduler", "beekeeper"]);
 const ROUTE_LEVEL_AUTH_API_PATHS = new Set([
   "/api/firebase-custom-token",
@@ -19,8 +19,17 @@ const ROUTE_LEVEL_AUTH_API_PATHS = new Set([
   "/api/schedule-edit-log",
 ]);
 
+function normalizePathname(pathname: string) {
+  if (pathname.length > 1 && pathname.endsWith("/")) {
+    return pathname.slice(0, -1);
+  }
+  return pathname;
+}
+
 function isPublicPath(pathname: string) {
-  if (PUBLIC_PATHS.has(pathname)) return true;
+  const normalizedPathname = normalizePathname(pathname);
+
+  if (PUBLIC_PATHS.has(normalizedPathname)) return true;
   if (pathname.startsWith("/api/auth")) return true;
   if (pathname === "/api/firebase-custom-token") return true;
   if (pathname.startsWith("/_next")) return true;
@@ -153,5 +162,7 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
+  matcher: [
+    "/((?!$|_next/static|_next/image|favicon.ico$|extension-signin(?:/.*)?$|privacy(?:/.*)?$).*)",
+  ],
 };
