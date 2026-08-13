@@ -1,5 +1,7 @@
 // app/api/freshbooks/callback/route.ts
 import { NextRequest, NextResponse } from "next/server";
+import { getApps, initializeApp, cert } from "firebase-admin/app";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
 
 export const dynamic = "force-dynamic";
 
@@ -104,10 +106,57 @@ export async function GET(req: NextRequest) {
       );
     }
 
+    /// Persist tokens to Firestore so Cloud Functions can read them.
+    ///
+    /// The portal's own FreshBooks calls (e.g. /api/freshbooks/clients)
+    /// keep using the httpOnly cookies below — nothing about that flow
+    /// changes. This Firestore write is a *second* copy of the same
+    /// tokens, existing only so backend sync jobs (invoice/payment
+    /// pullers in the `functions/` codebase) have a durable source of
+    /// truth that isn't tied to any browser session.
+    ///
+    /// Failure here does not block the OAuth flow: if the write fails,
+    /// the user's portal experience is unaffected — they just don't
+    /// get Cloud Functions sync until the next successful reconnect.
+    /// We log and move on rather than surfacing an error, because the
+    /// user has no way to act on a "Firestore write failed" message
+    /// mid-OAuth-redirect.
+    try {
+      if (!getApps().length) {
+        const serviceAccount = JSON.parse(
+          mustEnv("GOOGLE_SERVICE_ACCOUNT_KEY")
+        );
+        initializeApp({ credential: cert(serviceAccount) });
+      }
+      const db = getFirestore();
+      /// expiresIn is seconds from now; convert to absolute epoch ms
+      /// so the Cloud Function refresh logic can compare against
+      /// Date.now() without needing to know when this write happened.
+      /// Fallback of 43200s (12h) matches FreshBooks' documented
+      /// access-token lifetime in case expiresIn was missing.
+      const expiresAtMs = Date.now() + (expiresIn || 43200) * 1000;
+      await db.doc("financialConfig/current").set(
+        {
+          freshbooksAuth: {
+            accessToken,
+            refreshToken,
+            expiresAt: expiresAtMs,
+            updatedAt: FieldValue.serverTimestamp(),
+            source: "portal-oauth-callback",
+          },
+        },
+        { merge: true }
+      );
+    } catch (persistError: any) {
+      console.error(
+        "Failed to persist FreshBooks tokens to Firestore:",
+        persistError
+      );
+    }
+
     const response = NextResponse.redirect(
       new URL("/billing-payroll?freshbooks=connected", req.url)
     );
-
     response.cookies.set("fb_access_token", accessToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",

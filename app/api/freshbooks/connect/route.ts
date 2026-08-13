@@ -16,6 +16,9 @@ const DEFAULT_SCOPES = [
   "user:profile:read",
   "user:clients:read",
   "user:invoices:read",
+  "user:invoices:write",
+  "user:payments:read",
+  "user:reports:read",
 ].join(" ");
 
 export async function GET(req: NextRequest) {
